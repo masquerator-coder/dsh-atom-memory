@@ -4,6 +4,20 @@
 
 ### Fixed
 
+- **strict codec 契约漂移导致 web 前端整个起不来**（浏览器 console：
+  `web boot: 1 entry did not activate / dsh-atom-memory: failed`，页面停在
+  “Failed to load plugins”）：dsh 在 0.1.6-alpha.1 发布**之后**的 commit
+  `e459e32637`（`perf(typert): materialize generated schemas on first use`）把 strict
+  codec 由「eager `schema` 字段」改成「`create()` 懒工厂」，客户端 typert registry 在
+  mount 时校验描述符并拒绝旧写法——`typert: atomMemory/listFacts result strict codec has
+  no create() factory`。该异常抛在 `ctx.remote.$mount(...)` 内部，于是浏览器半区 `apply()`
+  失败、整个 web boot 中止，而 Host 半区照常加载、终端一行日志都没有（用户视角就是
+  「装完插件 dsh 起不来」）。现让 codec **同时携带 `create()` 与 `schema` 两个键**：源码
+  HEAD 之后的 harness 走 `create().parse(...)`，最后一个 npm 发布版（0.1.6-alpha.1 及之前
+  所有 0.1.5-rc.x）走 `schema.parse`，两种装配都能挂载。devDependencies 对齐到
+  0.1.6-alpha.1（npm 最新发布；其类型定义仍只有 `schema`，故 codec 先装配再作为
+  `TypertCodec` 返回，避开 excess property 检查），`tests/remote-contribution.test.ts`
+  增加双键断言，防同类漂移再次静默发生。
 - **关闭记忆总开关后，系统提示词不再残留「You have persistent long-term memory…」**：
   `context.ts` 的 awareness 段此前作为**静态**分节无条件注册，`isEnabled` 只挡了冻结
   快照段而没挡这段能力描述文本——`enabled=false` 时模型仍会在系统提示词里读到

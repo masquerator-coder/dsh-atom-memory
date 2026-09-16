@@ -1354,11 +1354,44 @@ window.__ModuleLoader__.load({
 		//#region src/client/remote.ts
 		/** The Remote wire namespace this browser half mounts (matches the Host binding). */
 		const REMOTE_NAMESPACE = "atomMemory";
-		const JSON_CODEC = {
-			mode: "strict",
-			typeSymbol: "dsh-atom-memory#JsonValue",
-			schema: { parse: (value) => value }
-		};
+		/**
+		* The pass-through boundary schema for this namespace's plain-JSON values.
+		*
+		* The Host SRC claim for the same endpoints uses `{ mode: 'src-json' }`, so both
+		* ends already agree the wire value is plain JSON that needs no structural
+		* narrowing: this schema only has to exist, never to narrow anything.
+		*/
+		const JSON_SCHEMA = { parse: (value) => value };
+		/**
+		* One strict boundary codec carrying BOTH keys of the `TypertCodec` contract
+		* change that landed after the 0.1.6-alpha.1 release (dsh commit e459e32637,
+		* "perf(typert): materialize generated schemas on first use"):
+		*
+		*  - a harness built from a source past that commit validates descriptors at
+		*    mount time and decodes through `create().parse(...)`, rejecting an eager
+		*    `schema` codec with "typert: <ns>/<method> result strict codec has no
+		*    create() factory" — thrown inside `ctx.remote.$mount(...)`, so this
+		*    browser half's `apply()` fails and the ENTIRE web boot stops on
+		*    "Failed to load plugins" while the Host half keeps working;
+		*  - the last npm-published build (0.1.6-alpha.1, and every 0.1.5-rc.x before
+		*    it) reads `schema.parse` and knows nothing about `create()`.
+		*
+		* Carrying both keys mounts on either build. The published typings lag the new
+		* key too, so the object is assembled before being returned as `TypertCodec`:
+		* a direct object literal would trip excess-property checking on `create`.
+		*
+		* @param typeSymbol - canonical wire type symbol for the boundary value.
+		* @returns the strict codec for both halves of this contribution.
+		*/
+		function strictJsonCodec(typeSymbol) {
+			return {
+				mode: "strict",
+				typeSymbol,
+				create: () => JSON_SCHEMA,
+				schema: JSON_SCHEMA
+			};
+		}
+		const JSON_CODEC = strictJsonCodec("dsh-atom-memory#JsonValue");
 		/** One descriptor for a Host method whose single argument is a JSON `args` object. */
 		function jsonArgsMethod(method, hasArgs) {
 			return {
