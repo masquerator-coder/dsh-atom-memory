@@ -37,8 +37,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import socket
 import sqlite3
 import uuid
+from dataclasses import dataclass
 from typing import Callable, List, Optional
 
 from .conflict import (
@@ -48,14 +51,21 @@ from .conflict import (
 )
 from .config import MemConfig
 from .db import index_orphans, now_ms, record_event
+from .fingerprint import BODY_IDENTIFIED_TYPES, content_fingerprint
 from .models import (
     FactCandidate,
     NEUTRAL_SCORE,
     default_importance,
 )
-from .reinforce import KIND_USER_RESTATED, adjust, effective_importance, record_reinforcement
+from .reinforce import (
+    KIND_USER_RESTATED,
+    ReinforceCurve,
+    adjust,
+    effective_importance,
+    record_reinforcement,
+)
 from .retriever import segment_text
-from .validator import is_multi_valued, validate
+from .validator import has_negation, is_multi_valued, validate
 
 logger = logging.getLogger(__name__)
 
@@ -144,12 +154,44 @@ def empty_outcome() -> dict:
 
     The shape is what a caller sees when it asks for a synchronous outcome, and
     what gets stored on the candidate row: what was written, what was replaced,
-    what was refused and why.
+    what was refused and why, and what had to be shortened.
 
     Returns:
-        ``{"written", "superseded", "rejected", "reinforced"}`` — all lists.
+        ``{"written", "superseded", "rejected", "reinforced", "truncated"}`` —
+        all lists.
     """
-    return {"written": [], "superseded": [], "rejected": [], "reinforced": []}
+    return {
+        "written": [],
+        "superseded": [],
+        "rejected": [],
+        "reinforced": [],
+        "truncated": [],
+    }
+
+
+@dataclass(frozen=True)
+class PersistResult:
+    """What :meth:`Worker._persist_fact` did with one candidate.
+
+    ``fact_id`` is ``None`` when the candidate turned out to be a memory the
+    store already holds: in that case ``existing_fact_id`` names the row that was
+    reinforced instead, and ``deduped_on`` says which test recognised it
+    (``fingerprint`` for identical content, ``embedding`` for a reworded body).
+    A caller that ignored the distinction would report "written" for a write
+    that never happened.
+    """
+
+    fact_id: Optional[str]
+    """The new fact id, or ``None`` when the claim was already stored."""
+    deduped_on: Optional[str] = None
+    """``fingerprint`` / ``embedding`` when deduplicated, else ``None``."""
+    existing_fact_id: Optional[str] = None
+    """The active fact the candidate was folded into, when deduplicated."""
+
+    @property
+    def written(self) -> bool:
+        """Whether a new fact row was created."""
+        return self.fact_id is not None
 
 
 class Worker:
@@ -187,10 +229,19 @@ class Worker:
         self.privacy_filter = privacy_filter
         self._task: Optional[asyncio.Task] = None
         self._last_maintenance: Optional[int] = None
+        # Identity of this consumer. A claim records who holds it, so a second
+        # consumer over the same file can tell "abandoned" from "someone else is
+        # working on it" instead of guessing from timestamps alone.
+        self.worker_id = f"{socket.gethostname()}#{os.getpid()}#{uuid.uuid4().hex[:8]}"
+        # The reuse-and-decay curve this store was configured with. Every
+        # reinforcement and every strength read goes through it, so retuning
+        # `reinforce_*` changes behaviour rather than just the constants.
+        self.curve = ReinforceCurve.from_config(self.config)
         # The reclaim-on-start boundary. A `running` row older than this worker
         # was orphaned by a previous process (that is the crash-recovery case);
         # a row claimed *after* this worker was constructed belongs to a live
-        # consumer and must be left alone.
+        # consumer and must be left alone. With a lease the boundary only has to
+        # cover rows written before the lease column existed (NULL lease).
         self._started_before_ms = now_ms()
         self.last_maintenance_result: dict = {}
 
@@ -220,9 +271,11 @@ class Worker:
             # making the reclaim no longer steal a peer's in-flight unit of
             # work.
             self.conn.execute(
-                "UPDATE task_queue SET status = ? WHERE status = ? "
-                "AND (started_at IS NULL OR started_at < ?)",
-                (TASK_PENDING, TASK_RUNNING, self._started_before_ms),
+                "UPDATE task_queue SET status = ?, claimed_by = NULL, "
+                "lease_expires_at = NULL "
+                "WHERE status = ? AND (lease_expires_at IS NOT NULL AND lease_expires_at < ? "
+                "OR lease_expires_at IS NULL AND (started_at IS NULL OR started_at < ?))",
+                (TASK_PENDING, TASK_RUNNING, now_ms(), self._started_before_ms),
             )
             self.conn.commit()
             self._task = asyncio.create_task(self._run(), name="dsh-worker")
@@ -302,9 +355,17 @@ class Worker:
         if row is None:
             return None
         cursor = self.conn.execute(
-            "UPDATE task_queue SET status = ?, started_at = ? "
+            "UPDATE task_queue SET status = ?, started_at = ?, claimed_by = ?, "
+            "lease_expires_at = ? "
             "WHERE task_id = ? AND status = ?",
-            (TASK_RUNNING, now_ms(), row["task_id"], TASK_PENDING),
+            (
+                TASK_RUNNING,
+                now_ms(),
+                self.worker_id,
+                now_ms() + int(self.config.task_lease_sec * 1000),
+                row["task_id"],
+                TASK_PENDING,
+            ),
         )
         self.conn.commit()
         if cursor.rowcount != 1:
@@ -330,7 +391,8 @@ class Worker:
             return
         try:
             self.conn.execute(
-                "UPDATE task_queue SET status = ? WHERE task_id = ? AND status = ?",
+                "UPDATE task_queue SET status = ?, claimed_by = NULL, "
+                "lease_expires_at = NULL WHERE task_id = ? AND status = ?",
                 (TASK_PENDING, task_id, TASK_RUNNING),
             )
             self.conn.commit()
@@ -355,7 +417,8 @@ class Worker:
                 raise ValueError(f"unknown task_type: {task_type}")
 
             self.conn.execute(
-                "UPDATE task_queue SET status = ?, completed_at = ? "
+                "UPDATE task_queue SET status = ?, completed_at = ?, "
+                "claimed_by = NULL, lease_expires_at = NULL "
                 "WHERE task_id = ?",
                 (TASK_DONE, now_ms(), task_id),
             )
@@ -398,17 +461,22 @@ class Worker:
         if retry_count >= self.max_retries:
             self.conn.execute(
                 "UPDATE task_queue SET status = ?, retry_count = ?, error = ?, "
-                "completed_at = ? WHERE task_id = ?",
+                "completed_at = ?, claimed_by = NULL, lease_expires_at = NULL "
+                "WHERE task_id = ?",
                 (TASK_DEAD, retry_count, str(exc)[:2000], now_ms(), task_id),
             )
             self.conn.commit()
             self._log_dead(task_id, exc)
             return
 
-        # Requeue for the next poll after the backoff delay.
+        # Requeue for the next poll after the backoff delay. The claim is
+        # released with it: the row is going back to `pending`, so keeping
+        # `claimed_by` would attribute it to a worker that has stopped working
+        # on it.
         delay = min(2 ** (retry_count - 1), 60)
         self.conn.execute(
-            "UPDATE task_queue SET status = ?, retry_count = ?, error = ? "
+            "UPDATE task_queue SET status = ?, retry_count = ?, error = ?, "
+            "claimed_by = NULL, lease_expires_at = NULL "
             "WHERE task_id = ?",
             (TASK_PENDING, retry_count, str(exc)[:2000], task_id),
         )
@@ -475,7 +543,7 @@ class Worker:
         """
         try:
             return record_reinforcement(
-                self.conn, fact_id, user_id, session_id, kind
+                self.conn, fact_id, user_id, session_id, kind, curve=self.curve
             ) is not None
         except Exception:  # pragma: no cover - defensive
             logger.exception("Failed to reinforce fact %s (%s)", fact_id, kind)
@@ -541,6 +609,11 @@ class Worker:
                             "applied": bool(changed),
                             "object": candidate.object,
                             "predicate": candidate.predicate,
+                            # Which test recognised the repeat: the SPO-exact pass
+                            # here, or content identity / embedding further down.
+                            # The receipt names it so a human can tell an exact
+                            # restatement from a semantic merge.
+                            "on": "idempotent",
                         }
                     )
                     continue
@@ -557,8 +630,26 @@ class Worker:
                 )
                 continue
 
-            new_ids.append(await self._persist_fact(candidate, trace_id=None))
-            outcome["written"].append(new_ids[-1])
+            persisted = await self._persist_fact(candidate, trace_id=None)
+            if not persisted.written:
+                # The claim (or the body) is already stored: this is a repeat, and
+                # the only correct effect is the reinforcement `_fold_into` just
+                # recorded. Reporting it as "written" would claim a row that does
+                # not exist.
+                outcome["reinforced"].append(
+                    {
+                        "fact_id": persisted.existing_fact_id,
+                        "applied": True,
+                        "object": candidate.object,
+                        "predicate": candidate.predicate,
+                        "on": persisted.deduped_on,
+                    }
+                )
+                continue
+            if result.truncated_fields:
+                outcome["truncated"].extend(result.truncated_fields)
+            new_ids.append(persisted.fact_id)
+            outcome["written"].append(persisted.fact_id)
 
         # A `replace` whose new text no longer collides with anything still has
         # to retire the fact the caller named.
@@ -688,7 +779,22 @@ class Worker:
         supersede_ids = [
             str(r["fact_id"]) for r in rows if str(r["fact_id"]) in forced
         ] or list(resolution.supersede_ids)
-        new_id = await self._persist_fact(candidate, trace_id=None)
+        persisted = await self._persist_fact(candidate, trace_id=None)
+        if not persisted.written:
+            # The new value turned out to be the one already stored (a reworded
+            # repeat of an active claim). Retiring anything now would remove the
+            # very value that matched, so the reinforcement is the whole effect.
+            outcome["reinforced"].append(
+                {
+                    "fact_id": persisted.existing_fact_id,
+                    "applied": True,
+                    "object": candidate.object,
+                    "predicate": candidate.predicate,
+                    "on": persisted.deduped_on,
+                }
+            )
+            return
+        new_id = persisted.fact_id
         for old_id in supersede_ids:
             self._supersede(old_id, new_id)
         outcome["written"].append(new_id)
@@ -843,10 +949,29 @@ class Worker:
         )
         self.conn.commit()
 
-    async def _persist_fact(self, candidate: FactCandidate, trace_id: Optional[str]) -> str:
-        """Persist a validated candidate into facts + facts_fts + facts_vec.
+    async def _persist_fact(
+        self, candidate: FactCandidate, trace_id: Optional[str]
+    ) -> PersistResult:
+        """Persist a validated candidate, or fold it into a memory already held.
 
-        The three writes go in **one transaction**, and the embedding is
+        Two questions are answered before anything is written, and both matter
+        more than they look:
+
+        1. **Is this claim already stored?** The content fingerprint (see
+           :mod:`~atom_memory.fingerprint`) identifies a claim by its normalised
+           content, polarity included. A match means the user just restated
+           something the store holds — the cleanest reuse evidence the library
+           can observe — so the existing row is *reinforced* instead of being
+           duplicated. Before this, only exact SPO repeats of single-valued
+           predicates were caught; knowledge bodies and multi-valued facts could
+           be re-stored indefinitely, which is where the noise came from.
+        2. **Is this body a reworded copy?** For a long body, the candidate's
+           own embedding is compared against active facts sharing owner, type,
+           subject and predicate. The gate is deliberately tight and narrow: a
+           false merge removes a distinct memory from the working set, while a
+           missed merge only costs a row.
+
+        The three index writes go in **one transaction**, and the embedding is
         computed before it opens. They are one logical fact: an interruption
         between them used to leave a row that full-text search could find and
         semantic search could not, which no caller could distinguish from "the
@@ -857,8 +982,19 @@ class Worker:
             trace_id: Optional trace id recorded with the fact.
 
         Returns:
-            The new fact id.
+            What happened: the new fact id, or the fact this candidate was
+            deduplicated onto and which test recognised it.
         """
+        fingerprint = self._fingerprint(candidate)
+
+        existing = self.conn.execute(
+            "SELECT fact_id FROM facts WHERE user_id = ? AND content_fingerprint = ? "
+            "AND status = 'active' ORDER BY created_at ASC LIMIT 1",
+            (candidate.user_id, fingerprint),
+        ).fetchone()
+        if existing is not None:
+            return self._fold_into(str(existing["fact_id"]), candidate, "fingerprint")
+
         fact_id = str(uuid.uuid4())
         text = f"{candidate.subject} {candidate.predicate} {candidate.object}"
         content = candidate.content or ""
@@ -869,12 +1005,17 @@ class Worker:
         # responsive during model inference.
         blob = await asyncio.to_thread(self.embed_func, searchable)
 
+        near = self._near_duplicate(candidate, blob)
+        if near is not None:
+            return self._fold_into(near, candidate, "embedding")
+
         with self.conn:
             self.conn.execute(
                 "INSERT INTO facts(fact_id, user_id, session_id, subject, predicate, "
                 "object, qualifiers, confidence, importance, privacy, source_type, "
-                "status, superseded_by, observed_at, created_at, trace_id, version, type, content) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "status, superseded_by, observed_at, created_at, trace_id, version, type, "
+                "content, content_fingerprint) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     fact_id,
                     candidate.user_id,
@@ -895,6 +1036,7 @@ class Worker:
                     1,
                     getattr(candidate, "type", "semantic") or "semantic",
                     content or None,
+                    fingerprint,
                 ),
             )
             # FTS index uses jieba-segmented text so Chinese queries can match
@@ -909,7 +1051,107 @@ class Worker:
                 "INSERT INTO facts_vec(fact_id, embedding) VALUES (?, ?)",
                 (fact_id, blob),
             )
-        return fact_id
+        return PersistResult(fact_id)
+
+    def _fingerprint(self, candidate: FactCandidate) -> str:
+        """Content identity of a candidate (polarity included).
+
+        Args:
+            candidate: The candidate to identify.
+
+        Returns:
+            A 32-character hex digest.
+        """
+        return content_fingerprint(
+            user_id=candidate.user_id,
+            type=getattr(candidate, "type", "semantic") or "semantic",
+            subject=candidate.subject,
+            predicate=candidate.predicate,
+            object=candidate.object,
+            content=candidate.content,
+            negated=has_negation(candidate.qualifiers),
+        )
+
+    def _fold_into(self, fact_id: str, candidate: FactCandidate, on: str) -> PersistResult:
+        """Reinforce an existing fact instead of writing a duplicate.
+
+        Args:
+            fact_id: The active fact that already holds this memory.
+            candidate: The candidate that turned out to repeat it.
+            on: Which test recognised the repeat (``fingerprint`` /
+                ``embedding``) — recorded in the audit event so a later reader
+                can tell an exact repeat from a semantic one.
+
+        Returns:
+            A deduplicated :class:`PersistResult`.
+        """
+        self._reinforce(
+            fact_id, candidate.user_id, candidate.session_id, KIND_USER_RESTATED
+        )
+        record_event(
+            self.conn,
+            "fact_deduplicated",
+            {
+                "fact_id": fact_id,
+                "on": on,
+                "subject": candidate.subject,
+                "predicate": candidate.predicate,
+                "object": candidate.object,
+            },
+            user_id=candidate.user_id,
+        )
+        return PersistResult(None, on, fact_id)
+
+    def _near_duplicate(self, candidate: FactCandidate, blob: bytes) -> Optional[str]:
+        """Find an active fact whose body is the same memory, reworded.
+
+        Narrow on purpose, because the failure modes are asymmetric: merging two
+        genuinely different procedures loses one of them from every recall, while
+        a missed merge costs one redundant row. The comparison therefore requires
+        the same owner, type, subject **and** predicate, and a distance inside a
+        tight gate, and it only runs for bodies long enough to be a document.
+
+        Args:
+            candidate: The candidate being written.
+            blob: Its serialised embedding (already computed for the write).
+
+        Returns:
+            The fact id to fold into, or ``None``.
+        """
+        threshold = float(self.config.dedup_max_distance or 0.0)
+        if threshold <= 0:
+            return None
+        body = (candidate.content or "").strip()
+        if len(body) < int(self.config.dedup_min_body_chars or 0):
+            return None
+        fact_type = getattr(candidate, "type", "semantic") or "semantic"
+        try:
+            neighbours = self.conn.execute(
+                "SELECT fact_id, distance FROM facts_vec WHERE embedding MATCH ? AND k = 5",
+                (blob,),
+            ).fetchall()
+        except sqlite3.Error:
+            logger.exception("Near-duplicate probe failed; storing as a new fact")
+            return None
+        for neighbour in neighbours:
+            distance = neighbour["distance"]
+            if distance is None or float(distance) > threshold:
+                continue
+            fact = self.conn.execute(
+                "SELECT fact_id, status, type, subject, predicate FROM facts "
+                "WHERE fact_id = ?",
+                (neighbour["fact_id"],),
+            ).fetchone()
+            if fact is None or fact["status"] != "active":
+                continue
+            if (fact["type"] or "semantic") != fact_type:
+                continue
+            if (fact["subject"] or "") != (candidate.subject or ""):
+                continue
+            if (fact["predicate"] or "") != (candidate.predicate or ""):
+                continue
+            return str(fact["fact_id"])
+        return None
 
     # -- mutation bookkeeping -----------------------------------------------------
 
@@ -1325,7 +1567,7 @@ class Worker:
                     continue
                 candidates.append(
                     (
-                        _effective_rank(row),
+                        _effective_rank(row, self.curve),
                         int(row["created_at"]),
                         row["fact_id"],
                         row["predicate"],
@@ -1369,13 +1611,24 @@ def _evidence(candidate: FactCandidate) -> float:
     return evidence_weight(candidate.confidence, candidate.importance)
 
 
-def _effective_rank(row: sqlite3.Row) -> float:
+def _effective_rank(
+    row: sqlite3.Row, curve: Optional[ReinforceCurve] = None
+) -> float:
     """Return a fact's current importance rank for the archive ordering.
 
     Stored importance is only a signal when the extractor supplied one; the
     neutral default means "unknown" and defers to the fact's type rank — the
     same rule the derived views use, so a fact is archived for the same reason
     it would be ranked low.
+
+    Args:
+        row: A ``facts`` row carrying ``importance``/``type`` and the
+            reinforcement state columns.
+        curve: The curve to evaluate strength under; defaults to the shipped
+            constants.
+
+    Returns:
+        The fact's current effective importance, in ``[0, 1]``.
     """
     stated = float(row["importance"] or 0.0)
     base = (
@@ -1383,5 +1636,5 @@ def _effective_rank(row: sqlite3.Row) -> float:
         if abs(stated - NEUTRAL_SCORE) <= 1e-9
         else stated
     )
-    count = adjust(float(row["reinforce_count"] or 0.0), row["last_used_at"])
-    return effective_importance(base, count)
+    count = adjust(float(row["reinforce_count"] or 0.0), row["last_used_at"], curve=curve)
+    return effective_importance(base, count, curve)
