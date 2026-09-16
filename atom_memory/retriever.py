@@ -4,18 +4,26 @@ Implements the recall half of the memory loop (spec 8.2 / 8.3):
 
     retrieval  = FTS5 (lexical, jieba-segmented query) ⊕ vec0 (semantic KNN)
     fusion     = Reciprocal Rank Fusion (RRF)
-    re-rank    = 0.4·rrf_norm + 0.2·effective_importance + 0.2·recency_norm
+    relevance  = min(1, rrf / rrf_ceiling)      ← absolute, not per-query
+    re-rank    = 0.4·relevance + 0.2·effective_importance + 0.2·recency_norm
                  + 0.2·trust_score
     trust      = 0.6·confidence + 0.4·source_credibility
+
+**Every term is on an absolute 0..1 scale.** That is the point of the design and
+it applies to the relevance term too: a rank-based score rescaled over the
+candidate set (min-max) makes the strongest candidate *always* exactly 1.0 and
+the weakest exactly 0.0, so a lone mediocre match is indistinguishable from a
+perfect one and the meaning of the score depends on who else happened to be
+retrieved. ``rrf_ceiling`` is the score a perfect match would earn (rank 0 in
+both lists), so dividing by it yields a value that means the same thing in every
+query.
 
 The importance term is the fact's **effective** importance: the value written at
 extraction time plus the saturating reuse bonus from
 :mod:`~atom_memory.reinforce`, with the stored reinforcement snapshot decayed to
 the current instant (``reinforce.adjust``). Reuse therefore strengthens ranking,
 but bounded and with a diminishing marginal effect — and it fades again if the
-fact stops being used. It is used on its absolute 0..1 scale rather than min-max
-normalised, so the reinforcement ceiling is a real ceiling instead of a per-query
-rank.
+fact stops being used.
 
 Recency is likewise a half-life decay rather than a min-max rescale of the
 candidate ages: ages are shifted so the newest candidate is the reference
@@ -23,6 +31,17 @@ candidate ages: ages are shifted so the newest candidate is the reference
 (:func:`~atom_memory.db.recency_credit`). It is measured from ``last_used_at``
 where the fact has been used, so a long-lived fact that is still in active use is
 not aged out for being old. See :data:`RECENCY_HALF_LIFE_DAYS` for the tuning.
+
+Two filters decide whether a candidate is *relevant enough to answer with*,
+because a memory that always returns its least-bad row cannot say "I don't know":
+
+- ``max_vector_distance`` gates the semantic half on the raw cosine distance.
+  Rank alone cannot express "all of these are far away" — the nearest of twenty
+  bad matches still ranks first — so the distance is the only honest signal for
+  a floor.
+- ``min_relevance`` gates the fused score. Only meaningful together with the
+  distance gate; on its own every candidate that made either top-k clears it,
+  which is exactly the trap a rank-based floor sets.
 
 All lookups are hard-scoped to ``user_id`` and only ``active`` facts are
 considered.
@@ -35,6 +54,7 @@ import logging
 import sqlite3
 from typing import Callable, Dict, List, Optional, Sequence
 
+from .config import MemConfig
 from .db import MS_PER_DAY, age_offset, now_ms, recency_credit
 from .reinforce import adjust, effective_importance
 
@@ -51,7 +71,9 @@ SOURCE_CREDIBILITY: Dict[str, float] = {
     "model_generated": 0.30,
 }
 
-# Weights for the re-ranking formula (spec 8.3).
+# Default weights for the re-ranking formula (spec 8.3). Overridable through
+# :class:`~atom_memory.config.MemConfig`, because "how much should relevance
+# outweigh importance" is a product decision, not a constant of nature.
 W_RRF = 0.4
 W_IMPORTANCE = 0.2
 W_RECENCY = 0.2
@@ -60,17 +82,26 @@ W_TRUST = 0.2
 T_TRUST_CONFIDENCE = 0.6
 T_TRUST_SOURCE = 0.4
 
+# RRF constant. Larger flattens the gap between neighbouring ranks.
+RRF_K = 60
+
+# Default relevance floor / distance gate. Both are off by default so the
+# library behaves exactly as before unless a deployer opts in; the plugin sets a
+# distance gate, because an injected digest that never says "nothing relevant"
+# is worse than one that does.
+MIN_RELEVANCE = 0.0
+
 # -- recency ------------------------------------------------------------------
 #
 # Age at which a fact's recency credit halves, and how far back the relative
 # shift may reach. See db.age_offset / db.recency_credit for why recency is a
 # shifted exponential decay rather than a per-query min-max rescale of ages.
 #
-# 30 days is deliberately much longer than memory.md's 14: that view answers
-# "what is going on right now" for a session-start snapshot, while this one
-# answers "which of the things matching *this query* is most current", already
-# gated by relevance — so recency here is a tie-breaker among relevant facts, not
-# a selector.
+# 30 days is deliberately much longer than the summary view's 14: that view
+# answers "what is going on right now" for a session-start snapshot, while this
+# one answers "which of the things matching *this query* is most current",
+# already gated by relevance — so recency here is a tie-breaker among relevant
+# facts, not a selector.
 RECENCY_HALF_LIFE_DAYS = 30.0
 
 # Cap on the relative shift. It must stay well above the half-life, or the cap
@@ -88,7 +119,7 @@ _AGE_AT_SQL = "COALESCE(last_used_at, created_at)"
 
 
 def rrf_merge(
-    fts: Sequence[str], vec: Sequence[str], k: int = 60
+    fts: Sequence[str], vec: Sequence[str], k: int = RRF_K
 ) -> List[tuple]:
     """Fuse the FTS and vector result lists by Reciprocal Rank Fusion.
 
@@ -108,6 +139,35 @@ def rrf_merge(
     return sorted(scores.items(), key=lambda x: -x[1])
 
 
+def rrf_ceiling(k: int = RRF_K) -> float:
+    """Return the RRF score of a perfect match (rank 0 in both lists).
+
+    Args:
+        k: RRF constant.
+
+    Returns:
+        The highest score :func:`rrf_merge` can produce for this ``k``.
+    """
+    return 2.0 / (k + 1)
+
+
+def relevance_from_rrf(score: float, k: int = RRF_K) -> float:
+    """Map a fused RRF score onto the absolute 0..1 relevance scale.
+
+    Args:
+        score: A raw :func:`rrf_merge` score.
+        k: RRF constant used by that merge.
+
+    Returns:
+        ``min(1, score / ceiling)`` — 1.0 only for a top-of-both-lists match,
+        ~0.5 for a top-of-one-list match, lower for weaker ranks.
+    """
+    ceiling = rrf_ceiling(k)
+    if ceiling <= 0:
+        return 0.0
+    return min(1.0, max(0.0, float(score) / ceiling))
+
+
 class Retriever:
     """Ranked recall of active atomic facts for a user."""
 
@@ -116,6 +176,7 @@ class Retriever:
         conn: sqlite3.Connection,
         embed_one: Callable[[str], bytes],
         top_k_default: int = 10,
+        config: Optional[MemConfig] = None,
     ) -> None:
         """Initialise the retriever.
 
@@ -123,10 +184,16 @@ class Retriever:
             conn: The SQLite connection.
             embed_one: Callable mapping text to a serialized embedding BLOB.
             top_k_default: Default number of candidates to return.
+            config: Configuration carrying the ranking weights and the
+                relevance/distance gates. ``None`` uses the library defaults.
         """
         self.conn = conn
         self.embed_one = embed_one
         self.top_k_default = top_k_default
+        self.config = config or MemConfig()
+        # Indexes that failed during the last search. Surfaced through recall so
+        # a caller can tell "nothing matched" from "the index is broken".
+        self.last_degraded: List[str] = []
 
     async def search(self, user_id: str, query: str, top_k: Optional[int] = None) -> List[dict]:
         """Run the full retrieval pipeline and return ranked facts.
@@ -141,19 +208,24 @@ class Retriever:
             A list of fact dicts ordered by descending ``final_score``, each
             with keys ``fact_id``, ``subject``, ``predicate``, ``object``,
             ``confidence``, ``importance``, ``source_type``, ``status``,
-            ``created_at`` and ``final_score``.
+            ``created_at``, ``relevance`` and ``final_score``. Candidates below
+            ``min_relevance`` are dropped — "nothing relevant" is a valid
+            answer.
         """
         k = top_k or self.top_k_default
         query = (query or "").strip()
+        self.last_degraded = []
         if not query:
             return []
 
         blob = await asyncio.to_thread(self.embed_one, query)
 
-        vec_ids = self._vector_knn(user_id, blob, k)
+        vec_ids = self._vector_knn(
+            user_id, blob, k, max_distance=self.config.max_vector_distance
+        )
         fts_ids = self._fts_search(user_id, query, k)
 
-        fused = rrf_merge(fts_ids, vec_ids)
+        fused = rrf_merge(fts_ids, vec_ids, k=self.config.rrf_k)
         if not fused:
             return []
 
@@ -163,34 +235,67 @@ class Retriever:
         # RRF scores in the same order as fused.
         rrf_scores = dict(fused)
         ranked = self._rerank(facts, rrf_scores)
+        floor = float(self.config.min_relevance or 0.0)
+        if floor > 0.0:
+            ranked = [f for f in ranked if f["relevance"] >= floor]
         return ranked[:k]
 
     # -- retrieval primitives -------------------------------------------------
 
-    def _vector_knn(self, user_id: str, blob: bytes, k: int) -> List[str]:
+    def _vector_knn(
+        self,
+        user_id: str,
+        blob: bytes,
+        k: int,
+        max_distance: Optional[float] = None,
+    ) -> List[str]:
         """Return fact_ids from semantic KNN, best first.
 
         Restricts candidates to the user's active facts via an ``IN``
         subquery; sqlite-vec requires the KNN form with an explicit ``LIMIT``.
+
+        Args:
+            user_id: Isolation scope.
+            blob: The query embedding.
+            k: Maximum number of ids.
+            max_distance: Optional cosine-distance ceiling. Rows farther away
+                than this are dropped, which is the only way to say "none of
+                these are close" — a rank cannot.
+
+        Returns:
+            Fact ids, nearest first.
         """
         try:
-            rows = self.conn.execute(
-                "SELECT fact_id FROM facts_vec WHERE embedding MATCH ? "
-                "AND fact_id IN (SELECT fact_id FROM facts "
-                "WHERE user_id = ? AND status = 'active') "
-                "ORDER BY distance LIMIT ?",
-                (blob, user_id, k),
-            ).fetchall()
+            if max_distance is None:
+                rows = self.conn.execute(
+                    "SELECT fact_id FROM facts_vec WHERE embedding MATCH ? "
+                    "AND fact_id IN (SELECT fact_id FROM facts "
+                    "WHERE user_id = ? AND status = 'active') "
+                    "ORDER BY distance LIMIT ?",
+                    (blob, user_id, k),
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    "SELECT fact_id, distance FROM facts_vec WHERE embedding MATCH ? "
+                    "AND fact_id IN (SELECT fact_id FROM facts "
+                    "WHERE user_id = ? AND status = 'active') "
+                    "ORDER BY distance LIMIT ?",
+                    (blob, user_id, k),
+                ).fetchall()
+                rows = [r for r in rows if float(r["distance"]) <= max_distance]
             return [r["fact_id"] for r in rows]
         except sqlite3.Error as exc:  # pragma: no cover - defensive
             logger.warning("vector KNN failed: %s", exc)
+            self.last_degraded.append("vector")
             return []
 
     def _fts_search(self, user_id: str, query: str, k: int) -> List[str]:
         """Return fact_ids matching a jieba-segmented FTS query, best first.
 
         FTS is best-effort: malformed queries or empty token streams are
-        swallowed and return nothing rather than breaking retrieval.
+        swallowed and return nothing rather than breaking retrieval. The
+        failure is recorded on :attr:`last_degraded` so the caller can tell it
+        apart from a genuine miss.
         """
         tokens = segment_text(query)
         if not tokens:
@@ -207,7 +312,8 @@ class Retriever:
             ).fetchall()
             return [r["fact_id"] for r in rows]
         except sqlite3.Error as exc:
-            logger.debug("FTS search failed (%s): %s", match, exc)
+            logger.warning("FTS search failed (%s): %s", match, exc)
+            self.last_degraded.append("fts")
             return []
 
     def _fetch_facts(
@@ -238,7 +344,15 @@ class Retriever:
             return []
 
         now = now_ms()
-        rrf_vals = [rrf_scores.get(f["fact_id"], 0.0) for f in facts]
+        k = int(self.config.rrf_k)
+        # Relevance is absolute: the fused score is divided by what a perfect
+        # match would have earned, so a lone mediocre hit no longer scores the
+        # same as a top-of-both-lists hit (which min-max over the candidate set
+        # would have made it do).
+        rel_vals = [
+            relevance_from_rrf(rrf_scores.get(f["fact_id"], 0.0), k)
+            for f in facts
+        ]
         # Reuse feeds ranking through the *effective* importance (base plus the
         # saturating reinforcement bonus); the stored `importance` stays the
         # extractor's original judgement so it can always be reported as-is.
@@ -269,15 +383,15 @@ class Retriever:
         window_ms = RECENCY_REFERENCE_WINDOW_DAYS * MS_PER_DAY
         half_life_ms = RECENCY_HALF_LIFE_DAYS * MS_PER_DAY
 
-        rrf_norm = _minmax(rrf_vals)
-        # Absolute, *not* min-max normalised. Min-max rescales the candidate set
-        # so the best fact always scores exactly 1.0 and the worst 0.0, which
-        # makes the importance term's real magnitude depend on who else happened
-        # to be retrieved and lets a negligible relevance gap between two
-        # candidates stretch across the full 0.2 weight — enough to cancel the
-        # entire reinforcement budget (A_MAX = 0.5 -> at most 0.1 of the final
-        # score). The value is already a meaningful 0..1 measure, so the
-        # reinforcement ceiling is a real ceiling instead of a per-query rank.
+        # Absolute, *not* min-max normalised — the same rule as the relevance
+        # term above. Min-max rescales the candidate set so the best fact always
+        # scores exactly 1.0 and the worst 0.0, which makes the importance
+        # term's real magnitude depend on who else happened to be retrieved and
+        # lets a negligible relevance gap between two candidates stretch across
+        # the full 0.2 weight — enough to cancel the entire reinforcement budget
+        # (A_MAX = 0.5 -> at most 0.1 of the final score). The value is already a
+        # meaningful 0..1 measure, so the reinforcement ceiling is a real ceiling
+        # instead of a per-query rank.
         imp_norm = eff_vals
         recency_norm = [
             recency_credit(
@@ -285,6 +399,11 @@ class Retriever:
             )
             for age in age_ms
         ]
+
+        w_rrf = float(self.config.w_rrf)
+        w_imp = float(self.config.w_importance)
+        w_rec = float(self.config.w_recency)
+        w_trust = float(self.config.w_trust)
 
         ranked: List[dict] = []
         for i, fact in enumerate(facts):
@@ -294,12 +413,13 @@ class Retriever:
                 * SOURCE_CREDIBILITY.get(fact["source_type"], 0.5)
             )
             final = (
-                W_RRF * rrf_norm[i]
-                + W_IMPORTANCE * imp_norm[i]
-                + W_RECENCY * recency_norm[i]
-                + W_TRUST * trust
+                w_rrf * rel_vals[i]
+                + w_imp * imp_norm[i]
+                + w_rec * recency_norm[i]
+                + w_trust * trust
             )
             item = dict(fact)
+            item["relevance"] = round(rel_vals[i], 6)
             item["effective_importance"] = round(eff_vals[i], 6)
             # The decayed reuse count the bonus above was derived from. The raw
             # column is a snapshot from last_used_at and would disagree with it.
@@ -313,17 +433,6 @@ class Retriever:
 
 
 # -- helpers ------------------------------------------------------------------
-
-
-def _minmax(values: Sequence[float]) -> List[float]:
-    """Min-max normalize a sequence into [0, 1]; a constant series maps to 1."""
-    if not values:
-        return []
-    lo, hi = min(values), max(values)
-    if hi == lo:
-        return [1.0 for _ in values]
-    span = hi - lo
-    return [(v - lo) / span for v in values]
 
 
 def estimate_tokens(text: str) -> int:
@@ -341,10 +450,30 @@ def estimate_tokens(text: str) -> int:
     """
     if not text or not text.strip():
         return 0
+    return token_cost(text)[0]
+
+
+def token_cost(text: str) -> tuple:
+    """Return ``(tokens, cjk_chars, other_chars)`` for a text.
+
+    The two counts are what make the estimate *incrementally* computable: the
+    token count of an assembled artifact is a pure function of its totals
+    (``cjk + max(other // 5, 1)``), so a caller that removes a line can update
+    the totals instead of re-measuring the whole text. See
+    :func:`~atom_memory.summary._select` for the consumer.
+
+    Args:
+        text: The text to measure.
+
+    Returns:
+        ``(tokens, cjk, other)``.
+    """
+    if not text or not text.strip():
+        return (0, 0, 0)
     cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
     other = len(text) - cjk
     word_tokens = (other // 5) if other else 0
-    return cjk + max(word_tokens, 1 if other else 0)
+    return (cjk + max(word_tokens, 1 if other else 0), cjk, other)
 
 
 def segment_text(text: str) -> List[str]:

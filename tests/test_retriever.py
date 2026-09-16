@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from atom_memory.config import MemConfig
 from atom_memory.db import connect_for_tests
 from atom_memory.embedder import serialize_float32
@@ -12,6 +14,8 @@ from atom_memory.retriever import (
     Retriever,
     SOURCE_CREDIBILITY,
     estimate_tokens,
+    relevance_from_rrf,
+    rrf_ceiling,
     rrf_merge,
     segment_text,
 )
@@ -354,6 +358,189 @@ def test_derive_profile_from_facts_single_and_multi():
             "SELECT value FROM user_profile WHERE user_id='u1' AND section='职业'"
         ).fetchone()
         assert prof["value"] == "工程师"
+    finally:
+        conn.close()
+
+
+# ---- relevance is absolute, and the gates can say "nothing relevant" ----------
+
+def _retriever(conn, config=None, embed=None):
+    embed = embed or _FakeEmbed()
+    return Retriever(
+        conn, embed.embed_one, top_k_default=10, config=config
+    )
+
+
+def test_relevance_is_absolute_not_rescaled_per_query():
+    """A lone mediocre hit must not score like a top-of-both-lists hit.
+
+    Min-max normalisation over the candidate set gave the best candidate 1.0
+    *whatever* it was, which made a single weak match indistinguishable from a
+    perfect one. The absolute scale maps a one-list hit to ~0.5 and a
+    both-lists hit to 1.0.
+    """
+    assert relevance_from_rrf(rrf_ceiling(60), 60) == pytest.approx(1.0)
+    assert relevance_from_rrf(1.0 / 61, 60) == pytest.approx(0.5)
+    # A weaker rank on one list is worth less than a top rank on both.
+    assert relevance_from_rrf(1.0 / 70, 60) < relevance_from_rrf(2.0 / 61, 60)
+
+
+def test_a_single_candidate_no_longer_scores_full_relevance():
+    """Relevance is computed from the fusion, not forced to 1.0 by normalisation.
+
+    Unit-level on purpose: the candidate set here would have been min-max
+    normalised to 1.0 before, whatever the match quality was.
+    """
+    retriever = Retriever.__new__(Retriever)
+    retriever.config = MemConfig()
+    fact = {
+        "fact_id": "f1", "subject": "用户", "predicate": "偏好", "object": "黑咖啡",
+        "confidence": 0.8, "importance": 0.6, "source_type": "user_explicit",
+        "status": "active", "created_at": 2, "type": "semantic", "content": None,
+        "reinforce_count": 0.0, "last_used_at": None, "age_at": 2,
+    }
+    # A top hit in one list only: half the ceiling.
+    one_list = retriever._rerank([dict(fact)], {"f1": 1.0 / 61})
+    assert one_list[0]["relevance"] == pytest.approx(0.5)
+    # A top hit in both lists: the ceiling.
+    both = retriever._rerank([dict(fact)], {"f1": 2.0 / 61})
+    assert both[0]["relevance"] == pytest.approx(1.0)
+    assert both[0]["final_score"] < 1.0
+
+
+def test_min_relevance_makes_nothing_relevant_a_valid_answer():
+    """A lexical-only match scores half the ceiling, so a floor can refuse it.
+
+    Built with 11 near neighbours so the one lexical-only fact really is outside
+    the vector top-k: that is the situation a rank-based floor cannot detect and
+    an absolute one can.
+    """
+    conn = connect_for_tests()
+    try:
+        for index in range(11):
+            _insert_fact(conn, f"near{index}", "u1", "用户", "无关", f"内容{index}")
+        conn.execute(
+            "INSERT INTO facts(fact_id, user_id, session_id, subject, predicate, "
+            "object, confidence, importance, source_type, status, observed_at, "
+            "created_at, version, type) VALUES ('lexical','u1','s','用户','偏好',"
+            "'黑咖啡',0.8,0.6,'user_explicit','active',1,2,1,'semantic')"
+        )
+        conn.execute(
+            "INSERT INTO facts_fts(fact_id, text) VALUES ('lexical', ?)",
+            (" ".join(segment_text("用户 偏好 黑咖啡")),),
+        )
+        conn.execute(
+            "INSERT INTO facts_vec(fact_id, embedding) VALUES ('lexical', ?)",
+            (serialize_float32([-1.0] * DIM),),  # farthest from the query vector
+        )
+        conn.commit()
+
+        baseline = _search(conn, "u1", "咖啡", _FakeEmbed(), top_k=10)
+        lexical = [f for f in baseline if f["fact_id"] == "lexical"]
+        assert lexical, "the lexical hit is still returned"
+        rel = lexical[0]["relevance"]
+        assert rel < 1.0, "a lexical-only match does not score full relevance"
+
+        # A floor just under it keeps it; a floor just over it refuses it, so the
+        # caller gets an empty answer instead of the least-bad row.
+        loose = Retriever(
+            conn, _FakeEmbed().embed_one,
+            config=MemConfig(min_relevance=rel - 0.01),
+        )
+        assert any(
+            f["fact_id"] == "lexical"
+            for f in asyncio.run(loose.search("u1", "咖啡", top_k=10))
+        )
+        strict = Retriever(
+            conn, _FakeEmbed().embed_one,
+            config=MemConfig(min_relevance=rel + 0.01),
+        )
+        kept = {
+            f["fact_id"]
+            for f in asyncio.run(strict.search("u1", "咖啡", top_k=10))
+        }
+        assert "lexical" not in kept
+    finally:
+        conn.close()
+
+
+def test_vector_distance_gate_filters_far_rows():
+    conn = connect_for_tests()
+    try:
+        _insert_fact(conn, "near", "u1", "用户", "偏好", "黑咖啡")
+        # A distant vector: same table, opposite direction.
+        conn.execute(
+            "INSERT INTO facts(fact_id, user_id, session_id, subject, predicate, "
+            "object, confidence, importance, source_type, status, observed_at, "
+            "created_at, version, type) VALUES ('far','u1','s','用户','偏好',"
+            "'无关内容',0.8,0.6,'user_explicit','active',1,2,1,'semantic')"
+        )
+        conn.execute(
+            "INSERT INTO facts_fts(fact_id, text) VALUES ('far', ?)",
+            (" ".join(segment_text("用户 偏好 无关内容")),),
+        )
+        conn.execute(
+            "INSERT INTO facts_vec(fact_id, embedding) VALUES ('far', ?)",
+            (serialize_float32([-1.0] * DIM),),
+        )
+        conn.commit()
+
+        open_gate = Retriever(conn, _FakeEmbed().embed_one)
+        assert {f["fact_id"] for f in asyncio.run(
+            open_gate.search("u1", "咖啡", top_k=10)
+        )} == {"near", "far"}
+
+        gated = Retriever(
+            conn, _FakeEmbed().embed_one, config=MemConfig(max_vector_distance=1.0)
+        )
+        gated_facts = asyncio.run(gated.search("u1", "咖啡", top_k=10))
+        # 'far' is still a lexical hit, so what the gate removes is its *semantic*
+        # support: it survives only through FTS.
+        assert all(f["fact_id"] != "far" or f["relevance"] < 1.0 for f in gated_facts)
+        direct = gated._vector_knn("u1", _vec(1.0), 10, max_distance=1.0)
+        assert direct == ["near"]
+    finally:
+        conn.close()
+
+
+def test_a_broken_index_is_reported_rather_than_looking_empty():
+    conn = connect_for_tests()
+    try:
+        _insert_fact(conn, "f1", "u1", "用户", "偏好", "黑咖啡")
+        conn.commit()
+        conn.execute("DROP TABLE facts_fts")
+        conn.commit()
+        r = Retriever(conn, _FakeEmbed().embed_one)
+        assert r._fts_search("u1", "咖啡", 10) == []
+        assert r.last_degraded == ["fts"]
+        # The vector half still answers, so recall is degraded, not dead.
+        facts = asyncio.run(r.search("u1", "咖啡", top_k=10))
+        assert r.last_degraded == ["fts"]
+        assert [f["fact_id"] for f in facts] == ["f1"]
+    finally:
+        conn.close()
+
+
+def test_weights_are_configurable():
+    conn = connect_for_tests()
+    try:
+        _insert_fact(conn, "old", "u1", "用户", "偏好", "黑咖啡")
+        conn.execute("UPDATE facts SET created_at = 1 WHERE fact_id = 'old'")
+        _insert_fact(conn, "new", "u1", "用户", "偏好", "绿茶")
+        conn.execute("UPDATE facts SET created_at = 999999999999 WHERE fact_id = 'new'")
+        conn.commit()
+        from atom_memory.db import now_ms
+
+        recency_only = MemConfig(
+            w_rrf=0.0, w_importance=0.0, w_recency=1.0, w_trust=0.0
+        )
+        facts = asyncio.run(
+            Retriever(
+                conn, _FakeEmbed().embed_one, config=recency_only
+            ).search("u1", "咖啡", top_k=10)
+        )
+        assert facts[0]["fact_id"] == "new", "recency-only ranks the newest first"
+        assert now_ms() > 0
     finally:
         conn.close()
 
