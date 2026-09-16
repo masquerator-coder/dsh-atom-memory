@@ -9,6 +9,23 @@ Stage 2 implements the ``extract`` handler: extract candidates from the raw
 utterance, run the validation chain, then persist accepted facts into the
 ``facts``, ``facts_fts`` and ``facts_vec`` tables.
 
+Two policies live here rather than in the API layer, because both are decisions
+about *what the store should contain*:
+
+- **Conflict resolution.** The validator classifies a candidate against the
+  stored value; this module carries out the verdict: under a single-valued
+  predicate a newer assertion supersedes the stored value(s) — losing the
+  newest statement silently is not an option — unless the stored claim has
+  decisively stronger evidence (:mod:`atom_memory.conflict`). Every supersede
+  and every rejection is recorded in ``events`` and on the candidate row, so a
+  write that did *not* land is never reported as if it had.
+- **Retention and self-repair.** On idle the worker runs a maintenance pass:
+  it collects finished bookkeeping rows past their retention, archives the
+  least valuable *unprotected* facts when a capacity cap is configured, and
+  re-derives any fact whose FTS or vector entry went missing. Facts themselves
+  are never deleted by policy — the archive tier is how the working set stays
+  bounded while nothing is lost.
+
 The worker also owns the implicit half of the reuse-reinforcement loop: when a
 candidate is rejected as ``idempotent`` the user has re-stated a claim already
 stored, which is recorded as a reinforcement event (see
@@ -24,11 +41,21 @@ import sqlite3
 import uuid
 from typing import Callable, List, Optional
 
-from .db import now_ms
-from .models import AtomicFact, FactCandidate, default_importance
-from .reinforce import KIND_USER_RESTATED, record_reinforcement
+from .conflict import (
+    ACTION_REJECT,
+    REASON_BATCH_DUPLICATE,
+    resolve_conflict,
+)
+from .config import MemConfig
+from .db import index_orphans, now_ms, record_event
+from .models import (
+    FactCandidate,
+    NEUTRAL_SCORE,
+    default_importance,
+)
+from .reinforce import KIND_USER_RESTATED, adjust, effective_importance, record_reinforcement
 from .retriever import segment_text
-from .validator import validate
+from .validator import is_multi_valued, validate
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +74,10 @@ TASK_PENDING = "pending"
 TASK_RUNNING = "running"
 TASK_DONE = "done"
 TASK_DEAD = "dead"
+
+# Fact statuses that a capacity pass may move a row *into*. Everything else
+# (``active``) is what the read paths see.
+FACT_STATUS_ARCHIVED = "archived"
 
 
 def _candidate_from_rpc_dict(
@@ -108,6 +139,19 @@ def _candidate_from_rpc_dict(
     )
 
 
+def empty_outcome() -> dict:
+    """Return a fresh write-outcome accumulator.
+
+    The shape is what a caller sees when it asks for a synchronous outcome, and
+    what gets stored on the candidate row: what was written, what was replaced,
+    what was refused and why.
+
+    Returns:
+        ``{"written", "superseded", "rejected", "reinforced"}`` — all lists.
+    """
+    return {"written": [], "superseded": [], "rejected": [], "reinforced": []}
+
+
 class Worker:
     """Polling worker for the memory task queue."""
 
@@ -119,6 +163,7 @@ class Worker:
         max_retries: int = 3,
         llm_extractor: Optional[Callable[..., list]] = None,
         privacy_filter: str = "private",
+        config: Optional[MemConfig] = None,
     ) -> None:
         """Initialise the worker.
 
@@ -130,17 +175,28 @@ class Worker:
             max_retries: Max retries before a task is marked dead.
             llm_extractor: Optional LLM extractor callable.
             privacy_filter: Default privacy tag applied during validation.
+            config: Configuration carrying the ingest caps, the conflict margin
+                and the retention policy. ``None`` uses library defaults, which
+                is what direct (non-``AtomMem``) construction wants.
         """
         self.conn = conn
         self.embed_func = embed_func
         self.poll_interval_sec = poll_interval_sec
         self.max_retries = max_retries
+        self.config = config or MemConfig()
+        self.privacy_filter = privacy_filter
+        self._task: Optional[asyncio.Task] = None
+        self._last_maintenance: Optional[int] = None
+        # The reclaim-on-start boundary. A `running` row older than this worker
+        # was orphaned by a previous process (that is the crash-recovery case);
+        # a row claimed *after* this worker was constructed belongs to a live
+        # consumer and must be left alone.
+        self._started_before_ms = now_ms()
+        self.last_maintenance_result: dict = {}
 
         from .extractor import Extractor
 
         self.extractor = Extractor(llm_extractor=llm_extractor)
-        self.privacy_filter = privacy_filter
-        self._task: Optional[asyncio.Task] = None
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -155,9 +211,18 @@ class Worker:
             # work is lost forever. Resetting them to `pending` re-enqueues them
             # under the same at-least-once retry semantics the worker already
             # has for failed tasks.
+            #
+            # Only rows that have been `running` since before this process
+            # started are reclaimed: a task claimed by *another* live consumer
+            # (two AtomMem instances over one database file) carries a
+            # `started_at` inside this worker's own lifetime only if this worker
+            # claims it, so the guard keeps the crash-recovery behaviour while
+            # making the reclaim no longer steal a peer's in-flight unit of
+            # work.
             self.conn.execute(
-                "UPDATE task_queue SET status = ? WHERE status = ?",
-                (TASK_PENDING, TASK_RUNNING),
+                "UPDATE task_queue SET status = ? WHERE status = ? "
+                "AND (started_at IS NULL OR started_at < ?)",
+                (TASK_PENDING, TASK_RUNNING, self._started_before_ms),
             )
             self.conn.commit()
             self._task = asyncio.create_task(self._run(), name="dsh-worker")
@@ -184,6 +249,10 @@ class Worker:
             try:
                 task_row = self._claim_next_task()
                 if task_row is None:
+                    # Idle: this is the only place the maintenance pass runs, so
+                    # it can never delay a queued write.
+                    if self._maintenance_due():
+                        await self.maintenance()
                     await asyncio.sleep(self.poll_interval_sec)
                     continue
                 await self._handle_task(task_row)
@@ -209,8 +278,16 @@ class Worker:
     def _claim_next_task(self) -> Optional[sqlite3.Row]:
         """Atomically claim the highest-priority pending task.
 
+        The claim is a compare-and-swap: the row is selected, then moved to
+        ``running`` **only if it is still ``pending``**, and the update's row
+        count decides whether this worker got it. A bare
+        ``UPDATE ... WHERE task_id = ?`` would let two consumers over one
+        database file both claim the same row (both select it before either
+        updates) and execute the same unit of work twice.
+
         Returns:
-            The claimed task row, or ``None`` if the queue is empty.
+            The claimed task row, or ``None`` if the queue is empty (or the row
+            was taken by another consumer between the select and the update).
         """
         if self.conn is None:
             return None
@@ -224,13 +301,18 @@ class Worker:
         ).fetchone()
         if row is None:
             return None
-        # Mark as running so concurrent consumers don't double-dispatch; the
-        # status is restored to pending if the task is later retried.
-        self.conn.execute(
-            "UPDATE task_queue SET status = ?, started_at = ? WHERE task_id = ?",
-            (TASK_RUNNING, now_ms(), row["task_id"]),
+        cursor = self.conn.execute(
+            "UPDATE task_queue SET status = ?, started_at = ? "
+            "WHERE task_id = ? AND status = ?",
+            (TASK_RUNNING, now_ms(), row["task_id"], TASK_PENDING),
         )
         self.conn.commit()
+        if cursor.rowcount != 1:
+            logger.debug(
+                "Task %s was claimed by another consumer; skipping",
+                row["task_id"],
+            )
+            return None
         return row
 
     def _requeue_inflight(self, task_id: str) -> None:
@@ -279,7 +361,29 @@ class Worker:
             )
             self.conn.commit()
         except Exception as exc:
+            # Roll *back* first. A handler that failed halfway through its
+            # inserts leaves an open implicit transaction; committing the
+            # bookkeeping below without rolling back would persist the partial
+            # write — a fact row that has an FTS entry but no vector, which no
+            # index repair would ever be told about because the task reports
+            # `dead` for an unrelated reason.
+            self._safe_rollback()
+            candidate_id = payload.get("candidate_id")
+            if candidate_id:
+                self._finish_candidate(
+                    candidate_id,
+                    CAND_STATUS_ERROR,
+                    reject_kind="task_error",
+                    reject_reason=str(exc)[:500],
+                )
             await self._record_failure(task_id, row["retry_count"], exc)
+
+    def _safe_rollback(self) -> None:
+        """Roll back any open implicit transaction, best-effort."""
+        try:
+            self.conn.rollback()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Failed to roll back after a task failure")
 
     async def _record_failure(
         self, task_id: str, retry_count: int, exc: Exception
@@ -319,22 +423,11 @@ class Worker:
     def _log_dead(self, task_id: str, exc: Exception) -> None:
         """Mark a dead task, log an alarm and record an event."""
         logger.error("Task %s permanently failed (dead): %s", task_id, exc)
-        try:
-            self.conn.execute(
-                "INSERT INTO events(event_id, user_id, type, payload, trace_id, "
-                "created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    str(uuid.uuid4()),
-                    "",
-                    "task_dead",
-                    json.dumps({"task_id": task_id, "error": str(exc)[:2000]}),
-                    None,
-                    now_ms(),
-                ),
-            )
-            self.conn.commit()
-        except Exception:  # pragma: no cover - event write must not raise
-            logger.exception("Failed to record dead-task event for %s", task_id)
+        record_event(
+            self.conn,
+            "task_dead",
+            {"task_id": task_id, "error": str(exc)[:2000]},
+        )
 
     # -- extract handler ---------------------------------------------------------
 
@@ -354,32 +447,13 @@ class Worker:
         candidates = self.extractor.extract(text, user_id, session_id, turn_id)
 
         if not candidates:
-            self._set_candidate_status(candidate_id, CAND_STATUS_SKIPPED)
+            self._finish_candidate(candidate_id, CAND_STATUS_SKIPPED)
             return
 
-        for candidate in candidates:
-            result = validate(
-                candidate, self.conn, privacy_filter=self.privacy_filter
-            )
-            if not result.ok:
-                # Conflicts and idempotent duplicates are not written; other
-                # validation failures are skipped with a debug log.
-                logger.debug(
-                    "Candidate %s rejected (%s): %s",
-                    candidate.candidate_id, result.kind, result.reason,
-                )
-                # An idempotent rejection means the user re-stated a claim we
-                # already hold: that is the cleanest reuse evidence there is, and
-                # it costs nothing extra to observe (see reinforce.py).
-                if result.kind == "idempotent" and result.suppressed:
-                    self._reinforce(
-                        result.suppressed, user_id, session_id,
-                        KIND_USER_RESTATED,
-                    )
-                continue
-            await self._persist_fact(candidate, trace_id=None)
-
-        self._set_candidate_status(candidate_id, CAND_STATUS_APPLIED)
+        outcome = await self._apply_candidates(candidates, user_id, session_id)
+        self._finish_candidate(
+            candidate_id, CAND_STATUS_APPLIED, outcome=outcome
+        )
 
     def _reinforce(
         self, fact_id: str, user_id: str, session_id: str, kind: str
@@ -407,6 +481,289 @@ class Worker:
             logger.exception("Failed to reinforce fact %s (%s)", fact_id, kind)
             return False
 
+    async def _apply_candidates(
+        self,
+        candidates: List[FactCandidate],
+        user_id: str,
+        session_id: str,
+        force_supersede: Optional[List[str]] = None,
+    ) -> dict:
+        """Validate and persist a batch of candidates under one outcome.
+
+        This is the single write gate for extracted candidates, whichever
+        extractor produced them (rules, the LLM, or a ``replace`` request), so
+        every path gets the same conflict policy, the same ingest cleaning and
+        the same auditable outcome.
+
+        A batch is first reduced to **one winner per single-valued key**: if an
+        extractor emits two competing values for the same key from one utterance
+        the store cannot honour both, and resolving the ambiguity by keeping
+        whichever happened to be written first would make the result depend on
+        the extraction order. The winner is the candidate with the stronger
+        evidence (ties go to the first, and the losers are reported as
+        ``batch_duplicate`` rather than silently absorbed).
+
+        Args:
+            candidates: Candidates to persist.
+            user_id: Owner of the facts.
+            session_id: Session the write belongs to (reinforcement scope).
+            force_supersede: Fact ids the caller has explicitly asked to
+                replace (``replace`` requests). Those are superseded by the new
+                fact even when the evidence comparison would have kept them —
+                the caller named them.
+
+        Returns:
+            The accumulated :func:`empty_outcome` mapping.
+        """
+        forced = {str(fid) for fid in (force_supersede or [])}
+        outcome = empty_outcome()
+        winners = self._dedupe_batch(candidates, outcome)
+        new_ids: List[str] = []
+
+        for candidate in winners:
+            result = validate(
+                candidate,
+                self.conn,
+                privacy_filter=self.privacy_filter,
+                max_field_chars=self.config.max_field_chars,
+                max_content_chars=self.config.max_content_chars,
+            )
+            if not result.ok:
+                if result.kind == "idempotent" and result.suppressed:
+                    # The user re-stated a claim we already hold: the cleanest
+                    # reuse evidence there is, and it costs nothing to observe.
+                    changed = self._reinforce(
+                        result.suppressed, user_id, session_id, KIND_USER_RESTATED
+                    )
+                    outcome["reinforced"].append(
+                        {
+                            "fact_id": result.suppressed,
+                            "applied": bool(changed),
+                            "object": candidate.object,
+                            "predicate": candidate.predicate,
+                        }
+                    )
+                    continue
+                if result.kind == "conflict" and result.conflict_rows:
+                    await self._resolve_and_write(
+                        candidate, result, outcome, forced
+                    )
+                    continue
+                self._reject(
+                    outcome,
+                    candidate,
+                    kind=result.kind,
+                    reason=result.reason,
+                )
+                continue
+
+            new_ids.append(await self._persist_fact(candidate, trace_id=None))
+            outcome["written"].append(new_ids[-1])
+
+        # A `replace` whose new text no longer collides with anything still has
+        # to retire the fact the caller named.
+        already = {
+            str(fid)
+            for entry in outcome["superseded"]
+            for fid in (entry.get("old_fact_ids") or [])
+            or ([entry["old_fact_id"]] if entry.get("old_fact_id") else [])
+        }
+        for old_id in forced:
+            if old_id in already:
+                continue
+            fresh = self._active_fact(old_id)
+            if fresh is not None and new_ids:
+                self._supersede(old_id, new_ids[0])
+                outcome["superseded"].append(
+                    {
+                        "old_fact_id": old_id,
+                        "old_fact_ids": [old_id],
+                        "new_fact_id": new_ids[0],
+                        "predicate": fresh["predicate"],
+                        "old_object": fresh["object"],
+                        "new_object": None,
+                        "reason": "caller_replace",
+                    }
+                )
+        return outcome
+
+    def _dedupe_batch(
+        self, candidates: List[FactCandidate], outcome: dict
+    ) -> List[FactCandidate]:
+        """Reduce a batch to one candidate per single-valued key.
+
+        Args:
+            candidates: The batch, in extraction order.
+            outcome: The outcome accumulator the losers are reported into.
+
+        Returns:
+            The surviving candidates, in their original relative order.
+        """
+        best: dict = {}
+        for index, candidate in enumerate(candidates):
+            if is_multi_valued(
+                candidate.predicate or "", getattr(candidate, "type", "semantic")
+            ):
+                best[("multi", index)] = candidate
+                continue
+            key = (candidate.subject, candidate.predicate)
+            weight = _evidence(candidate)
+            current = best.get(key)
+            if current is None or weight > _evidence(current):
+                if current is not None:
+                    self._reject(
+                        outcome,
+                        current,
+                        kind=REASON_BATCH_DUPLICATE,
+                        reason=(
+                            f"another candidate in the same batch claims "
+                            f"{candidate.predicate!r} with stronger evidence"
+                        ),
+                    )
+                best[key] = candidate
+            else:
+                self._reject(
+                    outcome,
+                    candidate,
+                    kind=REASON_BATCH_DUPLICATE,
+                    reason=(
+                        f"{candidate.predicate!r} is single-valued and already "
+                        f"claimed in this batch"
+                    ),
+                )
+        return list(best.values())
+
+    async def _resolve_and_write(
+        self,
+        candidate: FactCandidate,
+        result,
+        outcome: dict,
+        forced: set,
+    ) -> None:
+        """Apply the conflict policy to one contradicting candidate.
+
+        Args:
+            candidate: The candidate the validator found conflicting.
+            result: The validator's result, carrying ``conflict_rows``.
+            outcome: The outcome accumulator.
+            forced: Fact ids the caller explicitly asked to replace.
+        """
+        rows = list(result.conflict_rows or [])
+        resolution = resolve_conflict(
+            candidate.confidence,
+            candidate.importance,
+            rows,
+            confidence_margin=self.config.conflict_confidence_margin,
+        )
+        forced_rows = [r for r in rows if str(r["fact_id"]) in forced]
+        if resolution.action == ACTION_REJECT and not forced_rows:
+            self._reject(
+                outcome,
+                candidate,
+                kind="conflict",
+                reason=resolution.reason,
+                detail=resolution.detail,
+                conflict_with=result.conflict_with,
+                stored_object=resolution.stored_object,
+            )
+            record_event(
+                self.conn,
+                "fact_rejected",
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "subject": candidate.subject,
+                    "predicate": candidate.predicate,
+                    "object": candidate.object,
+                    "stored_object": resolution.stored_object,
+                    "reason": resolution.reason,
+                    "detail": resolution.detail,
+                },
+                user_id=candidate.user_id,
+            )
+            return
+
+        # Either the newer assertion wins, or the caller named the target of a
+        # `replace` — in both cases the stored value(s) retire behind the new
+        # fact, and the whole key is retired together rather than one row of it.
+        supersede_ids = [
+            str(r["fact_id"]) for r in rows if str(r["fact_id"]) in forced
+        ] or list(resolution.supersede_ids)
+        new_id = await self._persist_fact(candidate, trace_id=None)
+        for old_id in supersede_ids:
+            self._supersede(old_id, new_id)
+        outcome["written"].append(new_id)
+        outcome["superseded"].append(
+            {
+                "old_fact_id": supersede_ids[0] if supersede_ids else None,
+                "old_fact_ids": supersede_ids,
+                "new_fact_id": new_id,
+                "predicate": candidate.predicate,
+                "old_object": resolution.stored_object,
+                "new_object": candidate.object,
+                "reason": (
+                    "caller_replace" if forced_rows else resolution.reason
+                ),
+            }
+        )
+        record_event(
+            self.conn,
+            "fact_superseded",
+            {
+                "subject": candidate.subject,
+                "predicate": candidate.predicate,
+                "old_object": resolution.stored_object,
+                "new_object": candidate.object,
+                "old_fact_ids": supersede_ids,
+                "new_fact_id": new_id,
+                "reason": "caller_replace" if forced_rows else resolution.reason,
+            },
+            user_id=candidate.user_id,
+        )
+
+    def _reject(
+        self,
+        outcome: dict,
+        candidate: FactCandidate,
+        *,
+        kind: str,
+        reason: str,
+        detail: str = "",
+        conflict_with: Optional[str] = None,
+        stored_object: str = "",
+    ) -> None:
+        """Record a candidate that was *not* written, with its reason.
+
+        A refusal is part of the outcome, not a silent `continue`: the caller
+        (and the model, through the tool's render) has to be able to tell "this
+        was stored" from "this was refused because a stronger claim is already
+        stored".
+        """
+        outcome["rejected"].append(
+            {
+                "candidate_id": candidate.candidate_id,
+                "kind": kind,
+                "reason": reason,
+                "detail": detail,
+                "subject": candidate.subject,
+                "predicate": candidate.predicate,
+                "object": candidate.object,
+                "stored_object": stored_object,
+                "conflict_with": conflict_with,
+            }
+        )
+        logger.debug(
+            "Candidate %s rejected (%s): %s",
+            candidate.candidate_id, kind, reason or detail,
+        )
+
+    def _active_fact(self, fact_id: str) -> Optional[sqlite3.Row]:
+        """Return one active fact row by id, or ``None``."""
+        return self.conn.execute(
+            "SELECT fact_id, subject, predicate, object FROM facts "
+            "WHERE fact_id = ? AND status = 'active'",
+            (fact_id,),
+        ).fetchone()
+
     async def _process_persist_pre(self, payload: dict) -> None:
         """Persist pre-extracted candidates (e.g. from the dsh-side LLM extractor).
 
@@ -414,8 +771,8 @@ class Worker:
         ``ctx.llm`` lives) and ships the resulting typed candidates here via the
         ``persist_pre`` task. Each candidate dict is turned into a
         :class:`FactCandidate` and pushed through the *same* validation +
-        persistence chain as rule extraction, so conflict resolution and
-        idempotency (identical-SPO suppression) still apply.
+        persistence chain as rule extraction, so ingest cleaning, conflict
+        resolution and idempotency (identical-SPO suppression) all apply.
 
         Args:
             payload: keys ``candidate_id``, ``user_id``, ``session_id``,
@@ -428,38 +785,79 @@ class Worker:
         turn_id = int(payload.get("turn_id", 0))
         candidates = payload.get("candidates") or []
 
-        for d in candidates:
-            cand = _candidate_from_rpc_dict(d, user_id, session_id, turn_id)
-            result = validate(cand, self.conn, privacy_filter=self.privacy_filter)
-            if not result.ok:
-                logger.debug(
-                    "Pre-extracted candidate %s rejected (%s): %s",
-                    cand.candidate_id, result.kind, result.reason,
-                )
-                if result.kind == "idempotent" and result.suppressed:
-                    self._reinforce(
-                        result.suppressed, user_id, session_id,
-                        KIND_USER_RESTATED,
-                    )
-                continue
-            await self._persist_fact(cand, trace_id=None)
+        if not candidates:
+            self._finish_candidate(candidate_id, CAND_STATUS_SKIPPED)
+            return
 
-        self._set_candidate_status(candidate_id, CAND_STATUS_APPLIED)
+        parsed = [
+            _candidate_from_rpc_dict(d, user_id, session_id, turn_id)
+            for d in candidates
+        ]
+        outcome = await self._apply_candidates(parsed, user_id, session_id)
+        self._finish_candidate(candidate_id, CAND_STATUS_APPLIED, outcome=outcome)
 
-    def _set_candidate_status(self, candidate_id: str, status: str) -> None:
-        """Update a fact_candidates row's status."""
+    def _finish_candidate(
+        self,
+        candidate_id: str,
+        status: str,
+        *,
+        outcome: Optional[dict] = None,
+        reject_kind: Optional[str] = None,
+        reject_reason: Optional[str] = None,
+    ) -> None:
+        """Record a candidate's terminal state and what it produced.
+
+        The status alone is not an outcome: ``applied`` used to be written even
+        when every extracted candidate had been refused, which made a rejected
+        write indistinguishable from a stored one. The reason and the produced
+        ids are stored alongside it.
+
+        Args:
+            candidate_id: The candidate row to finish.
+            status: Terminal status (``applied`` / ``skipped`` / ``error``).
+            outcome: The write outcome, when the task produced one.
+            reject_kind: Explicit refusal category (used by the error path).
+            reject_reason: Human-readable refusal reason.
+        """
+        outcome = outcome or {}
+        rejected = list(outcome.get("rejected") or [])
+        if reject_kind is None and rejected:
+            # The first refusal is the one the caller needs to see; the full
+            # list is in the event log.
+            reject_kind = str(rejected[0].get("kind") or "")
+            reject_reason = str(
+                rejected[0].get("detail") or rejected[0].get("reason") or ""
+            )
         self.conn.execute(
-            "UPDATE fact_candidates SET status = ? WHERE candidate_id = ?",
-            (status, candidate_id),
+            "UPDATE fact_candidates SET status = ?, finished_at = ?, "
+            "reject_kind = ?, reject_reason = ?, result_fact_ids = ? "
+            "WHERE candidate_id = ?",
+            (
+                status,
+                now_ms(),
+                reject_kind,
+                (reject_reason or None),
+                json.dumps(outcome, ensure_ascii=False, default=str),
+                candidate_id,
+            ),
         )
         self.conn.commit()
 
-    async def _persist_fact(self, candidate: FactCandidate, trace_id: Optional[str]) -> None:
+    async def _persist_fact(self, candidate: FactCandidate, trace_id: Optional[str]) -> str:
         """Persist a validated candidate into facts + facts_fts + facts_vec.
+
+        The three writes go in **one transaction**, and the embedding is
+        computed before it opens. They are one logical fact: an interruption
+        between them used to leave a row that full-text search could find and
+        semantic search could not, which no caller could distinguish from "the
+        fact is fine".
 
         Args:
             candidate: The validated candidate.
             trace_id: Optional trace id recorded with the fact.
+
+        Returns:
+            The new fact id.
         """
         fact_id = str(uuid.uuid4())
         text = f"{candidate.subject} {candidate.predicate} {candidate.object}"
@@ -471,46 +869,46 @@ class Worker:
         # responsive during model inference.
         blob = await asyncio.to_thread(self.embed_func, searchable)
 
-        self.conn.execute(
-            "INSERT INTO facts(fact_id, user_id, session_id, subject, predicate, "
-            "object, qualifiers, confidence, importance, privacy, source_type, "
-            "status, superseded_by, observed_at, created_at, trace_id, version, type, content) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                fact_id,
-                candidate.user_id,
-                candidate.session_id,
-                candidate.subject,
-                candidate.predicate,
-                candidate.object,
-                candidate.qualifiers,
-                candidate.confidence,
-                candidate.importance,
-                candidate.privacy,
-                "user_explicit",
-                "active",
-                None,
-                created_at,
-                created_at,
-                trace_id,
-                1,
-                getattr(candidate, "type", "semantic") or "semantic",
-                content or None,
-            ),
-        )
-        # FTS index uses jieba-segmented text so Chinese queries can match
-        # individual words (unicode61 treats a CJK span as a single token).
-        # The body content is indexed too so knowledge facts are findable by
-        # their full text, not only the SPO title.
-        self.conn.execute(
-            "INSERT INTO facts_fts(fact_id, text) VALUES (?, ?)",
-            (fact_id, " ".join(segment_text(searchable))),
-        )
-        self.conn.execute(
-            "INSERT INTO facts_vec(fact_id, embedding) VALUES (?, ?)",
-            (fact_id, blob),
-        )
-        self.conn.commit()
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO facts(fact_id, user_id, session_id, subject, predicate, "
+                "object, qualifiers, confidence, importance, privacy, source_type, "
+                "status, superseded_by, observed_at, created_at, trace_id, version, type, content) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    fact_id,
+                    candidate.user_id,
+                    candidate.session_id,
+                    candidate.subject,
+                    candidate.predicate,
+                    candidate.object,
+                    candidate.qualifiers,
+                    candidate.confidence,
+                    candidate.importance,
+                    candidate.privacy,
+                    "user_explicit",
+                    "active",
+                    None,
+                    created_at,
+                    created_at,
+                    trace_id,
+                    1,
+                    getattr(candidate, "type", "semantic") or "semantic",
+                    content or None,
+                ),
+            )
+            # FTS index uses jieba-segmented text so Chinese queries can match
+            # individual words (unicode61 treats a CJK span as a single token).
+            # The body content is indexed too so knowledge facts are findable by
+            # their full text, not only the SPO title.
+            self.conn.execute(
+                "INSERT INTO facts_fts(fact_id, text) VALUES (?, ?)",
+                (fact_id, " ".join(segment_text(searchable))),
+            )
+            self.conn.execute(
+                "INSERT INTO facts_vec(fact_id, embedding) VALUES (?, ?)",
+                (fact_id, blob),
+            )
         return fact_id
 
     # -- mutation bookkeeping -----------------------------------------------------
@@ -550,10 +948,46 @@ class Worker:
         )
         self.conn.commit()
 
+    def purge_facts(self, fact_ids: List[str]) -> int:
+        """Physically delete facts and every derived row for them.
+
+        Soft deletion is the default because it keeps provenance; a *purge* is
+        the explicit exception, for a user who wants the content gone rather
+        than merely unused. It removes the fact row (which cascades
+        ``fact_reinforcements``), its FTS entry and its vector, so nothing is
+        left behind to be re-derived by the maintenance pass.
+
+        Args:
+            fact_ids: Fact ids to delete.
+
+        Returns:
+            How many fact rows were removed.
+        """
+        if not fact_ids:
+            return 0
+        removed = 0
+        with self.conn:
+            for fact_id in fact_ids:
+                self.conn.execute(
+                    "DELETE FROM facts_fts WHERE fact_id = ?", (fact_id,)
+                )
+                self.conn.execute(
+                    "DELETE FROM facts_vec WHERE fact_id = ?", (fact_id,)
+                )
+                cursor = self.conn.execute(
+                    "DELETE FROM facts WHERE fact_id = ?", (fact_id,)
+                )
+                removed += cursor.rowcount
+        return removed
+
     # -- replace handler -----------------------------------------------------------
 
     async def _process_replace(self, payload: dict) -> None:
         """Handle a replace task: persist the new fact(s), supersede the old.
+
+        A ``replace`` is the one write whose target is *named* by the caller, so
+        the conflict policy yields to that: the named fact is superseded by the
+        new statement even when the evidence comparison would have kept it.
 
         Args:
             payload: keys candidate_id, user_id, old_fact_id, new_text,
@@ -573,54 +1007,381 @@ class Worker:
             (user_id, old_fact_id),
         ).fetchone()
         if old is None:
-            self._set_candidate_status(candidate_id, CAND_STATUS_SKIPPED)
+            self._finish_candidate(candidate_id, CAND_STATUS_SKIPPED)
             return
 
         candidates = self.extractor.extract(text, user_id, session_id, turn_id)
-        new_ids: List[str] = []
-        for candidate in candidates:
-            result = validate(candidate, self.conn, privacy_filter=self.privacy_filter)
-            if not result.ok:
-                logger.debug("replace candidate rejected (%s)", result.kind)
-                continue
-            new_ids.append(await self._persist_fact(candidate, trace_id=None))
-
-        if new_ids:
-            self._supersede(old_fact_id, new_ids[0])
-            self._set_candidate_status(candidate_id, CAND_STATUS_APPLIED)
-        else:
-            self._set_candidate_status(candidate_id, CAND_STATUS_SKIPPED)
+        if not candidates:
+            self._finish_candidate(candidate_id, CAND_STATUS_SKIPPED)
+            return
+        outcome = await self._apply_candidates(
+            candidates, user_id, session_id, force_supersede=[old_fact_id]
+        )
+        self._finish_candidate(candidate_id, CAND_STATUS_APPLIED, outcome=outcome)
 
     # -- forget handler ---------------------------------------------------------------
 
     async def _process_forget(self, payload: dict) -> None:
-        """Handle a forget task: soft-delete the target fact(s).
+        """Handle a forget task: soft-delete (or purge) the target fact(s).
 
         Args:
             payload: keys candidate_id, user_id, fact_id (optional),
-                session_id (optional).
+                session_id (optional), purge (optional bool).
         """
         candidate_id = payload["candidate_id"]
         user_id = payload["user_id"]
         fact_id = payload.get("fact_id")
         session_id = payload.get("session_id")
+        purge = bool(payload.get("purge"))
+        outcome = empty_outcome()
 
+        targets: List[str] = []
         if fact_id:
             # Honour user isolation: retract any non-retracted fact of the
             # user (active or superseded both leave memory).
-            self.conn.execute(
-                "UPDATE facts SET status = 'retracted' "
-                "WHERE user_id = ? AND fact_id = ? AND status IN "
-                "('active', 'superseded')",
-                (user_id, fact_id),
-            )
+            targets = [
+                r["fact_id"]
+                for r in self.conn.execute(
+                    "SELECT fact_id FROM facts WHERE user_id = ? AND fact_id = ? "
+                    "AND status IN ('active', 'superseded')",
+                    (user_id, fact_id),
+                ).fetchall()
+            ]
         elif session_id:
-            self.conn.execute(
-                "UPDATE facts SET status = 'retracted' "
-                "WHERE user_id = ? AND session_id = ? AND status IN "
-                "('active', 'superseded')",
-                (user_id, session_id),
-            )
-        self.conn.commit()
+            targets = [
+                r["fact_id"]
+                for r in self.conn.execute(
+                    "SELECT fact_id FROM facts WHERE user_id = ? AND session_id = ? "
+                    "AND status IN ('active', 'superseded')",
+                    (user_id, session_id),
+                ).fetchall()
+            ]
 
-        self._set_candidate_status(candidate_id, CAND_STATUS_APPLIED)
+        if purge and targets:
+            removed = self.purge_facts(targets)
+            record_event(
+                self.conn,
+                "facts_purged",
+                {"user_id": user_id, "fact_ids": targets, "removed": removed},
+                user_id=user_id,
+            )
+            outcome["purged"] = targets
+        elif targets:
+            with self.conn:
+                for target in targets:
+                    self.conn.execute(
+                        "UPDATE facts SET status = 'retracted' WHERE fact_id = ?",
+                        (target,),
+                    )
+            outcome["retracted"] = targets
+        else:
+            outcome["rejected"].append(
+                {
+                    "kind": "not_found",
+                    "reason": "no active or superseded fact matched the request",
+                    "conflict_with": fact_id,
+                }
+            )
+
+        self._finish_candidate(candidate_id, CAND_STATUS_APPLIED, outcome=outcome)
+
+    # -- maintenance ---------------------------------------------------------------
+
+    def _maintenance_due(self) -> bool:
+        """Whether the idle maintenance pass should run now."""
+        interval = float(self.config.maintenance_interval_sec or 0.0)
+        if self._last_maintenance is None:
+            return True  # once per start, so a restart self-repairs
+        if interval <= 0:
+            return False
+        return now_ms() - self._last_maintenance >= interval * 1000.0
+
+    async def maintenance(self, user_id: Optional[str] = None) -> dict:
+        """Run the retention, repair and capacity passes.
+
+        Everything here is *policy about what the store keeps*: bookkeeping
+        rows past their retention are collected, facts whose index entries went
+        missing are re-derived, and — only when a capacity cap is configured —
+        the least valuable unprotected facts move to the archive tier.
+
+        Args:
+            user_id: Restrict the capacity pass to one user; ``None`` checks
+                every user.
+
+        Returns:
+            A summary dict of what changed.
+        """
+        self._last_maintenance = now_ms()
+        result: dict = {
+            "pruned_candidates": 0,
+            "pruned_tasks": 0,
+            "pruned_events": 0,
+            "repaired": {},
+            "archived": [],
+        }
+        try:
+            result["pruned_candidates"] = self._prune_table(
+                "fact_candidates",
+                self.config.candidate_retention_days,
+                statuses=("applied", "skipped", "error"),
+                guard="finished_at IS NOT NULL",
+            )
+            result["pruned_tasks"] = self._prune_table(
+                "task_queue",
+                self.config.task_retention_days,
+                statuses=(TASK_DONE, TASK_DEAD),
+                guard="completed_at IS NOT NULL",
+            )
+            result["pruned_events"] = self._prune_table(
+                "events",
+                self.config.event_retention_days,
+                statuses=None,
+                guard=None,
+            )
+            result["repaired"] = await self.repair_index()
+            result["archived"] = self.enforce_capacity(user_id)
+        except Exception:  # pragma: no cover - maintenance must not kill the loop
+            logger.exception("Maintenance pass failed")
+        self.last_maintenance_result = result
+        return result
+
+    def _prune_table(
+        self,
+        table: str,
+        retention_days: int,
+        *,
+        statuses: Optional[tuple],
+        guard: Optional[str],
+    ) -> int:
+        """Delete bookkeeping rows older than their retention.
+
+        Args:
+            table: Table name (from a fixed internal set, never user input).
+            retention_days: Age beyond which a finished row may go. ``<=0``
+                keeps rows forever.
+            statuses: Terminal statuses eligible for collection; ``None`` means
+                the table has no status column and age alone decides.
+            guard: Extra predicate ensuring only *finished* rows are eligible.
+
+        Returns:
+            Number of rows deleted.
+        """
+        if retention_days is None or retention_days <= 0:
+            return 0
+        cutoff = now_ms() - int(retention_days) * 86_400_000
+        clauses = ["created_at < ?"]
+        args: list = [cutoff]
+        if statuses:
+            clauses.append(
+                "status IN (" + ",".join("?" for _ in statuses) + ")"
+            )
+            args.extend(statuses)
+        if guard:
+            clauses.append(guard)
+        cursor = self.conn.execute(
+            f"DELETE FROM {table} WHERE " + " AND ".join(clauses), tuple(args)
+        )
+        self.conn.commit()
+        return max(0, cursor.rowcount)
+
+    async def repair_index(self) -> dict:
+        """Re-derive index entries for facts that are missing them.
+
+        Facts are meant to be written with their FTS and vector entries in one
+        transaction; this is the safety net for everything that can still go
+        wrong (an interrupted process, a hand-edited database, a row written
+        before this invariant existed). Re-deriving is cheap and idempotent, and
+        it is what turns "silently missing from semantic search" back into
+        "searchable".
+
+        Returns:
+            ``{"vector": n, "fts": n, "dropped_vector": n, "dropped_fts": n}``.
+        """
+        orphans = index_orphans(self.conn)
+        fixed = {"vector": 0, "fts": 0, "dropped_vector": 0, "dropped_fts": 0}
+
+        for fact_id in dict.fromkeys(
+            orphans["missing_vector"] + orphans["missing_fts"]
+        ):
+            row = self.conn.execute(
+                "SELECT subject, predicate, object, content FROM facts "
+                "WHERE fact_id = ?",
+                (fact_id,),
+            ).fetchone()
+            if row is None:
+                continue
+            searchable = (
+                f"{row['subject']} {row['predicate']} {row['object']} "
+                f"{(row['content'] or '')}"
+            ).strip()
+            blob = await asyncio.to_thread(self.embed_func, searchable or " ")
+            with self.conn:
+                if fact_id in orphans["missing_fts"]:
+                    self.conn.execute(
+                        "INSERT INTO facts_fts(fact_id, text) VALUES (?, ?)",
+                        (fact_id, " ".join(segment_text(searchable))),
+                    )
+                    fixed["fts"] += 1
+                if fact_id in orphans["missing_vector"]:
+                    self.conn.execute(
+                        "INSERT INTO facts_vec(fact_id, embedding) VALUES (?, ?)",
+                        (fact_id, blob),
+                    )
+                    fixed["vector"] += 1
+
+        with self.conn:
+            for fact_id in orphans["orphan_vector"]:
+                self.conn.execute(
+                    "DELETE FROM facts_vec WHERE fact_id = ?", (fact_id,)
+                )
+                fixed["dropped_vector"] += 1
+            for fact_id in orphans["orphan_fts"]:
+                self.conn.execute(
+                    "DELETE FROM facts_fts WHERE fact_id = ?", (fact_id,)
+                )
+                fixed["dropped_fts"] += 1
+
+        if any(fixed.values()):
+            record_event(self.conn, "index_repaired", fixed)
+            logger.warning("Index repair: %s", fixed)
+        return fixed
+
+    def enforce_capacity(self, user_id: Optional[str] = None) -> List[dict]:
+        """Archive the least valuable unprotected facts when over capacity.
+
+        The cap is a cap on the *working set*, not on the store: an archived
+        fact keeps its row, its content and its provenance, and can be brought
+        back with ``unarchive``. Which facts go first is the whole policy, so it
+        is spelled out:
+
+        - **Protected** — never archived whatever their score: facts young
+          enough that no reuse could have been observed yet
+          (``archive_protect_days``), facts with any reinforcement evidence
+          (someone has used them), durable knowledge types (decision rule,
+          lesson, SOP — the material whose value is least time-dependent), and
+          facts whose predicate backs a **pinned** profile row (the user
+          declared that row fixed).
+        - **Order** — everything else is archived oldest-and-least-important
+          first, by its *effective* importance (base rank, plus the decayed
+          reuse bonus), so a fact that was once heavily used but has not been
+          touched for months is archived before a modest one that is live.
+
+        Args:
+            user_id: Restrict to one user; ``None`` applies to every user.
+
+        Returns:
+            One entry per archived fact, in archival order.
+        """
+        cap = int(self.config.max_active_facts or 0)
+        if cap <= 0:
+            return []
+
+        scope = "AND f.user_id = ? " if user_id else ""
+        args: list = [user_id] if user_id else []
+        rows = self.conn.execute(
+            "SELECT f.fact_id, f.user_id, f.predicate, f.type, f.importance, "
+            "f.created_at, f.reinforce_count, f.last_used_at "
+            "FROM facts f WHERE f.status = 'active' " + scope +
+            "ORDER BY f.created_at DESC",
+            tuple(args),
+        ).fetchall()
+
+        protect_ms = int(self.config.archive_protect_days) * 86_400_000
+        cutoff = now_ms() - protect_ms
+        durable = {"decision_rule", "lesson", "sop"}
+
+        # A pinned profile row protects the facts whose predicate it mirrors.
+        pinned_sections: set = set()
+        if rows:
+            users = {r["user_id"] for r in rows}
+            for user in users:
+                pinned_sections.update(
+                    r["section"]
+                    for r in self.conn.execute(
+                        "SELECT section FROM user_profile "
+                        "WHERE user_id = ? AND pinned = 1",
+                        (user,),
+                    ).fetchall()
+                )
+
+        by_user: dict = {}
+        for row in rows:
+            by_user.setdefault(row["user_id"], []).append(row)
+
+        archived: List[dict] = []
+        for owner, owner_rows in by_user.items():
+            overflow = len(owner_rows) - cap
+            if overflow <= 0:
+                continue
+            candidates = []
+            for row in owner_rows:
+                if int(row["created_at"]) >= cutoff:
+                    continue  # too young to judge
+                if float(row["reinforce_count"] or 0.0) > 0.0:
+                    continue  # there is evidence of reuse
+                if (row["type"] or "semantic") in durable:
+                    continue
+                if (row["predicate"] or "") in pinned_sections:
+                    continue
+                candidates.append(
+                    (
+                        _effective_rank(row),
+                        int(row["created_at"]),
+                        row["fact_id"],
+                        row["predicate"],
+                        row["type"],
+                    )
+                )
+            candidates.sort()
+            for _rank, _created, fact_id, predicate, memory_type in candidates[
+                :overflow
+            ]:
+                self.conn.execute(
+                    "UPDATE facts SET status = ?, archived_at = ? WHERE fact_id = ?",
+                    (FACT_STATUS_ARCHIVED, now_ms(), fact_id),
+                )
+                archived.append(
+                    {
+                        "fact_id": fact_id,
+                        "user_id": owner,
+                        "predicate": predicate,
+                        "type": memory_type,
+                    }
+                )
+        if archived:
+            self.conn.commit()
+            record_event(
+                self.conn,
+                "facts_archived",
+                {"cap": cap, "archived": archived},
+                user_id=user_id or "",
+            )
+            logger.warning(
+                "Capacity pass archived %d fact(s) over cap %d", len(archived), cap
+            )
+        return archived
+
+
+def _evidence(candidate: FactCandidate) -> float:
+    """Return a candidate's evidence weight (confidence-led)."""
+    from .conflict import evidence_weight
+
+    return evidence_weight(candidate.confidence, candidate.importance)
+
+
+def _effective_rank(row: sqlite3.Row) -> float:
+    """Return a fact's current importance rank for the archive ordering.
+
+    Stored importance is only a signal when the extractor supplied one; the
+    neutral default means "unknown" and defers to the fact's type rank — the
+    same rule the derived views use, so a fact is archived for the same reason
+    it would be ranked low.
+    """
+    stated = float(row["importance"] or 0.0)
+    base = (
+        default_importance(row["type"] or "semantic")
+        if abs(stated - NEUTRAL_SCORE) <= 1e-9
+        else stated
+    )
+    count = adjust(float(row["reinforce_count"] or 0.0), row["last_used_at"])
+    return effective_importance(base, count)
