@@ -47,7 +47,7 @@ from .models import (
     TYPE_SEMANTIC,
     default_importance,
 )
-from .retriever import estimate_tokens, token_cost
+from .retriever import CHARS_PER_TOKEN, estimate_tokens, token_cost
 from .reinforce import adjust, effective_importance
 from .validator import MULTI_VALUED_PREDICATES
 
@@ -366,14 +366,16 @@ def _render_compact(buckets: dict, max_tokens: int) -> str:
             continue
         sections[_SECTION_TITLES[section]] = rendered
 
-    total = sum(len(lines) for lines in sections.values())
     rendered = _compose(sections, _select(sections, max_tokens))
     if estimate_tokens(rendered) <= max_tokens:
         return rendered
-    # The budget is smaller than even the empty digest + footer costs. Nothing
-    # per-type can be said within it, so emit the shortest honest thing rather
-    # than silently overshooting the caller's cap.
-    return f"> {total} 条记忆已省略（预算不足，请用 memory_recall 检索）"
+    # The budget cannot hold even the empty digest and its footer. There is no
+    # shorter *honest* thing to say than nothing: a notice would itself cost
+    # tokens, would overshoot the cap it is announcing, and would repeat what the
+    # caller already knows (it set the budget). Returning "" makes the empty case
+    # explicit — the injection path injects nothing — instead of leaving a branch
+    # that no realistic budget can reach.
+    return ""
 
 
 def _render_footer(omitted: int, hidden: List[str], kept: dict) -> str:
@@ -640,12 +642,14 @@ def _tokens_for_totals(totals) -> int:
 
     Mirrors :func:`~atom_memory.retriever.estimate_tokens` exactly (including
     its "empty text is zero" case) so an incremental measurement and a full
-    re-render can never disagree.
+    re-render can never disagree. The divisor is the shared
+    :data:`~atom_memory.retriever.CHARS_PER_TOKEN`: if this file kept its own
+    constant, retuning the estimate would silently split the two paths.
     """
     cjk, other = totals
     if cjk <= 0 and other <= 0:
         return 0
-    return cjk + max(other // 5, 1 if other else 0)
+    return cjk + max(other // CHARS_PER_TOKEN, 1 if other else 0)
 
 
 def _kept_indices(kept: dict, title: str) -> List[int]:

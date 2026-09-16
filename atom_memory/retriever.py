@@ -453,13 +453,24 @@ def estimate_tokens(text: str) -> int:
     return token_cost(text)[0]
 
 
+#: Non-CJK characters per estimated token.
+#:
+#: English prose and source code run at roughly 4 characters per token, so the
+#: previous divisor of 5 under-counted Latin text by 20-25% — enough for a
+#: Latin-heavy digest to overshoot a budget it claimed to respect. CJK text is
+#: unaffected (one character is one token). Exported because the summary's
+#: incremental accounting has to use the same constant as this estimate, or the
+#: fast path and the full render stop agreeing.
+CHARS_PER_TOKEN = 4
+
+
 def token_cost(text: str) -> tuple:
     """Return ``(tokens, cjk_chars, other_chars)`` for a text.
 
     The two counts are what make the estimate *incrementally* computable: the
     token count of an assembled artifact is a pure function of its totals
-    (``cjk + max(other // 5, 1)``), so a caller that removes a line can update
-    the totals instead of re-measuring the whole text. See
+    (``cjk + max(other // CHARS_PER_TOKEN, 1)``), so a caller that removes a line
+    can update the totals instead of re-measuring the whole text. See
     :func:`~atom_memory.summary._select` for the consumer.
 
     Args:
@@ -472,8 +483,38 @@ def token_cost(text: str) -> tuple:
         return (0, 0, 0)
     cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
     other = len(text) - cjk
-    word_tokens = (other // 5) if other else 0
+    word_tokens = (other // CHARS_PER_TOKEN) if other else 0
     return (cjk + max(word_tokens, 1 if other else 0), cjk, other)
+
+
+def truncate_to_tokens(text: str, limit: int) -> str:
+    """Shorten ``text`` so its estimated token count fits ``limit``.
+
+    One pass, not one measurement per prefix: the estimate is a function of the
+    CJK count and the non-CJK count, both of which accumulate as the text is
+    walked. The result carries an ellipsis, which is inside the limit.
+
+    Args:
+        text: The text to shorten (returned unchanged when it already fits).
+        limit: Maximum estimated tokens.
+
+    Returns:
+        The text, cut at the last character that fits.
+    """
+    if limit <= 0 or not text:
+        return ""
+    if estimate_tokens(text) <= limit:
+        return text
+    cjk = 0
+    other = 0
+    for index, ch in enumerate(text):
+        if "\u4e00" <= ch <= "\u9fff":
+            cjk += 1
+        else:
+            other += 1
+        if cjk + max((other // CHARS_PER_TOKEN) if other else 0, 1 if other else 0) > limit:
+            return text[:index].rstrip() + "…" if index > 0 else "…"
+    return text
 
 
 def segment_text(text: str) -> List[str]:

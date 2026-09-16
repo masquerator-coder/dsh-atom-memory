@@ -384,18 +384,25 @@ def test_budget_is_a_hard_cap_including_the_footer():
         conn.close()
 
 
-def test_tiny_budget_degrades_to_a_short_notice():
-    """An unusable budget still yields one honest line, never empty text."""
+def test_an_unusable_budget_yields_nothing_not_a_notice():
+    """A budget below the footer's own cost renders empty text, on purpose.
+
+    The previous behaviour emitted a one-line notice ("N memories omitted,
+    budget too small") — reachable only below ~18 tokens, which no shipping
+    budget can produce (the plugin's floor is 100). A notice is also the wrong
+    answer: it costs tokens, overshoots the cap it is announcing, and tells the
+    caller what it already knows. Empty is the honest and cheaper form, and the
+    injection path reads it as "inject nothing".
+    """
     conn = connect_for_tests()
     try:
         for index in range(30):
             _insert_fact(conn, f"f{index}", f"属性{index}", "值", created_at=index)
-        md = _md(conn, max_tokens=1)
-
-        assert md.strip()            # never empty: empty would read as "no read"
-        assert "省略" in md
-        assert "memory_recall" in md
-        assert len(md.splitlines()) == 1
+        assert _md(conn, max_tokens=1) == ""
+        # One notch above the floor, the render is real again.
+        md = _md(conn, max_tokens=40)
+        assert md.strip()
+        assert estimate_tokens(md) <= 40
     finally:
         conn.close()
 
@@ -530,10 +537,13 @@ def test_the_newest_survives_at_every_budget_down_to_one_line():
                 conn, f"l{index}", "教训", f"教训正文{index}",
                 memory_type="lesson", created_at=1000 + index * HALF_LIFE,
             )
-        for budget in (120, 100, 80, 60, 40):
+        for budget in (200, 160, 120, 100):
             md = _md(conn, max_tokens=budget)
             assert "教训正文19" in md, budget
             assert estimate_tokens(md) <= budget, budget
+        # Below what the footer alone costs there is nothing to give up *to*:
+        # the render is empty rather than a truncated fragment or a notice.
+        assert _md(conn, max_tokens=5) == ""
     finally:
         conn.close()
 
