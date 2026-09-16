@@ -47,6 +47,8 @@ pnpm build       # -> lib/index.mjs
 | `contextInjectionEnabled` | `true` | 会话起始冻结快照注入系统提示词 |
 | `maxProfileRows` | `50` | 用户画像表的条目上限（0 = 不限）。画像会写进系统提示词，每条都在每个请求上付费，这是那笔开销的硬上限；超限时**拒绝新增**并回报当前数量与上限（改动已有条目仍允许），不会静默淘汰最旧的一条 |
 | `rpcTimeoutMs` | `30000` | 单次 RPC 超时 |
+| `scopeEnabled` | `true` | 作用域感知开关（部署期）：采集会话上下文（工作目录 / git 根与 origin / 包名）并作为 `scope_context` 随每次读写与提示词冻结发出；关闭后所有 RPC 参数与引入该维度之前**逐字节一致**（连 `scope_context` 键都不发） |
+| `scopeOrg` / `scopeClient` / `scopeProject` / `scopeSeries` / `scopePhase` | `''` | 显式标签（部署期）：以 `explicit_*` 信号随每次调用发出，可靠性 0.95，高于任何从路径推断出的证据；留空即不发送。刻意**不进**设置命名空间——这不是运行时开关，而是「这个部署服务谁」 |
 
 ## 记忆设置界面（dsh Web）
 
@@ -121,6 +123,7 @@ pnpm build       # -> lib/index.mjs
 | `memory_summary_detail` | 渲染记忆**完整清单**（每条含 `fact_id`）——注意注入系统提示词的是同一份记忆的紧凑版（按类型分组、不含 `fact_id`），要确认注入内容以 `memory_summary` 为准 |
 | `memory_user_md` | 渲染用户画像 markdown |
 | `memory_stats` | 记忆统计计数 |
+| `memory_scope` | 作用域管理面：`list`（作用域树）/ `resolve`（当前上下文解析到哪 + 待确认候选队列）/ `create` / `confirm` / `alias_add` / `merge` |
 
 > **注意：模型只读 `output.render` 的返回值**（`ToolResult.content` 才是 model-facing），
 > `output.schema` 仅用于校验/类型。因此事实的任何字段若未写进 `render`，对模型就是不可见的。
@@ -164,6 +167,38 @@ memory_summary（概览：紧凑注入摘要）
 > （`global`），与写入侧（capture / LLM-first）保持一致，因此记忆能在会话间
 > 共享与检索；当前会话 id 仅作为 `session_id` 记录归属溯源。调用方可通过可选的
 > `user` 参数显式指定其他用户作用域。
+
+### 作用域（scope）
+
+记忆按层级归档（`global > user > org > team > client > project > series > phase >
+document > thread`，Python 侧实现见 `docs/scopes.md`）。dsh 侧只负责**采集会话上下文**
+（`src/scope.ts`）并把它作为 `scope_context` 随调用发出，因此一条记忆落在哪个项目里
+不需要人手工打标签：
+
+| 采集项 | 来源 | 发出为 |
+| --- | --- | --- |
+| 工作目录 | 工具调用取 `exec.agent.session.header.cwd`；自动捕获与提示词冻结取该会话的 header；都没有则退回插件进程 cwd | `path`（0.50） |
+| git 根 | 从工作目录逐级向上找 `.git`——目录即普通克隆，**文件**则读其中的 `gitdir:`（worktree；目标不可读时仍以该目录为仓库边界，避免挂到无关的父仓库上） | `git_root`（0.90） |
+| origin 远端 | git dir 的 `config`（worktree 只有这一处）或 `<根>/.git/config` 里 `[remote "origin"]` 的 `url`，只认 origin 段 | `git_remote`（0.80） |
+| 包名 | git 根（优先）或工作目录的 `package.json` `name`，或 `pyproject.toml` 的 `[project] name`（PEP 621；legacy `[tool.poetry]` 不读） | `package`（0.55） |
+| 显式标签 | 配置 `scopeOrg` / `scopeClient` / `scopeProject` / `scopeSeries` / `scopePhase` | `explicit_*`（0.95） |
+| 条件与位置提示 | LLM 抽取的每条事实可带 `conditions`（语言 / 文档类型 / 读者 / 行业 / 阶段 / 工具 / vcs）与 `scope_hint`（仅提示，0.25 的内容锚点，永不能独自绑定） | `conditions` / `scope_hint` |
+
+四条不变式：
+
+* **凭据先剥掉再当信号**：`https://user:token@host/o/r.git` 只保留 `https://host/o/r.git`；
+  scp 形式 `git@github.com:o/r.git` 原样保留（那是用户名，不是凭据）。git config 原文
+  从不进日志。
+* **没有证据就不发**：`buildScopeContext` 无内容时返回 `undefined`，调用方**不发**
+  `scope_context` 键（不是空对象）——作用域关闭或无信号的部署，RPC 参数与引入该维度
+  之前逐字节一致。
+* **按目录缓存**：一个目录的 git 根 / remote / 包名在会话期间不会变，缓存有上界
+  （`SIGNAL_CACHE_MAX`，`clearScopeSignalCache()` 供测试复位），热路径上是查表而非
+  遍历文件系统；采集**永不抛错**，读不到就是少一个信号。
+* **哪些调用带作用域**：`persist_candidates` / `add`（`memory_add` 的两条路径与自动
+  捕获）、`recall`、`summary`（提示词冻结与 `memory_summary_detail`）、`replace`。
+  设置面板的只读读取与 `get_fact` / `stats` / `user_md` / `forget` **不带**——前者是
+  全局管理视图（Python 侧也不接收该参数）。
 
 ## Model Experience
 

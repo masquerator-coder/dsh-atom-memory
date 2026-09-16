@@ -60,9 +60,10 @@ pip install -e .
 
 | 表面 | 贡献 |
 | --- | --- |
-| 模型可见工具 | `memory_add`、`memory_replace`、`memory_recall`、`memory_get`、`memory_summary`、`memory_snapshot`、`memory_forget`、`memory_summary_detail`、`memory_user_md`、`memory_stats` |
+| 模型可见工具 | `memory_add`、`memory_replace`、`memory_recall`、`memory_get`、`memory_summary`、`memory_snapshot`、`memory_forget`、`memory_summary_detail`、`memory_user_md`、`memory_stats`、`memory_scope` |
 | 系统提示词 | 一段常驻的持久记忆意识段，外加一份在会话起始冻结一次的紧凑 `memory summary` 摘要 |
 | 会话捕获 | 尽力而为的逐消息捕获、压缩前抢救与周期性微调，只读取持久会话事件 |
+| 作用域上下文 | 采集每个会话的工作目录、git 根与 origin 远端、包名（先剥凭据、按目录缓存），作为 `scope_context` 随每次读写与提示词冻结发出——记忆因此落在正确的项目里，不需要人手打标签 |
 | 设置面板 | dsh 设置侧边栏中的 **记忆 / Memory** 分区：总开关、注入体积滑块、抽取模型、一个把摘要查看、用户画像编辑（手动增删改 + 「生成画像」推荐后逐条采纳，带条目上限）与事实浏览/编辑归在一起的 **记忆内容** 区域，以及备份与恢复 |
 | 存储 | 位于 `dbPath` 的单个 SQLite 文件（默认 `~/.dsh/atom-memory/memory.db`） |
 
@@ -95,6 +96,8 @@ pip install -e .
 | `minRelevance` | `0` | 融合相关性下限（0..1）。`0` 即关闭；只有与距离门限配合才有意义。 |
 | `maxActiveFacts` | `0` | 单用户活跃事实软上限（`0` = 不限）。超出部分把价值最低且受保护之外的事实移入归档层；不删除任何内容。 |
 | `rpcTimeoutMs` | `30000` | 单次请求的桥接超时。 |
+| `scopeEnabled` | `true` | 采集会话上下文信号并作为 `scope_context` 发出。关闭（或没有任何信号）时，每个 RPC 的参数与作用域盲的部署**逐字节一致**。 |
+| `scopeOrg` / `scopeClient` / `scopeProject` / `scopeSeries` / `scopePhase` | `''` | 显式标签，以 `explicit_*` 信号发出（可靠性 0.95，高于任何从路径推断的证据）。留空即不发送。 |
 
 `dsh/README.md` 载有逐字段的表格及其理由。
 
@@ -136,7 +139,9 @@ AtomMem (worker, retriever,     tagged background events and logs on stderr
 
 抽取则以相反方向跨越这条边界。宿主用 dsh 当前默认模型执行 LLM 抽取，并把类型化候选通过 `persist_candidates` 送回；Python 内部的规则抽取仍是回退路径，因此没有默认模型的预设会降级而不是中断。
 
-桥接方法：`start`、`stop`、`health`、`add`、`recall`、`replace`、`forget`、`forget_all`、`persist_candidates`、`summary`、`user_md`、`stats`、`list_facts`、`edit_fact`、`list_profile`、`profile_candidates`、`write_profile`、`upsert_profile`、`delete_profile`、`backup`、`restore`。
+桥接方法：`start`、`stop`、`health`、`add`、`recall`、`replace`、`forget`、`forget_all`、`persist_candidates`、`summary`、`user_md`、`stats`、`list_facts`、`edit_fact`、`list_profile`、`profile_candidates`、`write_profile`、`upsert_profile`、`delete_profile`、`backup`、`restore`，以及作用域面：`scope_list`、`scope_resolve`、`scope_create`、`scope_alias_add`、`scope_confirm`、`scope_merge`、`scope_split`、`scope_reparent`、`scope_unresolved`、`scope_promote`、`fact_scope_bind`、`fact_condition_set`、`fact_scope_get`。
+
+作用域感知的调用携带会话的 `scope_context`（`signals` / `conditions` / `phase` / `scope_hint`）。dsh 半侧在 `dsh/src/scope.ts` 里构建它：从会话工作目录出发向上找 git 根、读 git config 的 `remote.origin.url`（先剥凭据）与声明的包名，再加上部署的 `scope*` 标签；LLM 抽取器为每条事实补充 `conditions`（*何时*成立）与 `scope_hint`（*归属哪里*，仅作提示）。内容为空的载荷**根本不发送**，这正是「没有任何上下文的部署行为与之前完全一致」的原因。见[作用域感知记忆](docs/scopes.md)。
 
 ### 一份权威事实，多个派生视图
 
@@ -144,7 +149,7 @@ AtomMem (worker, retriever,     tagged background events and logs on stderr
 
 检索融合两个彼此独立的索引——`sqlite-vec` `vec0` KNN（余弦、512 维、本地 FastEmbed 嵌入）与使用 jieba 分词的 SQLite FTS5——采用 Reciprocal Rank Fusion，再用 `0.4·rrf + 0.2·effective_importance + 0.2·recency + 0.2·trust` 重排。重要度项与近期项都不做 min-max 归一化；每查询一次的重缩放为何会同时毁掉这两项，见[复用强化](docs/reinforcement.md)。
 
-数据库 schema 通过 `PRAGMA user_version` 门控，共十个迁移：`001` 基础表与虚拟表、`002` `type` 判别列、`003` 知识 `content` 正文、`004` `user_profile.pinned`、`005` 强化相关列以及 `fact_reinforcements` 证据日志、`006` 删除冗余的 `summaries` 表、`007`–`008` 后续基础变更、`009` 空占位（其版本号被一个发布前已回滚的设计占用，但编号不能留空洞）、`010` 把画像改为用户自有的表（清空旧投影输出并删除 `user_profile.pinned`）。
+数据库 schema 通过 `PRAGMA user_version` 门控，共十一个迁移：`001` 基础表与虚拟表、`002` `type` 判别列、`003` 知识 `content` 正文、`004` `user_profile.pinned`、`005` 强化相关列以及 `fact_reinforcements` 证据日志、`006` 删除冗余的 `summaries` 表、`007`–`008` 后续基础变更、`009` 空占位（其版本号被一个发布前已回滚的设计占用，但编号不能留空洞）、`010` 把画像改为用户自有的表（清空旧投影输出并删除 `user_profile.pinned`）、`011` 作用域维度（`scope` / `scope_alias` / `scope_signal` / `scope_candidate` / `fact_scope` / `fact_condition` / `fact_origin` / `fact_evolution`，并**清空事实表**——作用域无法回填，理由见 [`docs/scopes.md`](docs/scopes.md)）。
 
 ### 为什么浏览器 bundle 要提交进仓库
 
@@ -159,6 +164,7 @@ AtomMem (worker, retriever,     tagged background events and logs on stderr
 
 - [`docs/python-library.md`](docs/python-library.md) —— Python 库契约：安装、`AtomMem` API、`MemConfig`、返回结构、存储与检索设计、记忆类型。
 - [`docs/reinforcement.md`](docs/reinforcement.md) —— 复用强化与近期项：饱和曲线、状态与强度的分离、什么算复用，以及为何两者都不做 min-max 归一化。
+- [`docs/scopes.md`](docs/scopes.md) —— 作用域感知记忆：层级、信号可靠性表、上下文如何解析、写读路径的差异，以及管理面。
 - [`dsh/README.md`](dsh/README.md) —— dsh 半侧详解：桥接协议、每一个工具、设置面板的六个表面、client bundle 构建规则，以及装饰器降级步骤。
 - [`dsh/CHANGELOG.md`](dsh/CHANGELOG.md) —— 逐轮记录发现的缺陷与做出的决定，包括强化审计。
 
@@ -220,7 +226,7 @@ memory content as system instructions.
 
 #### 模型看到什么
 
-十个工具 schema：`memory_add`、`memory_replace`、`memory_recall`、`memory_get`、`memory_summary`、`memory_snapshot`、`memory_forget`、`memory_summary_detail`、`memory_user_md`、`memory_stats`。本层位于树外，因此不出现在生成的工具目录里，所以本地相关的差异是：模型可见的结果文本是 `render` 的返回值，而非 `output.schema`，因此任何没写进 `render` 的事实字段对模型都是不可见的；`memory_recall` 暴露 `fact_id`、`type` 与完整知识 `content` 正文，只返回这次深入检索到的事实，不再前置聚合摘要；`memory_forget` 是软删除；`memory_summary_detail` 返回带 `fact_id` 的完整清单，这是确认冻结摘要——另一种、更紧凑的深度——究竟携带了什么内容的唯一途径。工具的 `user_id` 统一落入同一个 fallback 作用域，因此记忆在会话间共享，而会话 id 仅作为溯源记录。
+十一个工具 schema：`memory_add`、`memory_replace`、`memory_recall`、`memory_get`、`memory_summary`、`memory_snapshot`、`memory_forget`、`memory_summary_detail`、`memory_user_md`、`memory_stats`、`memory_scope`。本层位于树外，因此不出现在生成的工具目录里，所以本地相关的差异是：模型可见的结果文本是 `render` 的返回值，而非 `output.schema`，因此任何没写进 `render` 的事实字段对模型都是不可见的；`memory_recall` 暴露 `fact_id`、`type` 与完整知识 `content` 正文，只返回这次深入检索到的事实，不再前置聚合摘要；`memory_forget` 是软删除；`memory_summary_detail` 返回带 `fact_id` 的完整清单，这是确认冻结摘要——另一种、更紧凑的深度——究竟携带了什么内容的唯一途径；`memory_scope` 是作用域的管理面（查看树、诊断当前解析、创建/确认/加别名/合并）。工具的 `user_id` 统一落入同一个 fallback 作用域，因此记忆在会话间共享，而会话 id 仅作为溯源记录。
 
 #### Token 影响
 

@@ -2,6 +2,120 @@
 
 ## [Unreleased]
 
+### Added (第十八轮：作用域感知记忆 —— 显式的作用域维度 + dsh 侧上下文采集)
+
+**问题**：记忆此前是"每个用户一个全局池"，事实从哪里来（哪个项目、哪个客户、哪个阶段）
+从未被记录，于是五种失效同时存在：**跨项目污染**（A 项目的经验被 B 项目召回）、**全局
+规则与项目规则无法区分**（"TypeScript 开严格模式"要么被绑到某个项目、要么淹在噪音里）、
+**项目覆盖会毁掉一般规则**（项目自己的取值把公司级取值 `superseded` 掉，而那条规则每个
+项目都还需要）、**同一 claim 在第二个项目重申被当成重复合并**（这恰恰是"这是通用做法"
+的证据）、**注入摘要无作用域**（会话起始的摘要把无关项目混在一起）。
+
+**Python 侧（新维度）**：
+
+- **作用域是存储维度，不是语义属性**：新增表 `scope`（层级 + 物化 `path`）、
+  `scope_alias`（别名）、`scope_signal`（身份指纹，`(type, value)` 唯一 —— 一个信号只
+  标识一个作用域，这正是解析可判定的原因）、`scope_candidate`（低置信候选队列）、
+  `fact_scope`（事实↔作用域多对多）、`fact_condition`（"跨项目但有条件"的经验）、
+  `fact_origin`（抽象规则的来源证据）、`fact_evolution`（同作用域内的演化链接）。
+  **没有 `fact_scope` 行的事实按 global 读**——这条兼容规则让迁移前写入的行无需伪造绑定
+  仍然有意义，也让任何读取路径不会因为"查不到绑定"而把一条事实变成不可见。层级全部走
+  `parent_id`；`path` 只是给人看的标签（规范名本身可能含分隔符，解析回去必然歧义）。
+- **解析（`atom_memory/scope.py` + `context.py`）**：按可靠性表（显式标签 0.95 / git 根
+  与持久 id 0.90 / remote 0.80 / 路径 0.50 / 内容锚点 0.25 …）从最具体层级向上匹配
+  `scope_signal` 再匹配 `scope_alias`；命中即绑定并登记新信号，未命中则只创建**证据达到
+  0.8（设计里的"高"档）**的层级（先建更一般的层级，项目因此落在客户下面），否则把候选写进
+  队列、见满 3 次且信号一致才建档。**匹配到的信号永远绑定**（阈值管的是"创建"和"这次绑定
+  算多可信"，不是重新识别：信号行唯一，再见到它就是身份本身）；**解析绝不重构层级**（把
+  推断出的客户插到已有项目上面，会静默搬走已绑定的全部事实——那由显式的
+  `scope_reparent` / `merge` / `split` 做）；**查询侧解析不写任何东西**（否则答案取决于
+  被问过几次）。
+- **写入分层**：去重与冲突判定的窗口**就是写入自身的那个作用域**（不含祖先）。若含祖先，
+  项目在单值键上写出自己的取值就会 `superseded` 掉全局规则，而那条规则其他项目仍需要。
+  跨作用域不再判矛盾，改为**建链接**：对象相同 → `fact_origin` 的 `cross_scope_similar`；
+  对象不同且一方是另一方的祖先 → `fact_evolution` 的 `exception`；其余 → `evolves_to`。
+  `replace` 继承被替换事实的作用域（纠正不该把事实搬到调用者此刻所在的另一个项目）。
+- **召回分层**：候选集 = 当前作用域路径 + 其 `phase` 子作用域 + 条件匹配的其他作用域事实
+  + 未绑定（global）事实；**兄弟项目的事实不是候选**，只能靠条件匹配进入并被低权重打分。
+  排序在原有四项之上**仅当查询带上下文时**追加 `0.20·scope_distance + 0.15·condition_match
+  + 0.05·phase_match`，因此不带上下文的调用方排序与引入该维度之前逐字节一致。
+- **注入分块**：紧凑摘要在有上下文时按块渲染（`[当前项目: api]` / `[客户: acme]` /
+  `[阶段: draft]` / `[全局规则]` / `[条件规则: k=v]`），每块独立预算、全局块有保底预留；
+  总预算仍是**硬上限**：装不下时按"由具体到一般"的顺序回收（条件规则 → 阶段 → 远祖 →
+  当前作用域 → 全局规则最后），再放弃页脚（唯一不承载记忆的一行），最后才丢整块。
+  绑定在不可见作用域上的事实**根本不注入**（设计里的"其他项目参考默认不注入"，仍可用
+  `memory_recall` 取到）。detail 深度刻意不分块（那是给人定位/编辑用的）。
+- **提升为全局规则**：空闲维护里的 `promote_abstractions` 找出被 ≥3 个不同作用域独立持有
+  的同一 claim（按 `content_fingerprint`），在根部写入一份 `system_inferred_high` 副本、
+  绑到 `/global`、用 `fact_origin(relation='abstraction')` 连回每条具体事实，**并保留那些
+  具体事实**（它们是规则的证据，也是项目差异仍然可见的地方）。提升是幂等的，且在同一事务
+  里写 FTS/向量——搜索找不到的规则不是规则。
+- **管理面**：`scope_list` / `scope_resolve` / `scope_create` / `scope_alias_add` /
+  `scope_confirm` / `scope_unresolved` / `scope_merge` / `scope_split` / `scope_reparent` /
+  `scope_promote` / `fact_scope_bind` / `fact_condition_set` / `fact_scope_get`（Python 侧
+  `AtomMem` 方法同名，dsh 侧经 RPC 暴露）。`merge` 保留源作用域为 `merged` 并跟随
+  `merged_into`，历史仍可读；`reparent` 是 merge/split 表达不了的那种纠正（先发现项目、
+  后才知道客户），必须显式做。
+- **迁移 011 清空事实表**（这是用户明确选择的"清空重来"）：作用域**无法回填**——旧行里
+  没有任何信息说明它来自哪个项目，一律默认成 global 会把这个维度要消除的跨项目池原样
+  重建。因此清空 `facts`（连同其 FTS/向量、强化证据、候选溯源），`user_profile` 不动
+  （自迁移 010 起它是用户自有的表，不由事实派生）。索引用 `DROP TABLE IF EXISTS` + 重建
+  而不是 `DELETE`：那是唯一在"索引从未存在过"的库上也安全的写法。**这是一次性代价，
+  不是策略，后续迁移不得重复。**
+- **安全**：信号同时保留原始值与规范化身份值；原始值用于审计展示，因此 URL 形式的信号
+  在**入库前**就剥掉凭据——不只 userinfo（`user:token@host`），也包括查询串
+  （`?access_token=…`），并加上长度上限。身份计算只用规范化值（本就不含凭据）。
+- **旧库升级路径的测试改写**：`tests/test_db.py` 的 v1→v11 链路测试原本断言"事实存活"，
+  那是旧承诺；现在改为断言 **schema 回填正确**（在升级后写入新行来验证列默认值）+
+  **事实已清空** + 根作用域存在。承诺变了，测试就得变，而不是把断言删掉。
+
+**dsh 侧**：把「这个会话在哪里工作」采集出来，作为 `scope_context` 随每次读写与提示词
+冻结发出，使记忆归档到正确的项目/文档/阶段，而不是靠人手工打标签。
+
+- **新模块 `src/scope.ts`**：`collectScopeSignals` 从会话工作目录逐级向上找 `.git`
+  （目录 = 普通克隆；**文件** = worktree，读其中 `gitdir:` 指向的 git dir，目标不可读
+  时仍以该目录为仓库边界——否则会挂到无关的父仓库），读 git config 的
+  `remote.origin.url`（只认 `[remote "origin"]` 段，避免把别的 remote 的 url 当成身份），
+  再从 git 根/工作目录的 `package.json` 或 `pyproject.toml` 的 `[project] name` 取包名。
+  三条不变式：**采集永不抛错**（读不到就是少一个信号）；**没有证据就不发**
+  （`buildScopeContext` 返回 `undefined`，调用方连 `scope_context` 键都不发）；**凭据
+  先剥掉再当信号**（`https://user:token@host/...` → `https://host/...`；scp 形式
+  `git@host:o/r.git` 原样保留，那是用户名不是凭据；config 原文从不进日志）。按工作目录
+  缓存（有上界，`clearScopeSignalCache()` 供测试），因为一个目录的 git 根/remote/包名
+  在会话期间不会变，而每个捕获、每次工具调用、每次提示词冻结都要问同一个问题。
+  文件系统面（`exists`/`isDirectory`/`readText`/`join`/`parent`）可注入，测试全部跑在
+  假文件系统上（worktree、坏 config、不可读的清单都能构造）。
+- **配置**（`scopeEnabled` 默认 `true`，`scopeOrg`/`scopeClient`/`scopeProject`/
+  `scopeSeries`/`scopePhase` 为显式标签）：显式标签以 `explicit_*` 信号发出，可靠性
+  0.95，高于任何从路径推断的证据。刻意**不进**运行时/设置命名空间——这不是运行时开关，
+  而是「这个部署服务谁」。
+- **接线**：`memory_add`（`persist_candidates` 与 `add` 两条路径）、`memory_recall`、
+  `memory_summary`、`memory_summary_detail`、`memory_replace`，以及自动捕获路径
+  （`createCapture` 从 `apply` 中抽出，因此自动捕获的线形可在不启动 Python 子进程的
+  前提下测试）。提示词冻结（`context.ts`）也带该载荷，且以**该会话**的 header cwd 为
+  信号源，使注入摘要与会话内工具调用对「在哪个项目」的判断一致。设置面板的只读读取与
+  `get_fact`/`stats`/`user_md`/`forget` 不带（前者是全局管理视图，后者 Python 侧也不
+  接收该参数）。
+- **新工具 `memory_scope`**（模型可见的管理面）：`list` 作用域树、`resolve` 当前解析
+  结果 + 待确认候选队列（显式 `create: false`，诊断调用不得顺便造作用域）、`create`、
+  `confirm`、`alias_add`、`merge`；参数缺失时报清晰错误且**不发任何 RPC**。
+- **抽取器**：prompt 增加 per-fact `conditions`（*何时*成立：language / doc_type /
+  audience / industry / stage / tool / vcs）与 `scope_hint`（*归属哪里*，仅提示，
+  0.25 的内容锚点，永不独自绑定）；两者按既有数值解析同一容忍度防御式解析——shape 不对
+  的条目**丢弃而不是让整条事实失败**，映射写法 `{"language":"python"}` 也认。
+- **测试**：Python 侧新增 `tests/test_scope.py`（信号规范化与凭据剥离、解析的创建/绑定/
+  排队/提升/只读、层级与展开、距离与条件权重、按作用域分层的校验、merge/split/reparent、
+  分块注入的标题/硬预算/挤压顺序、跨项目阶段不得注入）与 `tests/test_scope_writes.py`
+  （写入归档与条件、跨作用域链接、同作用域仍会 supersede、`replace` 继承作用域、抽象提升
+  含索引与幂等、`AtomMem` 与 RPC 全套作用域方法）；`tests/test_db.py` 的升级链测试按新承诺
+  改写。dsh 侧新增 `tests/scope.test.ts`（假文件系统上的信号采集 / 工作树 / 凭据剥离 /
+  缓存与上界 / payload 组装 / 「无可发」）、`tests/tools-scope.test.ts`（每个调用点的
+  `scope_context` 与「不发该键」的反向断言、`memory_scope` 六个动作与校验、自动捕获
+  路径）；`context.test.ts`、`llm-extractor.test.ts`、`capture.test.ts` 同步补充。
+  另用真实 Python 侧校验过：payload 的每个信号类型都在 `SIGNAL_SPECS` 里、`scope_hint`
+  落到 `content_anchor`、候选级 `conditions`/`scope_hint` 两种写法都被
+  `_candidate_from_rpc_dict` 接住，dsh 侧发出的每个参数对象都能 bind 到真实签名。
+
 ### Changed (第十七轮：用户画像改为用户自有的表 —— 手动生成、确认入库、条目有上限)
 
 **问题（用户报告）**：在设置页面手动删除画像条目并保存后，条目**没有真正删除**——删除返回 `deleted: 1`，紧接着的 `list_profile` 又把它重建了出来。根因：`user_profile` 是活跃事实的**投影**，`list_profile` / `user_md` 每次读取都先跑 `derive_profile_from_facts`；删掉的只是投影行，源头事实仍然 `active`，于是同一 `(user_id, section, key)` 被 `ON CONFLICT DO UPDATE` 写回。配套的两个症状同源：投影**只 upsert 从不 delete**，所以事实被撤回后画像行会变成永远清不掉的孤儿行；`pinned` 也救不了它（`pinned` 的守卫是"已存在且 pinned 才跳过"，行被删后 `existing is None`，守卫落空，pin 标记还随行一起丢失）。这是在会话中端到端复现并确认的（真实 `AtomMem` + 真实库文件）。

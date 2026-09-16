@@ -455,3 +455,154 @@ ship together.
 **Tests.** `tests/test_hardening.py` — an oversized body comes back shortened and
 flagged while `get_fact` returns it whole; a body under the ceiling is untouched;
 `get_fact` refuses another user's fact.
+
+---
+
+## 14. Scope is an explicit dimension, and "unscoped" means global
+
+**Rule.** A fact carries zero or more scope bindings (`fact_scope`) and zero or
+more conditions (`fact_condition`); it carries no scope column of its own. A fact
+with **no** binding is read as a global fact by every path — dedup, conflict,
+recall and the digest.
+
+**Why.** "Where this came from" was previously an implicit semantic property, so
+the store could not tell a company-wide rule from one project's decision, could
+not keep two projects' experience apart, and could not notice that three projects
+had independently learned the same thing. Making it a table is what allows all
+three. The unbound-is-global rule is the compatibility clause that makes the
+migration survivable: rows written before the dimension existed stay meaningful
+without inventing a binding, and a read path can never make a fact invisible by
+failing to find one.
+
+**Owner.** Migration 011 (`scope`, `scope_alias`, `scope_signal`,
+`scope_candidate`, `fact_scope`, `fact_condition`, `fact_origin`,
+`fact_evolution`), `atom_memory/context.py`, `atom_memory/scope.py`,
+`docs/scopes.md`.
+
+**Tests.** `tests/test_scope.py::test_an_unbound_fact_counts_as_global_for_both_directions`,
+`tests/test_scope_writes.py::test_a_scope_blind_write_is_filed_as_global`.
+
+---
+
+## 15. A signal identifies one scope; weak evidence queues instead of creating
+
+**Rule.** A scope identity is a row in `scope_signal`, unique on
+`(signal_type, normalized_value)`. Resolution binds when a context's signal
+matches a registered one, creates only when the level's evidence reaches
+`scope_new_threshold` (the design's 高 band), and otherwise records the candidate
+in `scope_candidate` and binds the fact to the nearest *known* ancestor. A queued
+candidate becomes a scope after `scope_promote_after` consistent sightings, or
+when the user confirms it. Creating a second scope for a signal that is already
+registered is refused outright.
+
+**Why.** Three failure modes are all the same failure: a scope tree that grows
+duplicates. Two scopes for one project split its memory and neither recalls the
+other; a scope created from a weak hint (a folder name) is a near-duplicate of the
+one the next session would create; and a name that identifies two projects is
+cross-project pollution by construction. Making the *signal* unique is what makes
+resolution decidable, and queueing is what makes a wrong guess cheap: a queued
+candidate costs a row, a wrong scope costs every fact filed under it.
+
+**Owner.** `atom_memory/scope.py` (`resolve`, `_create_chain`, `_queue_candidates`,
+`_promote_candidate`, `create`), `atom_memory/context.py` (the reliability table).
+
+**Tests.** `tests/test_scope.py` — `test_a_low_confidence_signal_is_queued_not_created`,
+`test_a_third_consistent_sighting_promotes_the_candidate`,
+`test_a_second_different_signal_does_not_promote_the_first`,
+`test_creating_a_second_scope_for_a_known_signal_is_refused`.
+
+---
+
+## 16. Contradiction is judged inside one scope; across scopes things are linked
+
+**Rule.** The write path's dedup/conflict window is **exactly the write's own
+scope** — not its ancestors. Inside it, the existing rules apply unchanged (a
+restatement folds; a newer assertion supersedes under a single-valued key unless
+the stored claim has decisively stronger evidence). Across scopes nothing is
+merged and nothing is superseded: the write path records a relation instead —
+`cross_scope_similar` in `fact_origin` when both hold the same object,
+`exception` when one scope is an ancestor of the other, `evolves_to` otherwise.
+`replace` inherits the replaced fact's scopes.
+
+**Why.** If ancestors were in the window, a project stating its own value under a
+single-valued key would supersede the global rule — and the rule every *other*
+project still needs would be gone, silently, because the project's statement is
+the newest one. Keeping both and ranking the specific one higher is the design's
+"具体覆盖一般，保留例外": the model sees the rule and the exception instead of a
+contradiction it cannot resolve. The link is also what makes promotion possible:
+an independent restatement in a second project is the *evidence* that a pattern
+is general, so folding it away as a duplicate destroys exactly the signal the
+abstraction pass reads.
+
+**Owner.** `atom_memory/worker.py` (`_write_scope_ids`, `_persist_fact`,
+`_link_cross_scope`, `_process_replace`), `atom_memory/validator.py`
+(`_check_conflict`, `cross_scope_neighbours`), `atom_memory/scope.py`
+(`relate_cross_scope`).
+
+**Tests.** `tests/test_scope_writes.py` — `test_a_project_override_does_not_supersede_the_global_rule`,
+`test_a_contradiction_inside_one_scope_still_supersedes`,
+`test_the_same_claim_in_two_scopes_is_two_facts_linked_by_origin`,
+`test_replace_inherits_the_scope_of_the_fact_it_replaces`.
+
+---
+
+## 17. Recall expands upward; the digest says which level a rule belongs to
+
+**Rule.** A scoped recall considers the scope's own path, its `phase`
+descendants, facts whose conditions match the current context from anywhere else,
+and global facts. A sibling scope's facts are **not** candidates. The compact
+digest renders one block per level — current scope, ancestors, phases, global
+rules, condition rules — each under its own budget, with the artifact capped
+hard; facts bound to an invisible scope are not injected at all. The detail depth
+is not blocked.
+
+**Why.** Recall and injection answer different questions. Recall should find
+anything that could be relevant, so it walks *up* the hierarchy (a project
+inherits its company's rules) and down through phases (a project's own history);
+injection should be short and priority-ordered, so it must also be able to leave
+another project's material out entirely — and it must say *which* level each rule
+lives at, because without the heading a project rule and a company rule read as
+two contradicting statements. The budget is hard for the same reason it is hard
+in the flat digest: a caller that asked for a token budget must never receive
+more than it asked for.
+
+**Owner.** `atom_memory/retriever.py` (`_scope_view`, `_scope_predicate`,
+`_rerank`), `atom_memory/summary.py` (`_render_scoped`, `_partition_blocks`,
+`_compose_blocks`).
+
+**Tests.** `tests/test_scope.py` — `test_recall_excludes_a_sibling_project_without_a_condition_match`,
+`test_recall_reaches_a_condition_matching_fact_from_another_scope`,
+`test_recall_ranks_the_project_rule_above_the_global_one`,
+`test_the_scoped_digest_never_exceeds_its_budget`,
+`test_the_current_scope_and_the_global_rules_survive_a_squeeze`; and
+`tests/test_scope.py::test_a_scope_blind_query_keeps_the_pre_scope_pipeline`,
+which pins that a caller sending no context gets the pre-scope pipeline exactly.
+
+---
+
+## 18. A pattern several scopes arrived at becomes a global rule
+
+**Rule.** The idle maintenance pass promotes a claim that
+`scope_abstraction_min_scopes` (default 3) distinct scopes hold independently: it
+writes a copy at the root (`source_type='system_inferred_high'`, inheriting the
+strongest evidence among the sources), binds it to `/global`, links every
+concrete fact through `fact_origin` (`relation='abstraction'`) and keeps those
+concrete facts. The pass is thresholded, idempotent, and writes the promoted
+row's FTS and vector entries.
+
+**Why.** A pattern three different projects arrived at is not a project detail, it
+is how the work is done — and leaving it inside those three projects means the
+fourth re-learns it. It runs from maintenance rather than the write path because
+it is a store-wide judgement no single write can make, and because the promoted
+row needs an embedding like any other fact: a rule that search cannot find is not
+a rule. The concrete facts stay because they are the evidence for the rule and
+the place a project-specific nuance remains visible.
+
+**Owner.** `atom_memory/worker.py` (`promote_abstractions`,
+`_write_abstracted_fact`, `maintenance`), `atom_memory/scope.py`
+(`abstraction_candidates`).
+
+**Tests.** `tests/test_scope_writes.py` — `test_the_abstraction_pass_promotes_a_shared_claim_and_indexes_it`
+(including its idempotence and a zero-orphan index check),
+`test_promotion_stays_off_with_scope_awareness_disabled`;
+`tests/test_scope.py::test_abstraction_requires_independent_scopes`.

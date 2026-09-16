@@ -60,9 +60,10 @@ Leave `pythonBin` empty to use `python` on `PATH`, or point it at a virtualenv i
 
 | Surface | Contribution |
 | --- | --- |
-| Model-facing tools | `memory_add`, `memory_replace`, `memory_recall`, `memory_get`, `memory_summary`, `memory_snapshot`, `memory_forget`, `memory_summary_detail`, `memory_user_md`, `memory_stats` |
+| Model-facing tools | `memory_add`, `memory_replace`, `memory_recall`, `memory_get`, `memory_summary`, `memory_snapshot`, `memory_forget`, `memory_summary_detail`, `memory_user_md`, `memory_stats`, `memory_scope` |
 | System prompt | A persistent-memory awareness section (always registered) plus a compact `memory summary` digest frozen once at session start |
 | Session capture | Best-effort per-message capture, pre-compression rescue, and a periodic nudge, reading only durable session events |
+| Scope context | Each session's working directory, git root and origin remote, and declared package name are collected (credential-stripped, cached per directory) and sent as `scope_context` on every read, write and prompt freeze, so memory lands in the right project without hand-tagging |
 | Settings panel | A **记忆 / Memory** section in the dsh settings sidebar: master switch, injection-budget slider, extraction model, a **记忆内容** region that groups summary viewing, user-profile editing (manual add/edit/delete plus a **generate profile** run whose proposals are accepted entry by entry, under a row cap), and fact browsing/editing, plus backup and restore |
 | Storage | One SQLite file at `dbPath` (default `~/.dsh/atom-memory/memory.db`) |
 
@@ -95,6 +96,8 @@ Deploy-time fields are declared in [`dsh/cordis.patch.yml`](dsh/cordis.patch.yml
 | `minRelevance` | `0` | Fused-relevance floor (0..1). `0` disables it; it only means anything together with the distance gate. |
 | `maxActiveFacts` | `0` | Soft cap on one user's active facts (`0` = unlimited). Excess moves the least valuable unprotected facts to the archive tier; nothing is deleted. |
 | `rpcTimeoutMs` | `30000` | Per-request bridge timeout. |
+| `scopeEnabled` | `true` | Collect the session's context signals and send them as `scope_context`. Off (or no signal at all) leaves every RPC's params byte-identical to a scope-blind deployment. |
+| `scopeOrg` / `scopeClient` / `scopeProject` / `scopeSeries` / `scopePhase` | `''` | Explicit tags sent as `explicit_*` signals (reliability 0.95, above anything inferred from a path). Empty means "not sent". |
 
 `dsh/README.md` carries the field-by-field table with its rationale.
 
@@ -136,7 +139,9 @@ The boundary is what keeps the two halves independently installable: the Python 
 
 Extraction crosses that boundary in the other direction. The host runs LLM extraction with dsh's current default model and sends typed candidates back through `persist_candidates`; rule-based extraction inside Python remains the fallback, so a preset without a default model degrades rather than breaks.
 
-Bridge methods: `start`, `stop`, `health`, `add`, `recall`, `replace`, `forget`, `forget_all`, `persist_candidates`, `summary`, `user_md`, `stats`, `list_facts`, `edit_fact`, `list_profile`, `profile_candidates`, `write_profile`, `upsert_profile`, `delete_profile`, `backup`, `restore`.
+Bridge methods: `start`, `stop`, `health`, `add`, `recall`, `replace`, `forget`, `forget_all`, `persist_candidates`, `summary`, `user_md`, `stats`, `list_facts`, `edit_fact`, `list_profile`, `profile_candidates`, `write_profile`, `upsert_profile`, `delete_profile`, `backup`, `restore`, and the scope surface: `scope_list`, `scope_resolve`, `scope_create`, `scope_alias_add`, `scope_confirm`, `scope_merge`, `scope_split`, `scope_reparent`, `scope_unresolved`, `scope_promote`, `fact_scope_bind`, `fact_condition_set`, `fact_scope_get`.
+
+Scope-aware calls carry the session's `scope_context` (`signals` / `conditions` / `phase` / `scope_hint`). The dsh half builds it in `dsh/src/scope.ts` from the session's working directory — walking up to the git root, reading `remote.origin.url` out of the git config (credentials stripped) and the declared package name — plus the deployment's `scope*` tags; the LLM extractor adds per-fact `conditions` (when a claim holds) and a `scope_hint` (where it belongs, a hint only). A payload with nothing in it is not sent at all, which is what keeps a deployment without any context behaving exactly as before. See [scope-aware memory](docs/scopes.md).
 
 ### One authoritative fact, several derived views
 
@@ -144,7 +149,7 @@ Atomic facts are the only stored memory. The `summary` view (both depths) is reb
 
 Retrieval fuses two independent indexes — `sqlite-vec` `vec0` KNN (cosine, 512-dim, local FastEmbed embeddings) and SQLite FTS5 segmented with jieba — by Reciprocal Rank Fusion, then re-ranks with `0.4·rrf + 0.2·effective_importance + 0.2·recency + 0.2·trust`. Neither the importance nor the recency term is min-max normalised; see [reuse reinforcement](docs/reinforcement.md) for why a per-query rescale destroys both.
 
-Schema is `PRAGMA user_version`-gated across ten migrations: `001` the base tables and virtual tables, `002` the `type` discriminator, `003` the knowledge `content` body, `004` `user_profile.pinned`, `005` the reinforcement columns plus the `fact_reinforcements` evidence log, `006` dropping the redundant `summaries` table, `007`–`008` later base changes, `009` a no-op placeholder (its revision number was consumed by a design that was rolled back before release), and `010` making the profile a table the user owns (clears the projection output and drops `user_profile.pinned`).
+Schema is `PRAGMA user_version`-gated across eleven migrations: `001` the base tables and virtual tables, `002` the `type` discriminator, `003` the knowledge `content` body, `004` `user_profile.pinned`, `005` the reinforcement columns plus the `fact_reinforcements` evidence log, `006` dropping the redundant `summaries` table, `007`–`008` later base changes, `009` a no-op placeholder (its revision number was consumed by a design that was rolled back before release), `010` making the profile a table the user owns (clears the projection output and drops `user_profile.pinned`), and `011` the scope dimension (`scope` / `scope_alias` / `scope_signal` / `scope_candidate` / `fact_scope` / `fact_condition` / `fact_origin` / `fact_evolution`), which also **clears the fact store** — a scope cannot be back-filled, and the reason is in [`docs/scopes.md`](docs/scopes.md).
 
 ### Why the browser bundle is committed
 
@@ -159,6 +164,7 @@ The host serves `exports["./client"]` **verbatim** as a browser bundle — it do
 
 - [`docs/python-library.md`](docs/python-library.md) — the Python library contract: installation, `AtomMem` API, `MemConfig`, return shapes, storage and retrieval design, memory types.
 - [`docs/reinforcement.md`](docs/reinforcement.md) — reuse reinforcement and the recency term: the saturating curve, state-versus-strength separation, what counts as reuse, and why neither term is min-max normalised.
+- [`docs/scopes.md`](docs/scopes.md) — scope-aware memory: the hierarchy, the signal reliability table, how a context resolves, what the write and read paths do differently, and the management surface.
 - [`dsh/README.md`](dsh/README.md) — the dsh half in depth: bridge protocol, every tool, the settings panel's six surfaces, the client-bundle build rules, and the decorator downlevel step.
 - [`dsh/CHANGELOG.md`](dsh/CHANGELOG.md) — the round-by-round record of defects found and decisions taken, including the reinforcement audit.
 
@@ -220,7 +226,7 @@ A stable repeated prefix within the session. The snapshot is frozen on first ass
 
 #### What the model sees
 
-Ten tool schemas: `memory_add`, `memory_replace`, `memory_recall`, `memory_get`, `memory_summary`, `memory_snapshot`, `memory_forget`, `memory_summary_detail`, `memory_user_md`, `memory_stats`. This layer is out-of-tree and therefore absent from the generated tool catalog, so the locally relevant deltas are: the visible result text is what `render` returns, never `output.schema`, so a fact field omitted from `render` is invisible to the model; `memory_recall` exposes `fact_id`, `type`, and the full knowledge `content` body, flags a body it had to shorten and points at `memory_get factId=...` for the rest, and says so when an index was unavailable rather than returning an empty list (`memory_get` reads one fact whole, which is what makes the per-fact ceiling safe rather than lossy); `memory_forget` is a soft retract (`purge=true` erases instead); `memory_summary` renders the compact digest at the injected budget, `memory_summary_detail` the full listing with `fact_id`, and `memory_snapshot` the exact fenced text the session's prompt is being served from - the only way to confirm what the model actually read. A write tool (`memory_add`, `memory_replace`, `memory_forget`) waits briefly for the store's verdict and reports it: written, replaced (old -> new), or refused with the reason. Tool `user_id` resolves to one shared fallback scope, so memory is shared across sessions, while the session id is recorded only as provenance.
+Eleven tool schemas: `memory_add`, `memory_replace`, `memory_recall`, `memory_get`, `memory_summary`, `memory_snapshot`, `memory_forget`, `memory_summary_detail`, `memory_user_md`, `memory_stats`, `memory_scope`. This layer is out-of-tree and therefore absent from the generated tool catalog, so the locally relevant deltas are: the visible result text is what `render` returns, never `output.schema`, so a fact field omitted from `render` is invisible to the model; `memory_recall` exposes `fact_id`, `type`, and the full knowledge `content` body, flags a body it had to shorten and points at `memory_get factId=...` for the rest, and says so when an index was unavailable rather than returning an empty list (`memory_get` reads one fact whole, which is what makes the per-fact ceiling safe rather than lossy); `memory_forget` is a soft retract (`purge=true` erases instead); `memory_summary` renders the compact digest at the injected budget, `memory_summary_detail` the full listing with `fact_id`, and `memory_snapshot` the exact fenced text the session's prompt is being served from - the only way to confirm what the model actually read; `memory_scope` is the management surface for the scope hierarchy (list the tree, diagnose what the current context resolves to and which candidates are still unproven, create / confirm / alias / merge). A write tool (`memory_add`, `memory_replace`, `memory_forget`) waits briefly for the store's verdict and reports it: written, replaced (old -> new), or refused with the reason. Tool `user_id` resolves to one shared fallback scope, so memory is shared across sessions, while the session id is recorded only as provenance.
 
 #### Token effect
 

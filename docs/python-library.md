@@ -85,14 +85,49 @@ Primary class: `AtomMem`.
 | --- | --- | --- |
 | `start` | `async start() -> None` | Open DB, load embedder, start worker. Idempotent. |
 | `stop` | `async stop() -> None` | Stop worker and close DB. Idempotent. |
-| `add` | `async add(user_id, session_id, text, turn_id=0) -> dict` | Enqueue an utterance for extraction. Returns `{candidate_id, status, trace_id}` (`status='pending'`). |
-| `recall` | `async recall(user_id, query, token_budget=2000, top_k=10, include_pending=True) -> dict` | Ranked active facts + pending candidates. |
-| `replace` | `async replace(user_id, fact_id, new_text) -> dict` | Soft-replace: old fact → `superseded`, `superseded_by` set, new fact `active`. |
+| `add` | `async add(user_id, session_id, text, turn_id=0, wait_ms=None, scope_context=None) -> dict` | Enqueue an utterance for extraction. Returns `{candidate_id, status, trace_id}` (`status='pending'`). |
+| `recall` | `async recall(user_id, query, token_budget=2000, top_k=10, scope_context=None, conditions=None) -> dict` | Ranked active facts + active conflicts + the resolved scope. |
+| `replace` | `async replace(user_id, fact_id, new_text, wait_ms=None, scope_context=None) -> dict` | Soft-replace: old fact → `superseded`, `superseded_by` set, new fact `active` in the old fact's scopes. |
 | `forget` | `async forget(user_id, fact_id=None, session_id=None) -> dict` | Soft-delete: fact(s) → `retracted`. Pass exactly one of `fact_id`/`session_id`. |
-| `summary` | `async summary(user_id, max_tokens=1500, detail=True) -> str` | Render the memory summary. `detail=True` lists every fact with its `fact_id`; `detail=False` renders the compact digest injected into the prompt. |
+| `summary` | `async summary(user_id, max_tokens=1500, detail=True, scope_context=None) -> str` | Render the memory summary. `detail=True` lists every fact with its `fact_id`; `detail=False` renders the compact digest injected into the prompt, as scope blocks when a context is given. |
 | `user_md` | `async user_md(user_id, max_tokens=800) -> str` | Render the user's profile markdown. |
 | `stats` | `stats(user_id) -> dict` | Counters: `facts`, `pending`. |
 | `reinforce` | `async reinforce(user, fact_id, kind, session_id) -> dict` | Explicit reuse evidence. See [Reuse reinforcement](reinforcement.md). |
+| `get_fact` | `get_fact(user_id, fact_id) -> dict` | One fact in full, with its `scopes` and `conditions`. |
+| `list_facts` | `list_facts(user_id, limit=50, offset=0, include_retracted=False) -> dict` | Paged fact list; each row carries `scopes` / `scope_labels` / `conditions`. |
+| `scope_list` | `scope_list(parent_id=None, status='active') -> list` | The scope tree (or one level of it). |
+| `scope_resolve` | `scope_resolve(user_id, scope_context=None, conditions=None, session_id='', create=False) -> dict` | Resolve a context payload: the scope, its confidence, why, and any queued candidates. Read-only unless `create=True`. |
+| `scope_create` | `scope_create(scope_type, name, parent_id=None, signals=None, confidence=0.5, display_name='') -> dict` | Create a scope explicitly (user action). |
+| `scope_alias_add` | `scope_alias_add(scope_id, alias, alias_type='name', confidence=0.5) -> dict` | Register another name for a scope. |
+| `scope_confirm` | `scope_confirm(scope_id, confidence=1.0) -> dict` | Raise a scope's standing so it resolves without doubt. |
+| `scope_unresolved` | `scope_unresolved(user_id, limit=50) -> list` | The candidate queue waiting for evidence or a user's word. |
+| `scope_merge` / `scope_split` / `scope_reparent` | see [Scopes](scopes.md) | Fold two scopes together, split facts out, or move a scope under a different parent. |
+| `scope_promote` | `async scope_promote(user_id=None) -> list` | Run the cross-scope abstraction pass now. |
+| `fact_scope_bind` / `fact_condition_set` / `fact_scope_get` | see [Scopes](scopes.md) | Bind a fact to scopes, set its conditions, or read its scope bindings, provenance and evolution links. |
+
+### Scope awareness
+
+A fact belongs to a node in a hierarchy (`org / client / project / phase /
+document / thread`), and a session's context — a git remote, a working
+directory, an explicit `client=acme` tag — resolves to that node. Recall then
+considers the node's own path, its phases, condition-matching facts from
+elsewhere, and global facts; the injected digest is rendered as one block per
+level so a project's rule can be told apart from the company's.
+
+`scope_context` is the payload every scope-aware entry point accepts:
+
+```python
+scope_context = {
+    "signals": {"git_remote": "git@github.com:acme/api.git", "path": "D:/work/api"},
+    "conditions": {"language": "typescript"},
+}
+await mem.recall("u", "规范", scope_context=scope_context)
+```
+
+Passing no `scope_context` keeps the pre-scope behaviour exactly: one global
+pool, four ranking terms, no scope annotations. The full model, the resolution
+rules, the reliability table and the management surface are in
+[Scope-aware memory](scopes.md).
 
 ### `summary` — one view, two depths
 
@@ -183,17 +218,26 @@ fits 49 lines at 1500 tokens, against 46 before the cap existed.
   "facts": [
     {"fact_id": "...", "subject": "...", "predicate": "...", "object": "...",
      "confidence": 0.9, "importance": 0.7, "final_score": 0.88, "status": "active",
-     "type": "lesson", "content": "<full knowledge body, present for knowledge facts>"}
+     "type": "lesson", "content": "<full knowledge body, present for knowledge facts>",
+     "scopes": [3], "scope_labels": ["api"],
+     "conditions": [{"key": "language", "value": "typescript"}],
+     "scope_weight": 1.0, "condition_match": 0.5, "phase_match": 0.5}
   ],
-  "pending": [{"candidate_id": "...", "subject": "...", "predicate": "...",
-               "object": "...", "status": "pending"}],
   "conflicts": [],
+  "degraded": [],
+  "scope": {"scope_id": 3, "scope_type": "project", "path": "/global/project:...",
+            "display_name": "api", "confidence": 0.9, "status": "bound",
+            "conditions": [], "candidates": [], "matched": ["git_remote"],
+            "detail": "matched git_remote on ..."},
   "token_count": 1200,
   "trace_id": "uuid"
 }
 ```
 
-Pending candidates are reported by `candidate_id` only (never `fact_id`).
+`degraded` names an index that failed during this search, so "nothing matched"
+is distinguishable from "the search is broken". `scope` is `null` for a
+scope-blind query; the per-fact scope annotations are only present in
+scope-aware mode, so a caller can tell which of the two pipelines answered.
 
 ### Configuration (`MemConfig`)
 
@@ -238,12 +282,28 @@ class MemConfig:
     w_trust: float = 0.2
     min_relevance: float = 0.0
     max_vector_distance: Optional[float] = None
+    scope_aware: bool = True
+    w_scope: float = 0.20
+    w_condition: float = 0.15
+    w_phase: float = 0.05
+    scope_bind_threshold: float = 0.9
+    scope_pending_threshold: float = 0.6
+    scope_degrade_threshold: float = 0.3
+    scope_new_threshold: float = 0.8
+    scope_promote_after: int = 3
+    scope_abstraction_min_scopes: int = 3
+    scope_all_phases: bool = True
 ```
 
 `candidate_retention_days` was declared but unused before the maintenance pass
 existed; it now bounds `fact_candidates` pruning alongside the other two
 retention windows. `max_active_facts = 0` means unlimited, so the archive tier
 stays dormant until it is configured.
+
+The `scope_*` knobs are described in [Scope-aware memory](scopes.md#9-configuration).
+The three `w_scope` / `w_condition` / `w_phase` weights are added to the four base
+terms **only** for a query that carries a scope context, so `weights_sum()` (the
+base four) keeps meaning the same thing in both modes.
 
 ## Design
 
@@ -262,12 +322,18 @@ and `user_profile` are *derived views* rebuilt from facts.
   `007_init.sql` adds the write-outcome columns on `fact_candidates`
   (`reject_kind` / `reject_reason` / `result_fact_ids` / `finished_at`),
   `facts.archived_at`, and the maintenance indexes; `008_init.sql` adds
-  `facts.content_fingerprint` and the task claim columns) with
+  `facts.content_fingerprint` and the task claim columns; `011_init.sql` adds the
+  scope dimension — `scope` / `scope_alias` / `scope_signal` / `scope_candidate` /
+  `fact_scope` / `fact_condition` / `fact_origin` / `fact_evolution` — and clears
+  the fact store, since a scope cannot be back-filled; see
+  [Scope-aware memory](scopes.md#10-upgrading-from-a-pre-scope-database)) with
   `PRAGMA user_version`-gated migrations.
 - **Retrieval**: `sqlite-vec` `vec0` KNN (cosine, 512-dim) ⊕ FTS5 (jieba
   word-segmented for Chinese), fused by Reciprocal Rank Fusion and re-ranked with
   `w_rrf·relevance + w_importance·effective_importance + w_recency·recency +
-  w_trust·trust` (weights configurable, defaults `0.4/0.2/0.2/0.2`). `relevance`
+  w_trust·trust` (weights configurable, defaults `0.4/0.2/0.2/0.2`) plus, for a
+  scope-aware query, `w_scope·scope_distance + w_condition·condition_match +
+  w_phase·phase_match`. `relevance`
   is the fused RRF score normalised against its *ceiling* (`2/(k+1)`, the score
   two top-ranked hits produce) rather than against the best candidate in the
   current result set, so a score is comparable across queries and a single
