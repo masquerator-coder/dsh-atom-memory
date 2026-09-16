@@ -140,6 +140,13 @@ _SECTION_ORDER = [
 
 _EMPTY_NOTICE = "_暂无持久化的原子记忆。_ (No active atomic facts yet.)"
 
+# Marker opening a compact section label (``# 决策规则``). Held as a constant
+# because it is measured as well as rendered: `_select` accounts for the label's
+# cost while it trims the artifact, so a marker that only existed inside
+# `_render_body` would let the budget under-count every surviving section — by
+# one token per label, which is exactly the kind of leak the hard cap forbids.
+_COMPACT_LABEL_MARKER = "# "
+
 
 def generate_summary(
     conn: sqlite3.Connection,
@@ -344,12 +351,20 @@ def _section_of(fact: dict) -> str:
 def _render_compact(buckets: dict, max_tokens: int) -> str:
     """Render the type-grouped digest injected into the system prompt.
 
-    Section labels are plain text rather than markdown headings: this text is
-    never rendered *as* markdown — it is injected into the prompt and shown
-    verbatim in a ``<pre>`` block — so ``###`` would only surface as literal
-    hashes. There is likewise no document title here; the injection site
-    supplies its own header and the user scope never varies, so a
-    ``# 记忆 (Memory) — global`` line would be pure payload.
+    Section labels carry a single ``# `` and the footer a ``-- `` marker, so the
+    three line kinds (label / ``- `` fact / footer) differ in their *first*
+    character rather than their second. That matters because the dsh host fences
+    every injected line with ``| `` (`dsh/src/memory-data.ts`): under that prefix a bare label and a bullet used to look all but identical, and a
+    footer inherited markdown's quote marker (``| > …``) inside a plain-text
+    block where it means nothing. One ``#`` — not ``##``/``###`` — is deliberate:
+    this text is never rendered *as* markdown (it is injected into the prompt and
+    shown verbatim in a ``<pre>`` block), and it mirrors the ``# 记忆 (Memory)``
+    heading the detail depth already uses, so deeper hashes would only surface as
+    punctuation. The label stays cheap: one character per section.
+
+    There is likewise no document title here; the injection site supplies its own
+    header and the user scope never varies, so a ``# 记忆 (Memory) — global`` line
+    would be pure payload.
 
     The rendered artifact — footer and labels included — fits ``max_tokens``.
     The only exception is a budget too small to hold even the one-line
@@ -386,16 +401,20 @@ def _render_footer(omitted: int, hidden: List[str], kept: dict) -> str:
         hidden: Titles of the sections dropped in full.
         kept: The surviving ``section title -> line count`` mapping.
 
+    The count/inventory lines use ``-- `` rather than markdown's ``> ``: the
+    footer is summary material, not a quotation, and once the dsh host prefixes
+    every line with ``| `` a quote marker renders as the meaningless ``| > ``.
+
     Returns:
-        The footer markdown.
+        The footer text.
     """
     lines = [
-        f"> {sum(kept.values())} 条事实 · 类型分布："
+        f"-- {sum(kept.values())} 条事实 · 类型分布："
         + " · ".join(f"{title} {count}" for title, count in kept.items())
     ]
     if omitted or hidden:
         lines.append(
-            f"> 已省略 {omitted} 条低优先级记忆"
+            f"-- 已省略 {omitted} 条低优先级记忆"
             + (f"（{'、'.join(hidden)}分组已隐藏）" if hidden else "")
             + "；需要时用 memory_recall 检索"
         )
@@ -587,7 +606,7 @@ def _select(sections: dict, max_tokens: int) -> dict:
     title_cost: dict = {}
     totals = {"cjk": 0, "other": 0, "parts": 0, "lines": 0}
     for title, lines in sections.items():
-        cost = token_cost(title)
+        cost = token_cost(_COMPACT_LABEL_MARKER + title)
         title_cost[title] = (cost[1], cost[2])
         totals["cjk"] += cost[1]
         totals["other"] += cost[2]
@@ -663,13 +682,16 @@ def _render_body(sections: dict, kept: dict) -> str:
     Labels are emitted only for sections that kept at least one line, and lines
     keep their original (score-descending) order inside a section: the selection
     chooses *what* survives, never the layout.
+
+    Each label gets the ``# `` marker (see :func:`_render_compact` for why one
+    hash), so a section stays findable by jumping to the next ``# `` line.
     """
     parts: List[str] = []
     for title, lines in sections.items():
         indices = _kept_indices(kept, title)
         if not indices:
             continue
-        parts.append(title)
+        parts.append(_COMPACT_LABEL_MARKER + title)
         parts.extend(lines[index][0] for index in indices)
     return "\n".join(parts)
 

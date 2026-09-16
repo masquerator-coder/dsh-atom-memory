@@ -17,11 +17,13 @@ import pytest
 from atom_memory.db import connect_for_tests
 from atom_memory.models import NEUTRAL_SCORE
 from atom_memory.summary import (
+    _COMPACT_LABEL_MARKER,
     _DETAIL_CONTENT_CHARS,
     _MAX_COMPACT_LINE_CHARS,
     _MAX_DETAIL_FIELD_CHARS,
     _MAX_FOLDED_VALUE_CHARS,
     _RECENCY_HALF_LIFE_SECONDS,
+    _SECTION_TITLES,
     generate_summary,
 )
 from atom_memory.retriever import estimate_tokens
@@ -89,6 +91,7 @@ def test_compact_has_no_markdown_title():
         _insert_fact(conn, "f1", "职业", "工程师")
         md = _md(conn)
         assert not md.splitlines()[0].startswith("# 记忆")
+        assert "# 记忆" not in md
         assert "global" not in md
     finally:
         conn.close()
@@ -106,11 +109,15 @@ def test_compact_groups_every_present_type():
         md = _md(conn)
         lines = md.splitlines()
 
-        for title in ("决策规则", "教训", "流程", "偏好", "属性"):
-            assert title in lines, title
+        labels = {
+            _COMPACT_LABEL_MARKER + title
+            for title in ("决策规则", "教训", "流程", "偏好", "属性")
+        }
+        for label in labels:
+            assert label in lines, label
         # A section label is never rendered without content under it.
         for index, line in enumerate(lines[:-1]):
-            if line in ("决策规则", "教训", "流程", "偏好", "属性"):
+            if line in labels:
                 assert lines[index + 1].startswith("- "), line
     finally:
         conn.close()
@@ -423,11 +430,13 @@ def test_tight_budget_shrinks_tail_sections_first():
         md = _md(conn, max_tokens=200)
 
         assert "先回滚再排查" in md
-        assert "决策规则" in md.splitlines()
+        assert _COMPACT_LABEL_MARKER + "决策规则" in md.splitlines()
         assert "已省略" in md
         # The durable section comes first, and the tail was trimmed hard.
         body = md.splitlines()
-        assert body.index("决策规则") < body.index("属性")
+        assert body.index(_COMPACT_LABEL_MARKER + "决策规则") < body.index(
+            _COMPACT_LABEL_MARKER + "属性"
+        )
         assert md.count("- 属性") < 30
         assert estimate_tokens(md) <= 200
     finally:
@@ -560,7 +569,10 @@ def test_tight_budget_never_leaves_a_section_label_without_content():
             )
         md = _md(conn, max_tokens=100)
         lines = md.splitlines()
-        titles = ("决策规则", "教训", "流程（SOP）", "流程", "偏好", "属性", "示例", "事件")
+        titles = {
+            _COMPACT_LABEL_MARKER + title
+            for title in ("决策规则", "教训", "流程（SOP）", "流程", "偏好", "属性", "示例", "事件")
+        }
         for index, line in enumerate(lines[:-1]):
             if line in titles:
                 assert lines[index + 1].startswith("- "), line
@@ -712,6 +724,39 @@ def test_selection_does_not_re_render_the_artifact(monkeypatch):
     sections = _random_sections(7, sections=3, per_section=40)
     summary_mod._select(sections, 150)
     assert calls["compose"] == 0, "selection must not re-render the artifact"
+
+
+def test_incremental_selection_charges_each_label_what_it_renders():
+    """标签的标记字符必须计入预算，否则硬上限会被撑破。
+
+    `_select` 逐行回收预算时用的是自维护的字符计数，而 `_compose` 是重渲染测量。
+    两者必须对**同一段文本**计数：标签在 `_render_body` 里带标记渲染，测量端如果
+    只算裸标题，每个存活分组就会少算标记字符。构造恰好落在边界上的最小例子（两个
+    分组各一行）后，未计入标记的实现会把 28 token 的产物交给 27 token 的预算——正是
+    这个上限承诺不允许的泄漏。预算逐 token 扫过边界，因为泄漏只在差 1~2 token 处
+    显形，稀疏采样会漏掉它。
+    """
+    from atom_memory.summary import _compose, _select
+
+    sections = {
+        _SECTION_TITLES["attribute"]: [("- alpha", 0.9)],
+        _SECTION_TITLES["decision_rule"]: [("- beta", 0.8)],
+    }
+    ceilings = set()
+    for budget in range(1, 64):
+        kept = _select(sections, budget)
+        if not kept:
+            continue
+        rendered = _compose(sections, kept)
+        assert estimate_tokens(rendered) <= budget, (
+            budget,
+            estimate_tokens(rendered),
+            rendered,
+        )
+        ceilings.add(estimate_tokens(rendered))
+    # The sweep must actually cross the artifact's full size, or the assertion
+    # above would hold vacuously (an empty render fits every budget).
+    assert max(ceilings) >= 28
 
 
 def test_selecting_a_large_render_is_not_quadratic():
