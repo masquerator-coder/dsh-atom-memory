@@ -7,6 +7,10 @@
  *    summary_detail/forget/user_md/stats),
  *  - wires an LLM-first extractor that uses the dsh default model and ships
  *    typed candidates to Python for persistence (rules remain the fallback),
+ *  - collects each session's context signals (working directory, git root and
+ *    origin remote, declared package) and sends them as `scope_context` on
+ *    every read, write and prompt freeze, so memory lands in the right scope
+ *    without anyone tagging it by hand,
  *  - registers durable capture hooks (per-message, pre-compression rescue,
  *    periodic nudge) so conversation turns into memory automatically,
  *  - injects a system-prompt awareness section plus a per-session memory
@@ -44,6 +48,12 @@ import { registerMemoryContext } from './context.ts'
 import { registerCapture } from './capture.ts'
 import { buildLlmCompleter, buildLlmExtractor, type ExtractFn } from './llm-extractor.ts'
 import { checkPythonSide, type PreflightResult } from './preflight.ts'
+import {
+  scopeContextForCwd,
+  sessionCwdOf,
+  type ScopeContextPayload,
+  type SessionCwdSource,
+} from './scope.ts'
 import {
   createRuntime, SETTINGS_NAMESPACE, type LiveRuntime, Runtime,
 } from './runtime.ts'
@@ -136,6 +146,78 @@ function seedRuntime(config: ConfigShape): LiveRuntime {
     injectedSummaryTokens: config.injectedSummaryTokens,
     extractionModel: config.extractionModel,
   })
+}
+
+/** Everything the ingestion point needs, so it can be exercised without a child. */
+export interface CaptureWiring {
+  /** Master/durability gate: false makes the capture a no-op. */
+  isEnabled: () => boolean
+  /**
+   * Whether the Python bridge is up. A down bridge means *no* RPC at all rather
+   * than a failed one: the message stays uncaptured and the nudge retries it.
+   */
+  isReady: () => boolean
+  /** LLM-first extractor; absent means the rule engine is the only extractor. */
+  extract?: ExtractFn
+  /** Send one RPC to the memory store. */
+  call: (method: string, params: Record<string, unknown>) => Promise<unknown>
+  /**
+   * Scope payload for a working directory (`undefined` = send nothing, which is
+   * what a scope-disabled deployment does on every call).
+   */
+  scopeContextAt: (cwd?: string) => ScopeContextPayload | undefined
+}
+
+/**
+ * Build the single ingestion point: LLM-first candidates go to
+ * `persist_candidates`, and the rule path (`add`) takes anything extraction did
+ * not turn into facts. Both carry the session's scope context, so an automatic
+ * capture lands in the same scope a tool call from that session would.
+ *
+ * Extracted from `apply` (like {@link retryDelayMs}) so the *wire shape* of an
+ * automatic capture is testable without spawning a Python child: it is the path
+ * every user message takes, and the tools reach the same two RPCs by a route
+ * that would not catch a mistake here.
+ *
+ * @param deps - Gates, extractor, RPC sink and scope-context builder.
+ * @returns The capture function the hooks call, `(text, sessionId, cwd?)`.
+ */
+export function createCapture(
+  deps: CaptureWiring,
+): (text: string, sessionId: string, cwd?: string) => Promise<void> {
+  return async (text: string, sessionId: string, cwd?: string): Promise<void> => {
+    if (!deps.isEnabled()) return
+    // Built once per capture and shared by both paths: the payload answers
+    // "where is this session", which cannot differ between them.
+    const scope = deps.scopeContextAt(cwd)
+    const scoped = scope === undefined ? {} : { scope_context: scope }
+    if (deps.isReady() && deps.extract !== undefined) {
+      try {
+        const candidates = await deps.extract(text)
+        if (candidates.length > 0) {
+          await deps.call('persist_candidates', {
+            user_id: FALLBACK_SCOPE,
+            session_id: sessionId,
+            turn_id: 0,
+            candidates,
+            ...scoped,
+          })
+          return
+        }
+      } catch {
+        /* fall through to rule extraction on LLM failure */
+      }
+    }
+    if (deps.isReady()) {
+      await deps.call('add', {
+        user_id: FALLBACK_SCOPE,
+        session_id: sessionId,
+        text,
+        turn_id: 0,
+        ...scoped,
+      })
+    }
+  }
 }
 
 export function apply(ctx: Context, config: ConfigShape): void {
@@ -260,35 +342,39 @@ export function apply(ctx: Context, config: ConfigShape): void {
     ctx.logger(`[atom-memory] remote controller unavailable (${(err as Error)?.message ?? err})`)
   }
 
-  // Single ingestion point: LLM-first candidates -> persist_candidates, else
-  // -> rule-based add (everything stays isolated in the Python process).
-  const capture = async (text: string, sessionId: string): Promise<void> => {
-    if (!runtime.isEnabled()) return
-    if (state.value && extract !== undefined) {
-      try {
-        const candidates = await extract(text)
-        if (candidates.length > 0) {
-          await bridge.call('persist_candidates', {
-            user_id: FALLBACK_SCOPE,
-            session_id: sessionId,
-            turn_id: 0,
-            candidates,
-          })
-          return
-        }
-      } catch {
-        /* fall through to rule extraction on LLM failure */
-      }
-    }
-    if (state.value) {
-      await bridge.call('add', {
-        user_id: FALLBACK_SCOPE,
-        session_id: sessionId,
-        text,
-        turn_id: 0,
-      })
-    }
+  // Scope context: the payload every scope-aware call carries, assembled from
+  // the working directory the call site reports plus the deployment's explicit
+  // tags. The filesystem facts behind it are cached per directory (see
+  // `scope.ts`), so this is a map lookup on the hot path, not a walk.
+  //
+  // With `scopeEnabled: false` the builder resolves to `undefined` for every
+  // call, and each consumer treats "no payload" as "send no `scope_context` at
+  // all" — which is what keeps the RPC params identical to what they were
+  // before scope awareness existed.
+  const explicitTags = {
+    org: config.scopeOrg,
+    client: config.scopeClient,
+    project: config.scopeProject,
+    series: config.scopeSeries,
+    phase: config.scopePhase,
   }
+  const scopeContextAt = (cwd: string | undefined): ScopeContextPayload | undefined =>
+    config.scopeEnabled === false ? undefined : scopeContextForCwd(cwd, { explicit: explicitTags })
+  const scopeContextOf = (source?: SessionCwdSource): ScopeContextPayload | undefined =>
+    scopeContextAt(sessionCwdOf(source))
+
+  // Single ingestion point: LLM-first candidates -> persist_candidates, else
+  // -> rule-based add (everything stays isolated in the Python process). `cwd`
+  // is the session's working directory when the hook has the session at hand;
+  // the rescue sweeps pass none and the write falls back to the plugin's own
+  // directory.
+  const capture = createCapture({
+    isEnabled: () => runtime.isEnabled(),
+    isReady: () => state.value,
+    extract,
+    call: (method, params) => bridge.call(method, params),
+    scopeContextAt,
+  })
 
   // System-prompt awareness + the session-start-frozen memory snapshot.
   //
@@ -318,6 +404,7 @@ export function apply(ctx: Context, config: ConfigShape): void {
     // turning it back on must work without a restart.
     snapshotEnabled: () => runtime.get().contextInjectionEnabled,
     isEnabled: () => runtime.isEnabled(),
+    scopeContext: scopeContextOf,
   })
 
   // Explicit memory tools. `extract` is shared with the capture path so the
@@ -337,6 +424,7 @@ export function apply(ctx: Context, config: ConfigShape): void {
       clampInjectedSummaryTokens(runtime.get().injectedSummaryTokens),
     writeAckTimeoutMs: config.writeAckTimeoutMs ?? 0,
     snapshot,
+    scopeContext: scopeContextOf,
   })
   for (const d of disposers) ctx.effect(() => d)
 

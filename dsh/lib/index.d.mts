@@ -1,4 +1,5 @@
 import z from "@deepseek-ai/schemastery";
+import "@deepseek-ai/dsh-llm";
 import { Context } from "@deepseek-ai/cordis";
 //#region src/config.d.ts
 interface Config {
@@ -131,8 +132,100 @@ interface Config {
    * working set, while a missed merge costs one redundant row.
    */
   dedupMaxDistance?: number;
+  /**
+   * Whether scope-aware memory is on: collect this session's context signals
+   * (git root and origin remote, declared package name, working directory) and
+   * send them as the `scope_context` payload of every scope-aware RPC call.
+   *
+   * Deliberately a deploy-time field and *not* in the `atom-memory` settings
+   * namespace: it describes the deployment (which checkout this harness serves,
+   * and under which tags), not how memory should behave at this moment. It is
+   * also fully reversible at the wire level — with it off, every call sends
+   * exactly the params it sent before scope awareness existed, and the store
+   * behaves globally.
+   */
+  scopeEnabled?: boolean;
+  /**
+   * Explicit org tag, sent as the `explicit_org` signal.
+   *
+   * The explicit tags are "the user said so" evidence (reliability 0.95 on the
+   * Python side, far above anything inferred from a path), so one is worth
+   * setting whenever a deployment serves exactly one of the thing. Like
+   * `scopeEnabled` these are composition configuration only and have no
+   * runtime/settings counterpart: retagging a deployment is not a memory switch
+   * to flip mid-session but a different deployment.
+   */
+  scopeOrg?: string;
+  /** Explicit client tag (`explicit_client`), e.g. the customer this harness serves. */
+  scopeClient?: string;
+  /** Explicit project tag (`explicit_project`), for a harness pinned to one project. */
+  scopeProject?: string;
+  /** Explicit series tag (`explicit_series`), e.g. the newsletter a session belongs to. */
+  scopeSeries?: string;
+  /** Explicit phase tag (`explicit_phase`), e.g. `draft`; also sent as the context's phase. */
+  scopePhase?: string;
 }
 declare const Config: z<Config>;
+//#endregion
+//#region src/llm-extractor.d.ts
+/**
+ * One ``(key, value)`` condition: *when* a claim holds.
+ *
+ * Field names are the Python side's verbatim — a candidate object *is* the wire
+ * payload of ``persist_candidates``, so a renamed key would be accepted by the
+ * JSON parser and then silently ignored by the store.
+ */
+interface ExtractedCondition {
+  key: string;
+  value: string;
+}
+/** One typed candidate matching the Python ``persist_candidates`` wire shape. */
+interface ExtractedCandidate {
+  subject: string;
+  predicate: string;
+  object: string;
+  type?: string;
+  content?: string;
+  qualifiers?: Record<string, unknown>;
+  confidence?: number;
+  importance?: number;
+  /**
+   * Conditions the claim holds *under* (language, doc_type, audience, industry,
+   * stage, tool, vcs): a fact that is only true for a proposal in Chinese must
+   * not outrank the same claim in the other context.
+   */
+  conditions?: ExtractedCondition[];
+  /**
+   * Free-text hint about *where* the fact belongs.
+   *
+   * Named exactly as the Python candidate field reads it. It is only a hint: the
+   * store treats it as a low-reliability content anchor (0.25) that can
+   * corroborate a resolution or accumulate in the candidate queue, but can never
+   * bind a scope on its own.
+   */
+  scope_hint?: string;
+}
+/** The extraction callable signature the capture/tool layer uses. */
+type ExtractFn = (text: string) => Promise<ExtractedCandidate[]>;
+//#endregion
+//#region src/scope.d.ts
+/**
+ * The `scope_context` wire payload.
+ *
+ * Field names are the contract's verbatim (snake_case): this object is
+ * serialized straight into the RPC params, so a renamed key would be silently
+ * ignored by the Python side rather than reported.
+ */
+interface ScopeContextPayload {
+  /** `signal_type` -> raw value. */
+  signals?: Record<string, string>;
+  /** Conditions of the current context, e.g. `{doc_type: 'proposal'}`. */
+  conditions?: Record<string, string>;
+  /** Current phase (also a scope type of its own). */
+  phase?: string;
+  /** Free-text hint about where the work belongs; the weakest evidence. */
+  scope_hint?: string;
+}
 //#endregion
 //#region src/index.d.ts
 declare const name = "dsh-atom-memory";
@@ -153,6 +246,40 @@ declare const inject: readonly ["tools", "systemPrompt"];
  * @returns Milliseconds to wait, capped at {@link MAX_RETRY_MS}.
  */
 declare function retryDelayMs(attempt: number): number;
+/** Everything the ingestion point needs, so it can be exercised without a child. */
+interface CaptureWiring {
+  /** Master/durability gate: false makes the capture a no-op. */
+  isEnabled: () => boolean;
+  /**
+   * Whether the Python bridge is up. A down bridge means *no* RPC at all rather
+   * than a failed one: the message stays uncaptured and the nudge retries it.
+   */
+  isReady: () => boolean;
+  /** LLM-first extractor; absent means the rule engine is the only extractor. */
+  extract?: ExtractFn;
+  /** Send one RPC to the memory store. */
+  call: (method: string, params: Record<string, unknown>) => Promise<unknown>;
+  /**
+   * Scope payload for a working directory (`undefined` = send nothing, which is
+   * what a scope-disabled deployment does on every call).
+   */
+  scopeContextAt: (cwd?: string) => ScopeContextPayload | undefined;
+}
+/**
+ * Build the single ingestion point: LLM-first candidates go to
+ * `persist_candidates`, and the rule path (`add`) takes anything extraction did
+ * not turn into facts. Both carry the session's scope context, so an automatic
+ * capture lands in the same scope a tool call from that session would.
+ *
+ * Extracted from `apply` (like {@link retryDelayMs}) so the *wire shape* of an
+ * automatic capture is testable without spawning a Python child: it is the path
+ * every user message takes, and the tools reach the same two RPCs by a route
+ * that would not catch a mistake here.
+ *
+ * @param deps - Gates, extractor, RPC sink and scope-context builder.
+ * @returns The capture function the hooks call, `(text, sessionId, cwd?)`.
+ */
+declare function createCapture(deps: CaptureWiring): (text: string, sessionId: string, cwd?: string) => Promise<void>;
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { Config, apply, inject, name, retryDelayMs };
+export { CaptureWiring, Config, apply, createCapture, inject, name, retryDelayMs };

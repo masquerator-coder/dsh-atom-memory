@@ -138,6 +138,38 @@ export interface Config {
    * working set, while a missed merge costs one redundant row.
    */
   dedupMaxDistance?: number
+  /**
+   * Whether scope-aware memory is on: collect this session's context signals
+   * (git root and origin remote, declared package name, working directory) and
+   * send them as the `scope_context` payload of every scope-aware RPC call.
+   *
+   * Deliberately a deploy-time field and *not* in the `atom-memory` settings
+   * namespace: it describes the deployment (which checkout this harness serves,
+   * and under which tags), not how memory should behave at this moment. It is
+   * also fully reversible at the wire level — with it off, every call sends
+   * exactly the params it sent before scope awareness existed, and the store
+   * behaves globally.
+   */
+  scopeEnabled?: boolean
+  /**
+   * Explicit org tag, sent as the `explicit_org` signal.
+   *
+   * The explicit tags are "the user said so" evidence (reliability 0.95 on the
+   * Python side, far above anything inferred from a path), so one is worth
+   * setting whenever a deployment serves exactly one of the thing. Like
+   * `scopeEnabled` these are composition configuration only and have no
+   * runtime/settings counterpart: retagging a deployment is not a memory switch
+   * to flip mid-session but a different deployment.
+   */
+  scopeOrg?: string
+  /** Explicit client tag (`explicit_client`), e.g. the customer this harness serves. */
+  scopeClient?: string
+  /** Explicit project tag (`explicit_project`), for a harness pinned to one project. */
+  scopeProject?: string
+  /** Explicit series tag (`explicit_series`), e.g. the newsletter a session belongs to. */
+  scopeSeries?: string
+  /** Explicit phase tag (`explicit_phase`), e.g. `draft`; also sent as the context's phase. */
+  scopePhase?: string
 }
 
 export const Config: z<Config> = z.object({
@@ -170,5 +202,14 @@ export const Config: z<Config> = z.object({
   maxProfileRows: z.number().default(50),
   maxFactTokens: z.number().default(600),
   dedupMaxDistance: z.number().default(0.10),
+  scopeEnabled: z.boolean().default(true),
+  // Empty means "no tag": an empty signal value is dropped by the payload
+  // builder rather than sent, which is what keeps an unconfigured deployment's
+  // params identical to a pre-scope one.
+  scopeOrg: z.string().default(''),
+  scopeClient: z.string().default(''),
+  scopeProject: z.string().default(''),
+  scopeSeries: z.string().default(''),
+  scopePhase: z.string().default(''),
 })
 

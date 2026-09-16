@@ -21,6 +21,18 @@ import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ExtractionModelOverride } from './runtime.ts'
 
+/**
+ * One ``(key, value)`` condition: *when* a claim holds.
+ *
+ * Field names are the Python side's verbatim — a candidate object *is* the wire
+ * payload of ``persist_candidates``, so a renamed key would be accepted by the
+ * JSON parser and then silently ignored by the store.
+ */
+export interface ExtractedCondition {
+  key: string
+  value: string
+}
+
 /** One typed candidate matching the Python ``persist_candidates`` wire shape. */
 export interface ExtractedCandidate {
   subject: string
@@ -31,6 +43,21 @@ export interface ExtractedCandidate {
   qualifiers?: Record<string, unknown>
   confidence?: number
   importance?: number
+  /**
+   * Conditions the claim holds *under* (language, doc_type, audience, industry,
+   * stage, tool, vcs): a fact that is only true for a proposal in Chinese must
+   * not outrank the same claim in the other context.
+   */
+  conditions?: ExtractedCondition[]
+  /**
+   * Free-text hint about *where* the fact belongs.
+   *
+   * Named exactly as the Python candidate field reads it. It is only a hint: the
+   * store treats it as a low-reliability content anchor (0.25) that can
+   * corroborate a resolution or accumulate in the candidate queue, but can never
+   * bind a scope on its own.
+   */
+  scope_hint?: string
 }
 
 /** Minimal structural surface of the ``llm`` service. */
@@ -51,7 +78,7 @@ const EXTRACTION_SYSTEM = `You extract atomic memory facts from a user utterance
 Return ONLY a JSON array. Each element is an object with keys:
 - "subject" (entity, use "用户" for the user), "predicate" (relation),
 - "object" (the value), and optionally "type", "content", "importance",
-  "confidence".
+  "confidence", "conditions", "scope_hint".
 "type" is one of: semantic, procedural, episodic, sop, decision_rule, few_shot, lesson.
 For knowledge facts, put the full body in "content" and a short title in "object".
 
@@ -67,6 +94,24 @@ How to choose "type" - this matters, do not tag everything "semantic":
 - a stable attribute or preference of the user -> semantic
 - episodic is ONLY for a dated, one-off thing that happened AND is worth
   recalling in a later session. Use it sparingly.
+
+Two optional fields say *when* and *where* a fact applies. Both are optional -
+omit them rather than guessing.
+
+"conditions" says WHEN the claim holds, as
+[{"key": "<dimension>", "value": "<value>"}]. Use it only when the claim is
+true of one context and not of another (a rule about Python files is not a rule
+about the project). Dimensions, with example values:
+- language (typescript, python), doc_type (proposal, invoice, report),
+- audience (internal, customer), industry (finance, education),
+- stage (draft, review, published), tool (git, excel), vcs (git, svn).
+Keys must be lower_snake_case and values short and lower-case; at most a few
+conditions per fact. Do NOT restate the subject or the topic as a condition.
+
+"scope_hint" says WHERE the fact belongs - which project, client, document or
+thread it came from - as a short phrase. It is a hint, not a decision: it helps
+place the fact, it never overrides where the session actually is. Use it only
+when the text names a place the fact belongs to; never invent one.
 
 CRITICAL - only extract facts that are worth remembering long-term:
 - Save durable, reusable knowledge: decisions, workflows, procedures, lessons,
@@ -437,6 +482,52 @@ function clamp01(value: number): number {
 }
 
 /**
+ * Coerce the model's `conditions` field into usable `(key, value)` pairs.
+ *
+ * Tolerant in the same way as the numeric parsing: a malformed entry is dropped
+ * rather than failing the whole candidate (a fact without conditions is still a
+ * fact), and the mapping form (`{"language": "typescript"}`) is understood as
+ * well as the list the prompt asks for — a model that answers with the other
+ * spelling has still answered. Values are kept as written; the store normalises
+ * and caps them.
+ *
+ * @param value - The raw field value.
+ * @returns The usable conditions, or `undefined` when none were supplied.
+ */
+function parseConditions(value: unknown): ExtractedCondition[] | undefined {
+  const out: ExtractedCondition[] = []
+  const push = (key: unknown, val: unknown): void => {
+    if (typeof key !== 'string' || typeof val !== 'string') return
+    const cleanKey = key.trim()
+    const cleanValue = val.trim()
+    if (cleanKey.length === 0 || cleanValue.length === 0) return
+    out.push({ key: cleanKey, value: cleanValue })
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      if (typeof item !== 'object' || item === null) continue
+      const entry = item as { key?: unknown; value?: unknown }
+      push(entry.key, entry.value)
+    }
+  } else if (typeof value === 'object' && value !== null) {
+    for (const [key, val] of Object.entries(value as Record<string, unknown>)) push(key, val)
+  }
+  return out.length > 0 ? out : undefined
+}
+
+/**
+ * Coerce the model's `scope_hint` into a usable hint.
+ *
+ * @param value - The raw field value.
+ * @returns The trimmed hint, or `undefined` when nothing usable was supplied.
+ */
+function parseScopeHint(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  return trimmed.length > 0 ? trimmed : undefined
+}
+
+/**
  * Parse and sanitize the LLM's JSON output into typed candidates. Malformed or
  * non-object entries are dropped; a fully-invalid payload yields ``[]`` so the
  * caller can fall back to rules.
@@ -470,6 +561,8 @@ export function parseCandidates(raw: string): ExtractedCandidate[] {
       qualifiers: c.qualifiers,
       confidence: parseScore(c.confidence),
       importance: parseScore(c.importance),
+      conditions: parseConditions(c.conditions),
+      scope_hint: parseScopeHint(c.scope_hint),
     })
   }
   return out

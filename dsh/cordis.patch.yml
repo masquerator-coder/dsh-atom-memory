@@ -8,6 +8,13 @@
 # `dbPath` is where the Python SQLite database lives. `pythonBin` overrides the
 # interpreter used to spawn `python -m atom_memory.rpc` (leave unset to use
 # `python` on PATH). The plugin stays inert until loaded.
+#
+# `scopeEnabled` (default true) makes the plugin send each session's context
+# signals — working directory, git root and origin remote, package name — as the
+# `scope_context` of every memory call, so facts land in the right project. Set
+# it to false to keep every call scope-blind. The explicit `scopeOrg` /
+# `scopeClient` / `scopeProject` / `scopeSeries` / `scopePhase` tags are unset
+# here (empty = not sent); set the ones this deployment serves.
 - insert:
     - id: atom-memory
       name: dsh-atom-memory
@@ -20,5 +27,6 @@
         nudgeIntervalMinutes: 30
         preCompressionCapture: true
         autostart: true
+        scopeEnabled: true
 
 

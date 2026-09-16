@@ -55,6 +55,59 @@ describe('parseCandidates', () => {
     expect(out[1]).toEqual({ subject: '用户', predicate: '偏好', object: '咖啡' })
   })
 
+  it('parses the conditions and the scope hint the prompt asks for', () => {
+    const out = parseCandidates(JSON.stringify([
+      {
+        subject: '用户', predicate: '规则', object: '用 Tabs 缩进',
+        conditions: [{ key: 'language', value: 'typescript' }, { key: 'doc_type', value: 'proposal' }],
+        scope_hint: 'acme onboarding',
+      },
+    ]))
+    expect(out[0]!.conditions).toEqual([
+      { key: 'language', value: 'typescript' },
+      { key: 'doc_type', value: 'proposal' },
+    ])
+    expect(out[0]!.scope_hint).toBe('acme onboarding')
+  })
+
+  it('understands the mapping spelling of conditions', () => {
+    // A model that answers with the other accepted shape has still answered;
+    // dropping the conditions would silently widen the fact's reach.
+    const out = parseCandidates(JSON.stringify([
+      { subject: '用户', predicate: '规则', object: 'A', conditions: { language: 'python' } },
+    ]))
+    expect(out[0]!.conditions).toEqual([{ key: 'language', value: 'python' }])
+  })
+
+  it('drops malformed conditions instead of failing the candidate', () => {
+    const out = parseCandidates(JSON.stringify([
+      {
+        subject: '用户', predicate: '规则', object: 'A',
+        conditions: [
+          { key: 'language', value: 'python' },
+          { key: 42, value: 'x' },            // non-string key -> dropped
+          { key: 'doc_type' },                 // missing value -> dropped
+          { key: '   ', value: 'y' },          // blank key -> dropped
+          'bogus',                             // non-object -> dropped
+          { key: 'audience', value: '  internal  ' },
+        ],
+      },
+      { subject: '用户', predicate: '规则', object: 'B', conditions: 'language=python' },
+      { subject: '用户', predicate: '规则', object: 'C', scope_hint: 42 },
+      { subject: '用户', predicate: '规则', object: 'D', scope_hint: '   ' },
+    ]))
+    expect(out).toHaveLength(4)
+    // The fact survives with whatever conditions were usable...
+    expect(out[0]!.conditions).toEqual([
+      { key: 'language', value: 'python' },
+      { key: 'audience', value: 'internal' },
+    ])
+    // ...and a field that is the wrong shape is simply not there.
+    expect(out[1]!.conditions).toBeUndefined()
+    expect(out[2]!.scope_hint).toBeUndefined()
+    expect(out[3]!.scope_hint).toBeUndefined()
+  })
+
   it('drops transient process-only candidates (ask/complain/meta)', () => {
     const out = parseCandidates(JSON.stringify([
       // durable, should be kept

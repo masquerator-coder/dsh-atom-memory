@@ -34,6 +34,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
+import { sessionCwdOf } from './scope.ts'
 
 interface MessageEntry {
   seq: number
@@ -46,8 +47,18 @@ interface MessageEntry {
 
 export interface CaptureDeps {
   ctx: Context
-  /** Enqueue text for extraction (LLM-first or rule fallback; caller-owned). */
-  capture: (text: string, sessionId: string) => Promise<void>
+  /**
+   * Enqueue text for extraction (LLM-first or rule fallback; caller-owned).
+   *
+   * @param text - The message text.
+   * @param sessionId - The session it came from (provenance, and the rescue
+   *   sweep's key).
+   * @param cwd - The session's working directory, when the hook has the session
+   *   at hand, so the write travels with the right scope signals. The sweep
+   *   paths pass nothing: they only know a session id, and the caller then falls
+   *   back to its own default.
+   */
+  capture: (text: string, sessionId: string, cwd?: string) => Promise<void>
   /** Max recent messages remembered per session. */
   maxRecent?: number
 }
@@ -132,7 +143,10 @@ export function registerCapture(deps: CaptureDeps, opts: CaptureOptions): (() =>
     // `sweep` retries it.
     const entry: MessageEntry = { seq, text, captured: false, failed: false }
     push(session.id, entry)
-    void capture(text, session.id).then(
+    // The session's working directory rides along so the write carries a scope
+    // context: which checkout a message came from is not derivable from its id,
+    // and a harness can serve several sessions rooted in different ones.
+    void capture(text, session.id, sessionCwdOf(session)).then(
       () => { entry.captured = true },
       () => { entry.failed = true },
     )

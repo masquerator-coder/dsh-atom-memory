@@ -18,6 +18,14 @@
  * replaced, or refused-with-reason. ``memory_snapshot`` closes the other half of
  * the loop by showing the exact text the session's prompt carries.
  *
+ * **Every call travels with its context.** Reads and writes carry the session's
+ * ``scope_context`` (see `scope.ts`) because the store's answer depends on
+ * *where* the work happens, not only on what was asked. ``memory_scope`` is the
+ * management surface for that hierarchy: what this context resolves to, which
+ * hypotheses are still waiting for evidence, and how to confirm, alias, create
+ * or merge a scope. A deployment with no context sends nothing at all and
+ * behaves exactly as it did before scope awareness existed.
+ *
  * Tools are the only model-visible surface. What the model actually reads is
  * the ``ContentBlock[]`` returned by ``output.render``; ``output.schema`` only
  * types/validates the structured value (and tags what a host presenter may
@@ -32,6 +40,7 @@ import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { PythonBridge } from './bridge.ts'
 import type { ExtractFn, ExtractedCandidate } from './llm-extractor.ts'
 import type { FrozenSnapshotHandle } from './context.ts'
+import type { ScopeContextPayload, SessionCwdSource } from './scope.ts'
 
 /**
  * Minimum trimmed length (characters) for the raw knowledge fallback. Below
@@ -248,11 +257,197 @@ export interface ToolDeps {
   writeAckTimeoutMs?: number
   /** Frozen-snapshot handle, used by ``memory_snapshot`` for the audit view. */
   snapshot?: FrozenSnapshotHandle
+  /**
+   * Build the `scope_context` payload for one call site, so every read and
+   * write travels with the context it happened in (which project, which
+   * document, which phase).
+   *
+   * Optional: absent means a scope-blind deployment, and then no call carries
+   * `scope_context` at all — the params stay exactly what they were before
+   * scope awareness existed. Either way an `undefined` return wins: a context
+   * with nothing in it is not sent.
+   */
+  scopeContext?: (source?: SessionCwdSource) => ScopeContextPayload | undefined
 }
 
 /** Thrown when the memory master switch is off. */
 function disabledError(): Error {
   return new Error('memory is disabled')
+}
+
+/**
+ * The optional `scope_context` RPC parameter for one call site.
+ *
+ * Spread into a params object. An absent payload contributes **nothing** — not
+ * an empty object — so a scope-blind deployment (or a session whose context
+ * yielded no evidence) keeps sending exactly the params it sent before scope
+ * awareness existed, and the store sides with the global scope as it always did.
+ *
+ * @param deps - Tool dependencies, whose `scopeContext` builder is optional.
+ * @param source - The call site's session source (a tool run).
+ * @returns `{scope_context}` or an empty object.
+ */
+function scopeParam(deps: ToolDeps, source?: SessionCwdSource): Record<string, unknown> {
+  const payload = deps.scopeContext?.(source)
+  return payload === undefined ? {} : { scope_context: payload }
+}
+
+/**
+ * One row of the scope hierarchy, as ``scope_list`` returns it.
+ *
+ * The scope surface is an operator/model *management* view, so its shapes are
+ * declared here rather than imported: they are the Python store's dicts, and
+ * every field is optional because an older store may omit one.
+ */
+interface ScopeRow {
+  scope_id?: number
+  scope_type?: string
+  name?: string
+  display_name?: string
+  parent_id?: number | null
+  path?: string
+  status?: string
+  confidence?: number
+}
+
+/** One scope hypothesis that has not earned creation yet. */
+interface ScopeCandidate {
+  scope_type?: string
+  name?: string
+  parent_id?: number | null
+  signal_type?: string
+  signal_value?: string
+  confidence?: number
+  seen_count?: number
+}
+
+/** What a context resolved to, plus the evidence behind the decision. */
+interface ScopeResolution {
+  scope_id?: number
+  scope_type?: string | null
+  path?: string | null
+  display_name?: string | null
+  confidence?: number
+  status?: string
+  conditions?: Array<{ key?: string; value?: string }>
+  candidates?: ScopeCandidate[]
+  matched?: string[]
+  detail?: string
+}
+
+/** Format a confidence for the model (two decimals, never `NaN`). */
+function fmtConfidence(value: number | undefined): string {
+  return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(2) : '?'
+}
+
+/** Render one scope as a single line, prefixed by how it was obtained. */
+function scopeLine(row: ScopeRow, verb: string): string {
+  const place = row.path ?? row.name ?? '?'
+  const meta = [
+    row.scope_type ?? '?',
+    `状态 ${row.status ?? 'active'}`,
+    `置信度 ${fmtConfidence(row.confidence)}`,
+  ].join(' · ')
+  return `${verb} [${row.scope_id ?? '?'}] ${place}（${meta}）`
+}
+
+/** Render the scope tree, indented by each scope's depth in its path. */
+function renderScopeList(value: { scopes?: ScopeRow[] }): string {
+  const scopes = value.scopes ?? []
+  if (scopes.length === 0) return '（没有作用域）'
+  const lines = scopes.map((s) => {
+    const place = s.path ?? s.name ?? '?'
+    const depth = Math.max(0, place.split('/').filter(part => part.length > 0).length - 1)
+    return `${'  '.repeat(depth)}${scopeLine(s, '-')}`
+  })
+  return [`作用域树（${scopes.length} 个，按路径缩进）：`, ...lines].join('\n')
+}
+
+/**
+ * Render what the current context resolves to.
+ *
+ * The unresolved candidate queue is part of the answer, not a footnote: "this
+ * session is not in any scope yet" and "this session keeps looking like project
+ * X but has not proven it" are different states, and only the queue tells them
+ * apart — which is also what the model needs in order to decide whether to
+ * `create` the scope explicitly.
+ */
+function renderScopeResolve(value: { resolution?: ScopeResolution; candidates?: ScopeCandidate[] }): string {
+  const r = value.resolution ?? {}
+  const place = r.scope_type === 'global'
+    ? '全局作用域（没有更具体的匹配）'
+    : `${r.path ?? '?'}（${r.scope_type ?? '?'}）`
+  const lines = [
+    `当前上下文 → [${r.scope_id ?? '?'}] ${place}`,
+    `置信度 ${fmtConfidence(r.confidence)} · 状态 ${r.status ?? '?'}`,
+  ]
+  if ((r.matched ?? []).length > 0) lines.push(`匹配信号：${(r.matched ?? []).join(' / ')}`)
+  const conditions = (r.conditions ?? [])
+    .map(c => `${c.key ?? '?'}=${c.value ?? '?'}`)
+    .join('，')
+  if (conditions) lines.push(`条件：${conditions}`)
+  if (r.detail) lines.push(`说明：${r.detail}`)
+  if ((r.candidates ?? []).length > 0) {
+    lines.push(`本次解析记下候选 ${(r.candidates ?? []).length} 条（证据不足，尚未建档）`)
+  }
+
+  const queue = value.candidates ?? []
+  if (queue.length === 0) {
+    lines.push('待确认候选：无')
+    return lines.join('\n')
+  }
+  lines.push(`待确认候选（${queue.length} 条）：`)
+  for (const c of queue) {
+    lines.push(
+      `- ${c.scope_type ?? '?'} "${c.name ?? '?'}" ← ${c.signal_type ?? '?'}: `
+      + `${c.signal_value ?? '?'}（置信度 ${fmtConfidence(c.confidence)}，出现 ${c.seen_count ?? 1} 次）`,
+    )
+  }
+  return lines.join('\n')
+}
+
+/**
+ * Render the result of a `memory_scope` action for the model.
+ *
+ * @param action - The action the call ran with.
+ * @param value - The structured value that action returned.
+ * @returns The model-visible text.
+ */
+export function renderScopeResult(action: string, value: unknown): string {
+  switch (action) {
+    case 'list':
+      return renderScopeList(value as { scopes?: ScopeRow[] })
+    case 'resolve':
+      return renderScopeResolve(value as { resolution?: ScopeResolution; candidates?: ScopeCandidate[] })
+    case 'create':
+      return scopeLine(value as ScopeRow, '已创建（或已存在）作用域')
+    case 'confirm': {
+      const v = value as { scope_id?: number; confirmed?: boolean }
+      return v.confirmed === false
+        ? `作用域 [${v.scope_id ?? '?'}] 未确认（存储侧返回 confirmed=false）`
+        : `已确认作用域 [${v.scope_id ?? '?'}]：此后该上下文直接解析到它，不再进候选队列。`
+    }
+    case 'alias_add': {
+      const v = value as { scope_id?: number; alias?: string; alias_type?: string; added?: boolean }
+      return v.added === false
+        ? `别名 "${v.alias ?? '?'}" 已属于另一个作用域，未添加（一个别名只能指向一个作用域）。`
+        : `已为作用域 [${v.scope_id ?? '?'}] 添加别名 "${v.alias ?? '?'}"（${v.alias_type ?? 'name'}）。`
+    }
+    case 'merge': {
+      const v = value as {
+        from?: number; to?: number; facts_moved?: number; aliases_moved?: number
+        signals_moved?: number; children_moved?: number
+      }
+      return `已把作用域 [${v.from ?? '?'}] 合并进 [${v.to ?? '?'}]：迁移事实绑定 ${v.facts_moved ?? 0} 条、`
+        + `别名 ${v.aliases_moved ?? 0} 个、信号 ${v.signals_moved ?? 0} 个、子作用域 ${v.children_moved ?? 0} 个。`
+        + '源作用域保留为 merged 状态，历史仍可读。'
+    }
+    default:
+      // Unreachable through `execute` (an unknown action throws before any RPC),
+      // but `render` is also replayed over logged arguments: showing the raw
+      // value beats an empty line when a stored action is not recognised.
+      return JSON.stringify(value)
+  }
 }
 
 /** Register all memory tools and return their disposers. */
@@ -282,6 +477,10 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
       const uid = args.user ?? userIdOf(exec, scope)
       const sid = sessionIdOf(exec, scope)
       const raw = args.content
+      // Built once per call and spread into whichever path runs: the payload is
+      // the same for all three, and reading the filesystem facts per branch
+      // would be three chances to read three different answers.
+      const scoped = scopeParam(deps, exec)
       // 1. LLM-first, exactly like the capture path: extract typed candidates
       //    in the dsh process (where the model lives) and persist them. This
       //    matters because the Python-side ``add`` path only runs the rule
@@ -296,6 +495,7 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
               session_id: sid,
               turn_id: 0,
               candidates: stampExplicitPriority(candidates),
+              ...scoped,
             }))
             return { ...r, candidate_id: r.candidate_id ?? '' }
           }
@@ -315,12 +515,14 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
           session_id: sid,
           turn_id: 0,
           candidates: [rawKnowledgeCandidate(body)],
+          ...scoped,
         }))
         return { ...r, candidate_id: r.candidate_id ?? '', fallback: 'raw' }
       }
       // 3. Rule path for short utterances.
       return await call<any>('add', writeParams(deps, {
         user_id: uid, session_id: sid, text: raw, turn_id: 0,
+        ...scoped,
       }))
     },
   })))
@@ -347,6 +549,7 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
         user_id: args.user ?? userIdOf(exec, scope),
         fact_id: args.factId,
         new_text: args.content,
+        ...scopeParam(deps, exec),
       }))
     },
   })))
@@ -411,6 +614,7 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
         query: args.query,
         token_budget: 4000,
         top_k: args.topK ?? deps.maxRecalledFacts,
+        ...scopeParam(deps, exec),
       })
       return {
         facts: r.facts ?? [],
@@ -477,6 +681,7 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
         // session prompt would freeze at this moment.
         max_tokens: budget(),
         detail: false,
+        ...scopeParam(deps, exec),
       })
       return { text }
     },
@@ -533,6 +738,10 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
         user_id: uid,
         max_tokens: deps.summaryTokens,
         detail: true,
+        // The detail depth ignores the context in the Python renderer; passing
+        // it anyway keeps one rule ("every read travels with its context")
+        // instead of an exception a later reader has to re-derive.
+        ...scopeParam(deps, exec),
       })
       return { text }
     },
@@ -611,6 +820,102 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
     async execute(args, exec) {
       if (deps.isEnabled?.() === false) throw disabledError()
       return await call('stats', { user_id: args.user ?? userIdOf(exec, scope) })
+    },
+  })))
+
+  disposers.push(ctx.tools.register(defineTool({
+    name: 'memory_scope',
+    description:
+      '查看与维护记忆的作用域层级（org / team / client / project / series / phase / document / thread）——作用域决定一条记忆归属哪里、以及在什么上下文里被召回，但不改变任何记忆的内容。'
+      + 'action=list 列出作用域树；resolve 说明当前上下文解析到哪个作用域、还有哪些候选证据不足待确认；'
+      + 'create 显式创建一个作用域（可带身份信号）；confirm 确认一个作用域（此后该上下文无需更多证据即解析到它）；'
+      + 'alias_add 给作用域加一个别名；merge 把重复的两个作用域合并。',
+    parameters: {
+      action: {
+        type: 'string',
+        required: true,
+        description: '要执行的操作：list / resolve / create / confirm / alias_add / merge',
+      },
+      scopeType: {
+        type: 'string',
+        description: 'create 必填：作用域类型（org / team / client / project / series / phase / document / thread）',
+      },
+      name: { type: 'string', description: 'create 必填：作用域的规范名（同名作用域已存在时返回已有的那个）' },
+      parentId: { type: 'integer', description: 'create 可选：父作用域 id（省略则挂在根下）；list 可选：只看该父作用域的直接子作用域' },
+      signals: {
+        type: 'object',
+        additionalProperties: true,
+        description: 'create 可选：注册到该作用域上的身份信号，如 {"git_remote": "git@github.com:o/r.git"} 或 {"path": "D:/work/repo"}',
+      },
+      scopeId: { type: 'integer', description: 'confirm / alias_add 必填：目标作用域 id（来自 list / resolve / create）' },
+      alias: { type: 'string', description: 'alias_add 必填：别名（另一个名字、路径或 remote）' },
+      fromId: { type: 'integer', description: 'merge 必填：被合并掉的作用域 id' },
+      toId: { type: 'integer', description: 'merge 必填：保留的作用域 id' },
+      status: { type: 'string', description: 'list 可选：作用域状态（默认 active，也可用 merged / archived）' },
+      user: { type: 'string', description: '可选：归属用户 id（默认当前用户，跨会话共享）' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true },
+      render(args, value) {
+        return [{ type: 'text', text: renderScopeResult(args.action, value) }]
+      },
+    },
+    async execute(args, exec) {
+      if (deps.isEnabled?.() === false) throw disabledError()
+      const uid = args.user ?? userIdOf(exec, scope)
+      switch (args.action) {
+        case 'list': {
+          const scopes = await call<any>('scope_list', {
+            ...(args.parentId !== undefined ? { parent_id: args.parentId } : {}),
+            ...(args.status !== undefined && args.status !== '' ? { status: args.status } : {}),
+          })
+          return { scopes: scopes ?? [] }
+        }
+        case 'resolve': {
+          const resolution = await call<any>('scope_resolve', {
+            user_id: uid,
+            session_id: sessionIdOf(exec, scope),
+            // Read-only: asking what the context resolves to must not create a
+            // scope as a side effect. Creation belongs to the write path (and to
+            // an explicit `create`).
+            create: false,
+            ...scopeParam(deps, exec),
+          })
+          // The queue is accumulated across sessions, so it is a separate read
+          // rather than a field of this resolution.
+          const candidates = await call<any>('scope_unresolved', { user_id: uid })
+          return { resolution: resolution ?? {}, candidates: candidates ?? [] }
+        }
+        case 'create': {
+          if (!args.scopeType) throw new Error('memory_scope create requires scopeType')
+          if (!args.name) throw new Error('memory_scope create requires name')
+          return await call<any>('scope_create', {
+            scope_type: args.scopeType,
+            name: args.name,
+            parent_id: args.parentId,
+            signals: args.signals,
+          })
+        }
+        case 'confirm': {
+          if (args.scopeId === undefined) throw new Error('memory_scope confirm requires scopeId')
+          return await call<any>('scope_confirm', { scope_id: args.scopeId })
+        }
+        case 'alias_add': {
+          if (args.scopeId === undefined) throw new Error('memory_scope alias_add requires scopeId')
+          if (!args.alias) throw new Error('memory_scope alias_add requires alias')
+          return await call<any>('scope_alias_add', { scope_id: args.scopeId, alias: args.alias })
+        }
+        case 'merge': {
+          if (args.fromId === undefined) throw new Error('memory_scope merge requires fromId')
+          if (args.toId === undefined) throw new Error('memory_scope merge requires toId')
+          return await call<any>('scope_merge', { from_id: args.fromId, to_id: args.toId })
+        }
+        default:
+          throw new Error(
+            `memory_scope: unknown action ${String(args.action)}`
+            + '（可用：list / resolve / create / confirm / alias_add / merge）',
+          )
+      }
     },
   })))
 

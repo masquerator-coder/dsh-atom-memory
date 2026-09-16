@@ -21,9 +21,14 @@ function makeCtx() {
 }
 
 /** Feed a ``user/message`` durable event to a registered capture hook. */
-function send(session: string, text: string, byEvent: ReturnType<typeof makeCtx>['handlersOf']) {
+function send(
+  session: string,
+  text: string,
+  byEvent: ReturnType<typeof makeCtx>['handlersOf'],
+  cwd?: string,
+) {
   const handler = byEvent('session/event')[0] as (s: unknown, e: FakeSessionEvent) => void
-  handler({ id: session }, {
+  handler({ id: session, header: cwd === undefined ? undefined : { cwd } }, {
     type: 'user/message',
     data: { content: [{ type: 'text', text }], source: { kind: 'user' } },
     seq: 1,
@@ -42,7 +47,24 @@ describe('registerCapture', () => {
     // No strong-fact keyword present, but capture must still fire.
     send('s1', '总结我的obsidian工作笔记', handlersOf)
     await new Promise(r => setTimeout(r, 10))
-    expect(capture).toHaveBeenCalledWith('总结我的obsidian工作笔记', 's1')
+    // The third argument is the session's working directory: `undefined` here
+    // because this fake session carries no header, and the caller then falls
+    // back to its own default.
+    expect(capture).toHaveBeenCalledWith('总结我的obsidian工作笔记', 's1', undefined)
+  })
+
+  it('passes the session working directory so the write carries a scope context', async () => {
+    const { ctx, handlersOf } = makeCtx()
+    const capture = vi.fn(async () => {})
+    registerCapture(
+      { ctx, capture },
+      { captureEnabled: () => true, preCompressionCapture: false, nudgeEnabled: false, nudgeIntervalMs: 60_000 },
+    )
+    send('s1', '用户偏好黑咖啡', handlersOf, 'D:/work/repo')
+    await new Promise(r => setTimeout(r, 10))
+    // Which checkout a fact came from is not derivable from the session id, so
+    // the hook hands the directory over rather than letting the writer guess.
+    expect(capture).toHaveBeenCalledWith('用户偏好黑咖啡', 's1', 'D:/work/repo')
   })
 
   it('does not fire for plugin-sourced content', async () => {
@@ -98,7 +120,7 @@ describe('registerCapture', () => {
     enabled = true
     send('s2', '用户喜欢蓝山咖啡', handlersOf)
     await new Promise(r => setTimeout(r, 10))
-    expect(capture).toHaveBeenCalledWith('用户喜欢蓝山咖啡', 's2')
+    expect(capture).toHaveBeenCalledWith('用户喜欢蓝山咖啡', 's2', undefined)
   })
 
   it('rescues a message whose immediate capture failed via pre-compression', async () => {
@@ -117,7 +139,7 @@ describe('registerCapture', () => {
     send('s1', '用户偏好黑咖啡', handlersOf)
     await new Promise(r => setTimeout(r, 10))
     expect(capture).toHaveBeenCalledTimes(1)
-    expect(capture).toHaveBeenCalledWith('用户偏好黑咖啡', 's1')
+    expect(capture).toHaveBeenCalledWith('用户偏好黑咖啡', 's1', undefined)
 
     // Trigger the pre-compression rescue hook (llm/stream with purpose
     // 'compaction'). It is a generator waterfall; drain it to run the sweep.
@@ -133,7 +155,9 @@ describe('registerCapture', () => {
     }
 
     // The failed message was rescued: capture now ran twice (initial + rescue)
-    // with the same text and session, and the original stream still flows.
+    // with the same text and session, and the original stream still flows. The
+    // rescue only knows a session id, so it passes no directory and the writer
+    // falls back to its own — the same fallback the first attempt used here.
     expect(capture).toHaveBeenCalledTimes(2)
     expect(capture.mock.calls[1]).toEqual(['用户偏好黑咖啡', 's1'])
     expect(results).toEqual(['ORIGINAL'])

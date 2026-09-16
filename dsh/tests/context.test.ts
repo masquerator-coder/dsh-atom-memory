@@ -131,6 +131,50 @@ describe('registerMemoryContext', () => {
     expect(bridge.call).toHaveBeenCalledTimes(2)
   })
 
+  it('freezes the snapshot for the scope the session is actually in', async () => {
+    const bridge = {
+      call: vi.fn(async (_method: string, _params: Record<string, unknown>) => '# Memory\n- fact'),
+    }
+    const { ctx, handlers } = makeCtx()
+    const scopeContext = vi.fn(() => ({ signals: { git_root: 'D:/work/repo' } }))
+    registerMemoryContext({
+      ctx, bridge: bridge as any,
+      userScope: 'global', resolveMaxTokens: () => 1500, snapshotEnabled: () => true,
+      scopeContext,
+    })
+    const handler = assembleHandler(handlers)
+
+    const agent = { agent: { session: { id: 's1', header: { cwd: 'D:/work/repo/src' } } } } as any
+    await handler(assembly(), agent, next(assembly()))
+
+    // The digest is rendered for the scope this session is in — the same source
+    // its tool calls use, so an injection and a later recall agree.
+    expect(bridge.call.mock.calls[0]![1]).toMatchObject({
+      scope_context: { signals: { git_root: 'D:/work/repo' } },
+    })
+    expect(scopeContext).toHaveBeenCalledWith(expect.objectContaining({ agent: expect.anything() }))
+
+    // Read once per session: a second assembly serves the frozen text and does
+    // not re-resolve (or re-send) the context.
+    await handler(assembly(), agent, next(assembly()))
+    expect(bridge.call).toHaveBeenCalledTimes(1)
+    expect(scopeContext).toHaveBeenCalledTimes(1)
+  })
+
+  it('sends no scope_context key when there is no context to send', async () => {
+    const bridge = {
+      call: vi.fn(async (_method: string, _params: Record<string, unknown>) => '# Memory\n- fact'),
+    }
+    const { ctx, handlers } = makeCtx()
+    registerMemoryContext({
+      ctx, bridge: bridge as any,
+      userScope: 'global', resolveMaxTokens: () => 1500, snapshotEnabled: () => true,
+      scopeContext: () => undefined,
+    })
+    await assembleHandler(handlers)(assembly(), agentCtx('s1'), next(assembly()))
+    expect('scope_context' in bridge.call.mock.calls[0]![1]).toBe(false)
+  })
+
   it('does not freeze a transient bridge failure, and freezes the retry', async () => {
     let fail = true
     const bridge = {

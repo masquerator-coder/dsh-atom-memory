@@ -15,7 +15,8 @@
  *     characters stripped). The text is then cached for the lifetime of that
  *     session and re-injected byte-identically on every later assembly, so the
  *     system-prompt prefix never changes mid-session and the provider's KV cache
- *     stays valid.
+ *     stays valid. The read carries the session's `scope_context`, so the digest
+ *     is rendered for the scope that session is actually in.
  *
  * The snapshot is delivered through the `system-prompt/assemble` waterfall
  * because the section provider API is synchronous while reading memory is an
@@ -40,6 +41,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { AssembleContext, PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
 import type { PythonBridge } from './bridge.ts'
 import { renderMemoryDataBlock } from './memory-data.ts'
+import type { ScopeContextPayload, SessionCwdSource } from './scope.ts'
 
 /** Section name of the static awareness text. */
 const AWARENESS_SECTION = 'atom-memory-awareness'
@@ -90,6 +92,18 @@ export interface MemoryContextDeps {
   isEnabled?: () => boolean
   /** Max sessions whose frozen snapshot is retained (oldest evicted first). */
   maxFrozenSessions?: number
+  /**
+   * Build the `scope_context` payload for the session being frozen.
+   *
+   * The snapshot is per session, so the working directory *that* session reports
+   * is the right signal source — the same source the session's tool calls use,
+   * which is what makes the injected digest and a later `memory_recall` agree
+   * about which project they are in. When the assembly carries no session
+   * header the builder falls back to its own default, and when it yields
+   * nothing the `summary` params are exactly what a scope-blind deployment
+   * sends.
+   */
+  scopeContext?: (source?: SessionCwdSource) => ScopeContextPayload | undefined
 }
 
 /**
@@ -140,14 +154,19 @@ export function registerMemoryContext(deps: MemoryContextDeps): FrozenSnapshotHa
    * Return the frozen snapshot for a session, reading it once on first use.
    *
    * @param sessionId - Session whose snapshot to resolve.
+   * @param source - The assembly's session source, for the scope context.
    * @returns The text to inject (empty string means "inject nothing").
    */
-  const snapshotFor = async (sessionId: string): Promise<string> => {
+  const snapshotFor = async (
+    sessionId: string,
+    source?: SessionCwdSource,
+  ): Promise<string> => {
     const cached = frozen.get(sessionId)
     if (cached !== undefined) return cached
 
     let rendered: string
     try {
+      const scope = deps.scopeContext?.(source)
       const raw = await bridge.call<string | { text?: string; facts?: number }>('summary', {
         user_id: userScope,
         // Resolved here, at the moment of freezing: a budget changed in the
@@ -163,6 +182,9 @@ export function registerMemoryContext(deps: MemoryContextDeps): FrozenSnapshotHa
         // capability exists. Tolerates a plain-string reply from an older
         // Python side, in which case the count is simply unknown.
         include_meta: true,
+        // The scope the digest is rendered for: scope-scoped rendering answers
+        // with what *this* context has, at the same budget.
+        ...(scope === undefined ? {} : { scope_context: scope }),
       })
       const text = typeof raw === 'string' ? raw : (raw?.text ?? '')
       const facts = typeof raw === 'string' ? undefined : raw?.facts
@@ -216,7 +238,10 @@ export function registerMemoryContext(deps: MemoryContextDeps): FrozenSnapshotHa
     const sessionId = agent?.session?.id
     if (sessionId === undefined) return assembly
 
-    const text = await snapshotFor(sessionId)
+    // The assembly carries the agent (the harness types the context as
+    // scope-only), which is where this session's working directory lives —
+    // the same signal source its tool calls use.
+    const text = await snapshotFor(sessionId, context as unknown as SessionCwdSource)
     if (text) injectSection(assembly, text)
     return assembly
   })
@@ -229,6 +254,9 @@ export function registerMemoryContext(deps: MemoryContextDeps): FrozenSnapshotHa
       if (deps.snapshotEnabled() === false || deps.isEnabled?.() === false) {
         return ''
       }
+      // No assembly context here, so no session header: the builder falls back
+      // to its own default working directory rather than guessing which session
+      // this id belongs to.
       return await snapshotFor(sessionId)
     },
   }
