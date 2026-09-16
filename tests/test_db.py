@@ -155,8 +155,11 @@ def test_all_fact_columns_exist(tmp_path):
 
 
 def test_all_profile_columns_exist(tmp_path):
-    """The user_profile table must expose every required column, `pinned`
-    included — it is what freezes a row against automatic memory updates."""
+    """The user_profile table must expose every required column.
+
+    `pinned` is deliberately absent since v10: it froze a row against automatic
+    memory writes, and the profile is no longer written automatically at all.
+    """
     conn = open_db(MemConfig(db_path=str(tmp_path / "test.db")))
     try:
         cols = {
@@ -167,22 +170,27 @@ def test_all_profile_columns_exist(tmp_path):
 
     expected = {
         "user_id", "section", "key", "value", "source", "confidence",
-        "privacy", "pinned", "updated_at",
+        "privacy", "updated_at",
     }
     assert expected.issubset(cols)
+    assert "pinned" not in cols
 
 
-def test_pinned_column_defaults_to_unpinned(tmp_path):
-    """A profile row written without a pin is not pinned."""
+def test_profile_source_records_provenance(tmp_path):
+    """`source` distinguishes a typed row from an accepted suggestion."""
+    from atom_memory.profile import upsert_profile
+
     conn = open_db(MemConfig(db_path=str(tmp_path / "test.db")))
     try:
-        conn.execute(
-            "INSERT INTO user_profile(user_id, section, key, value, updated_at) "
-            "VALUES ('u1', '职业', 'value', '工程师', 1000)"
-        )
-        conn.commit()
-        row = conn.execute("SELECT pinned FROM user_profile").fetchone()
-        assert row["pinned"] == 0
+        upsert_profile(conn, "u1", "职业", "value", "工程师")
+        upsert_profile(conn, "u1", "城市", "value", "天津", source="generated")
+        rows = {
+            r["section"]: r["source"]
+            for r in conn.execute(
+                "SELECT section, source FROM user_profile ORDER BY section"
+            ).fetchall()
+        }
+        assert rows == {"城市": "generated", "职业": "user"}
     finally:
         conn.close()
 
@@ -282,8 +290,15 @@ def test_v1_database_upgrades_to_v2_with_type_default(tmp_path):
         ).fetchone()
         assert row is not None
         assert row["type"] == "semantic"
-        prof = conn.execute("SELECT pinned FROM user_profile").fetchone()
-        assert prof["pinned"] == 0
+        # v10 clears the old projection output: the row was derived, not
+        # curated, and the user's intent was only ever "what the facts implied".
+        # The facts are untouched, so it can be re-proposed by 生成画像.
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM user_profile"
+        ).fetchone()["n"] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM facts"
+        ).fetchone()["n"] == 1
     finally:
         conn.close()
 
@@ -369,8 +384,11 @@ def test_v2_database_upgrades_to_v3_with_null_content(tmp_path):
         # pre-existing rows get type default and NULL content
         assert row["type"] == "semantic"
         assert row["content"] is None
-        # ...and pre-existing profile rows stay live but unpinned.
-        assert conn.execute("SELECT pinned FROM user_profile").fetchone()["pinned"] == 0
+        # ...and the old projection output is cleared by v10 (the surviving
+        # facts are what matter; see the note in the v1 test above).
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM user_profile"
+        ).fetchone()["n"] == 0
         # column accepts a structured body
         conn.execute(
             "UPDATE facts SET content = ? WHERE fact_id = ?",
@@ -384,15 +402,15 @@ def test_v2_database_upgrades_to_v3_with_null_content(tmp_path):
         conn.close()
 
 
-def test_v3_database_upgrades_to_v4_unpinned(tmp_path):
-    """A database at user_version=3 gains `pinned`, defaulted to "not pinned".
+def test_v3_database_upgrades_through_the_profile_ownership_migration(tmp_path):
+    """A database at user_version=3 opens at the current schema.
 
-    Migration 004 must retro-fit rows that predate the pin: an existing
-    deployment's profile is live and editable, never silently frozen.
-
-    The fixture carries a ``facts`` table because a real v3 deployment has one
-    (migration 001 creates it) and later migrations alter it — see migration
-    005, which adds the reuse-reinforcement columns.
+    Migration 004 retro-fits `pinned` for rows that predate it, and migration
+    010 then removes that column again and clears the projection output — the
+    profile became a table the user owns, so those rows (which the old
+    projection wrote, not the user) are dropped while the facts they came from
+    stay. This test drives the whole chain in one open, which is what an
+    existing deployment actually experiences.
     """
     import sqlite3
 
@@ -458,9 +476,16 @@ def test_v3_database_upgrades_to_v4_unpinned(tmp_path):
     conn = open_db(MemConfig(db_path=path))
     try:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
-        row = conn.execute("SELECT value, pinned FROM user_profile").fetchone()
-        assert row["value"] == "工程师"
-        assert row["pinned"] == 0
+        # v10 leaves no `pinned` column behind, and clears the projection
+        # output. The facts — the actual memory — survive untouched.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(user_profile)").fetchall()}
+        assert "pinned" not in cols
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM user_profile"
+        ).fetchone()["n"] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM facts"
+        ).fetchone()["n"] == 1
     finally:
         conn.close()
 

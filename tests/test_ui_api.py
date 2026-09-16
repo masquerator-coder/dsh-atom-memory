@@ -25,15 +25,15 @@ class _FakeEmbedder:
         return serialize_float32([0.25] * 512)
 
 
-def _make(tmp_path, monkeypatch) -> AtomMem:
+def _make(tmp_path, monkeypatch, **overrides) -> AtomMem:
     monkeypatch.setattr("atom_memory.api.Embedder", _FakeEmbedder)
-    return AtomMem(
-        MemConfig(
-            db_path=str(tmp_path / "mem.db"),
-            worker_poll_interval_sec=0.05,
-            max_retries=3,
-        )
+    kwargs = dict(
+        db_path=str(tmp_path / "mem.db"),
+        worker_poll_interval_sec=0.05,
+        max_retries=3,
     )
+    kwargs.update(overrides)
+    return AtomMem(MemConfig(**kwargs))
 
 
 def _run(coro):
@@ -106,74 +106,133 @@ def test_profile_upsert_delete(tmp_path, monkeypatch):
     async def scenario():
         await mem.start()
         mem.upsert_profile("u1", "职业", "value", "工程师")
-        rows = mem.list_profile("u1")["profile"]
+        page = mem.list_profile("u1")
+        rows = page["profile"]
         assert len(rows) == 1
         assert rows[0]["section"] == "职业"
-        assert rows[0]["source"] == "user_explicit"
-        # Rows are live by default: the 固定 flag must be opt-in.
-        assert rows[0]["pinned"] is False
+        # `source` records provenance now (this one was typed, not suggested).
+        assert rows[0]["source"] == "user"
+        assert page["count"] == 1
+        assert page["limit"] == 50
 
         mem.upsert_profile("u1", "职业", "value", "产品经理")
         assert mem.list_profile("u1")["profile"][0]["value"] == "产品经理"
 
-        # The panel can pin an existing row, and the new state is reported back.
-        assert mem.upsert_profile("u1", "职业", "value", "产品经理", pinned=True)["pinned"] is True
-        assert mem.list_profile("u1")["profile"][0]["pinned"] is True
-        # ...and an edit that omits the flag keeps the pin rather than dropping it.
-        mem.upsert_profile("u1", "职业", "value", "架构师")
-        assert mem.list_profile("u1")["profile"][0]["pinned"] is True
-
         res = mem.delete_profile("u1", "职业", "value")
         assert res["deleted"] == 1
+        assert res["count"] == 0
+        assert mem.list_profile("u1")["profile"] == []
+        # A delete is permanent now: nothing re-derives the table.
+        for _ in range(3):
+            assert mem.list_profile("u1")["profile"] == []
+        await mem.stop()
+
+    _run(scenario())
+
+
+def test_learning_a_fact_does_not_create_a_profile_row(tmp_path, monkeypatch):
+    """Regression: the panel's delete used to be undone by the next read.
+
+    The profile was a projection rebuilt from active facts on every read, so a
+    fact that was still active re-derived the row the user had just deleted.
+    Entries now come only from the user.
+    """
+    mem = _make(tmp_path, monkeypatch)
+
+    async def scenario():
+        await mem.start()
+        _insert_fact(mem, "f1", "用户", "职业", "工程师", created_at=1)
+        mem.db.commit()
+
+        # The fact is remembered, but it is not a profile entry.
+        assert mem.list_facts("u1")["total"] == 1
+        assert mem.list_profile("u1")["profile"] == []
+
+        # It is offered as a suggestion instead — and offering writes nothing.
+        offered = mem.profile_candidates("u1")
+        assert offered["candidates"] == [
+            {"section": "职业", "key": "value", "value": "工程师"}
+        ]
+        assert offered["remaining"] == 50
+        assert mem.list_profile("u1")["profile"] == []
+
+        # Accept it, delete it, and the fact no longer brings it back.
+        mem.upsert_profile("u1", "职业", "value", "工程师")
+        assert mem.delete_profile("u1", "职业", "value")["deleted"] == 1
+        assert mem.list_profile("u1")["profile"] == []
+
+        # Suggestions remain available, but never re-enter the table on their own.
+        assert mem.profile_candidates("u1")["candidates"] != []
         assert mem.list_profile("u1")["profile"] == []
         await mem.stop()
 
     _run(scenario())
 
 
-def test_pinned_profile_row_survives_the_facts_projection(tmp_path, monkeypatch):
-    """A 固定 profile row is never updated or replaced by memory itself.
+def test_profile_rows_are_capped(tmp_path, monkeypatch):
+    """The table is bounded: it is rendered into the prompt on every request."""
+    from atom_memory.profile import ProfileLimitExceeded
 
-    The profile is a projection over active facts, so a newer contradicting fact
-    would normally rewrite the row (same source authority → write wins). The pin
-    is what makes the row the user's, not the pipeline's — while the user's own
-    edit through the panel still works, or the pin could never be corrected or
-    released.
-    """
-    from atom_memory.profile import derive_profile_from_facts
-
-    mem = _make(tmp_path, monkeypatch)
+    mem = _make(tmp_path, monkeypatch, max_profile_rows=3)
 
     async def scenario():
         await mem.start()
-        _insert_fact(mem, "f1", "用户", "职业", "工程师", created_at=1)
-        derive_profile_from_facts(mem.db, "u1")
-        assert mem.list_profile("u1")["profile"][0]["value"] == "工程师"
+        for index in range(3):
+            mem.upsert_profile("u1", f"属性{index}", "value", f"值{index}")
+        assert mem.list_profile("u1")["count"] == 3
 
-        mem.upsert_profile("u1", "职业", "value", "工程师", pinned=True)
+        with pytest.raises(ProfileLimitExceeded) as excinfo:
+            mem.upsert_profile("u1", "溢出", "value", "不行")
+        assert excinfo.value.limit == 3
+        assert excinfo.value.current == 4
+        # The refused write changed nothing.
+        assert mem.list_profile("u1")["count"] == 3
 
-        # A newer fact that contradicts the pinned row must not get through.
-        _insert_fact(mem, "f2", "用户", "职业", "产品经理", created_at=2)
-        derive_profile_from_facts(mem.db, "u1")
-        row = mem.list_profile("u1")["profile"][0]
-        assert row["value"] == "工程师"
-        assert row["pinned"] is True
+        # Editing an existing row is still allowed at the cap.
+        mem.upsert_profile("u1", "属性0", "value", "改过的值")
+        rows = {r["section"]: r["value"] for r in mem.list_profile("u1")["profile"]}
+        assert rows["属性0"] == "改过的值"
 
-        # user_md re-derives before rendering; the pinned value is what renders,
-        # and it is marked as fixed for the reader.
-        md = await mem.user_md("u1")
-        assert "工程师" in md
-        assert "固定" in md
-        assert "产品经理" not in md
+        # Deleting frees a slot again.
+        mem.delete_profile("u1", "属性1", "value")
+        mem.upsert_profile("u1", "新属性", "value", "现在可以了")
+        assert mem.list_profile("u1")["count"] == 3
+        await mem.stop()
 
-        # The user's own edit still applies (that is the pin's escape hatch).
-        mem.upsert_profile("u1", "职业", "value", "算法工程师", pinned=True)
-        assert mem.list_profile("u1")["profile"][0]["value"] == "算法工程师"
+    _run(scenario())
 
-        # Releasing the pin hands the row back to the pipeline.
-        mem.upsert_profile("u1", "职业", "value", "算法工程师", pinned=False)
-        derive_profile_from_facts(mem.db, "u1")
-        assert mem.list_profile("u1")["profile"][0]["value"] == "产品经理"
+
+def test_write_profile_batch_is_all_or_nothing(tmp_path, monkeypatch):
+    """A batch that breaks the cap leaves the table untouched."""
+    from atom_memory.profile import ProfileLimitExceeded
+
+    mem = _make(tmp_path, monkeypatch, max_profile_rows=2)
+
+    async def scenario():
+        await mem.start()
+        mem.upsert_profile("u1", "职业", "value", "工程师")
+        before = mem.list_profile("u1")["profile"]
+
+        with pytest.raises(ProfileLimitExceeded):
+            mem.write_profile("u1", [
+                {"section": "城市", "key": "value", "value": "天津"},
+                {"section": "语言", "key": "value", "value": "中文"},
+            ])
+        assert mem.list_profile("u1")["profile"] == before
+
+        # A batch that deletes one row and adds one fits, and applies both.
+        result = mem.write_profile("u1", [
+            {"section": "职业", "key": "value", "value": "", "deleted": True},
+            {"section": "城市", "key": "value", "value": "天津"},
+        ])
+        assert result["deleted"] == 1
+        assert result["written"] == 1
+        rows = {r["section"]: r["value"] for r in mem.list_profile("u1")["profile"]}
+        assert rows == {"城市": "天津"}
+
+        # A row missing its identity is refused outright.
+        with pytest.raises(ValueError):
+            mem.write_profile("u1", [{"section": "", "key": "value", "value": "x"}])
         await mem.stop()
 
     _run(scenario())
@@ -202,43 +261,41 @@ def test_backup_restore_roundtrip(tmp_path, monkeypatch):
         restored = await mem.restore("u1", snapshot)
         assert restored["facts_written"] == 2
         assert mem.list_facts("u1")["total"] == 2
-        # The profile is a read-through projection of the active facts, so after
-        # the restore it holds every row those facts imply: the exported 职业 row
-        # *and* the 偏好 row derived from the restored preference fact. Asserting
-        # the snapshot's own row count here would pin the old behaviour, where a
-        # profile could describe facts the store no longer had.
-        sections = {r["section"] for r in mem.list_profile("u1")["profile"]}
-        assert sections == {"职业", "偏好"}
+        # The profile round-trips exactly: it is a table the user owns, not a
+        # view of the restored facts, so the snapshot's own rows are what come
+        # back — restoring must not invent entries from the facts.
+        rows = mem.list_profile("u1")["profile"]
+        assert [r["section"] for r in rows] == ["职业"]
+        assert rows[0]["source"] == "user"
         await mem.stop()
 
     _run(scenario())
 
 
-def test_backup_roundtrip_preserves_the_pin(tmp_path, monkeypatch):
-    """A restore must not silently unfreeze a profile row the user pinned."""
+def test_backup_roundtrip_preserves_row_provenance(tmp_path, monkeypatch):
+    """A restore must not relabel what the user wrote as suggested, or vice versa."""
     mem = _make(tmp_path, monkeypatch)
 
     async def scenario():
         await mem.start()
-        mem.upsert_profile("u1", "职业", "value", "工程师", pinned=True)
+        mem.upsert_profile("u1", "职业", "value", "工程师")
+        mem.write_profile("u1", [{"section": "城市", "key": "value", "value": "天津"}])
+        # Tag the second row as coming from an accepted suggestion.
+        mem.db.execute(
+            "UPDATE user_profile SET source='generated' WHERE section='城市'"
+        )
+        mem.db.commit()
+
         snapshot = mem.backup("u1")
-        assert snapshot["profile"][0]["pinned"] == 1
+        sources = {r["section"]: r["source"] for r in snapshot["profile"]}
+        assert sources == {"职业": "user", "城市": "generated"}
 
         mem.db.execute("DELETE FROM user_profile WHERE user_id='u1'")
         mem.db.commit()
         await mem.restore("u1", snapshot)
 
-        rows = mem.list_profile("u1")["profile"]
-        assert rows[0]["value"] == "工程师"
-        assert rows[0]["pinned"] is True
-
-        # A snapshot taken before the pin existed restores as unpinned.
-        for row in snapshot["profile"]:
-            row.pop("pinned")
-        mem.db.execute("DELETE FROM user_profile WHERE user_id='u1'")
-        mem.db.commit()
-        await mem.restore("u1", snapshot)
-        assert mem.list_profile("u1")["profile"][0]["pinned"] is False
+        after = {r["section"]: r["source"] for r in mem.list_profile("u1")["profile"]}
+        assert after == {"职业": "user", "城市": "generated"}
         await mem.stop()
 
     _run(scenario())

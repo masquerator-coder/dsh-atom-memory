@@ -444,7 +444,7 @@ def test_capacity_archives_the_least_valuable_and_can_restore_it(tmp_path, monke
     _run(scenario())
 
 
-def test_capacity_protects_fresh_reinforced_durable_and_pinned_facts(tmp_path, monkeypatch):
+def test_capacity_protects_fresh_reinforced_and_durable_facts(tmp_path, monkeypatch):
     """The archive order is a policy: what is *protected* matters more than the
     score, so the pass cannot evict evidence that the fact is valuable."""
     from atom_memory.db import now_ms
@@ -467,10 +467,6 @@ def test_capacity_protects_fresh_reinforced_durable_and_pinned_facts(tmp_path, m
         # Durable knowledge.
         _insert_fact(mem, "rule", "用户", "决策规则", "先回滚再排查",
                      importance=0.1, created_at=1, type="decision_rule")
-        # Backs a pinned profile row.
-        _insert_fact(mem, "pinned_fact", "用户", "职业", "工程师",
-                     importance=0.1, created_at=1)
-        mem.upsert_profile("u1", "职业", "value", "工程师", pinned=True)
         mem.db.commit()
 
         archived = await mem.maintenance("u1")
@@ -551,17 +547,38 @@ def test_retention_of_zero_keeps_everything(tmp_path, monkeypatch):
     _run(scenario())
 
 
-# ---- F10: the profile is a read-through projection ---------------------------
+# ---- the profile is a table the user owns -------------------------------------
 
-def test_profile_reflects_facts_without_an_explicit_derive(tmp_path, monkeypatch):
+def test_learning_facts_does_not_touch_the_profile(tmp_path, monkeypatch):
+    """The reverse of the old read-through behaviour, and the point of the change.
+
+    The profile used to be re-derived from active facts on every read, so
+    learning a fact silently created a profile entry and deleting one silently
+    came back. Entries now arrive only through the user (accepted suggestions or
+    typed rows), and facts are merely *suggestible*.
+    """
     mem = _make(tmp_path, monkeypatch)
 
     async def scenario():
         await mem.start()
         _insert_fact(mem, "f1", "用户", "职业", "工程师")
         _insert_fact(mem, "f2", "用户", "偏好", "黑咖啡")
-        rows = {r["section"] for r in mem.list_profile("u1")["profile"]}
-        assert rows == {"职业", "偏好"}, "reading the profile refreshes it"
+
+        page = mem.list_profile("u1")
+        assert page["profile"] == [], "facts alone must not create profile entries"
+
+        # ...but they are offered as suggestions, and offering writes nothing.
+        offered = mem.profile_candidates("u1")["candidates"]
+        assert {(c["section"], c["key"]) for c in offered} == {
+            ("偏好", "黑咖啡"), ("职业", "value"),
+        }
+        assert mem.list_profile("u1")["profile"] == []
+
+        # A deleted entry stays deleted across reads.
+        mem.upsert_profile("u1", "职业", "value", "工程师")
+        assert mem.delete_profile("u1", "职业", "value")["deleted"] == 1
+        for _ in range(3):
+            assert mem.list_profile("u1")["profile"] == []
         await mem.stop()
 
     _run(scenario())

@@ -37,14 +37,15 @@ def _insert_fact(
     status: str = "active",
     source_type: str = "user_explicit",
     importance: float = 0.6,
+    memory_type: str = "semantic",
 ):
     conn.execute(
         "INSERT INTO facts(fact_id, user_id, session_id, subject, predicate, "
         "object, confidence, importance, source_type, status, observed_at, "
-        "created_at, version) VALUES (?, ?, ?, ?, ?, ?, 0.8, ?, ?, ?, 1, 2, 1)",
+        "created_at, version, type) VALUES (?, ?, ?, ?, ?, ?, 0.8, ?, ?, ?, 1, 2, 1, ?)",
         (
             fact_id, user_id, "s_test", subject, predicate, obj,
-            importance, source_type, status,
+            importance, source_type, status, memory_type,
         ),
     )
     conn.execute(
@@ -253,111 +254,95 @@ def test_summary_compact_omits_fact_id():
         conn.close()
 
 
-def test_upsert_profile_source_priority():
+def test_profile_rows_are_user_owned_and_ordered():
+    """The profile table is written by the user and read back verbatim.
+
+    There is no source-priority arbitration any more: that rule existed to stop
+    one *writer* (the facts projection) downgrading another's row, and the
+    projection is gone. A second write simply is the new value.
+    """
     from atom_memory.profile import profile_md, upsert_profile
 
     conn = connect_for_tests()
     try:
-        # weak source first, then strong source -> strong wins
-        ok1 = upsert_profile(
-            conn, "u1", "职业", "value", "工程师",
-            source="system_inferred_low", confidence=0.5,
-        )
-        ok2 = upsert_profile(
-            conn, "u1", "职业", "value", "科学家",
-            source="user_explicit", confidence=0.9,
-        )
-        assert ok1 and ok2
+        assert upsert_profile(conn, "u1", "职业", "value", "工程师")
+        assert upsert_profile(conn, "u1", "职业", "value", "科学家")
         row = conn.execute(
-            "SELECT value FROM user_profile WHERE user_id='u1' AND section='职业'"
+            "SELECT value, source FROM user_profile WHERE user_id='u1' AND section='职业'"
         ).fetchone()
         assert row["value"] == "科学家"
-        # strong source already present -> weaker source must not downgrade
-        ok3 = upsert_profile(
-            conn, "u1", "职业", "value", "教师",
-            source="model_generated", confidence=0.3,
+        assert row["source"] == "user"
+
+        # A generated row is labelled as such, so the panel can tell the two apart.
+        assert upsert_profile(
+            conn, "u1", "城市", "value", "天津", source="generated"
         )
-        assert ok3 is False
-        row = conn.execute(
-            "SELECT value FROM user_profile WHERE user_id='u1' AND section='职业'"
-        ).fetchone()
-        assert row["value"] == "科学家"  # unchanged
+        assert conn.execute(
+            "SELECT source FROM user_profile WHERE user_id='u1' AND section='城市'"
+        ).fetchone()["source"] == "generated"
+
         md = profile_md(conn, "u1", max_tokens=2000)
         assert "科学家" in md
+        assert "天津" in md
     finally:
         conn.close()
 
 
-def test_pinned_profile_row_blocks_automatic_writes():
-    """A pinned row is frozen: derived writes may not update or replace it.
+def test_profile_md_marks_rows_it_could_not_fit():
+    """A truncated render says so instead of looking complete.
 
-    Only a write that carries the pin explicitly (the settings panel toggling
-    it) gets through, which is what makes the flag releasable at all.
+    The row cap bounds how many entries exist; this budget bounds what they may
+    cost in the prompt. They are independent, so a full table can still overflow
+    the render — and silently dropping the tail would read as "that is all".
     """
-    from atom_memory.profile import upsert_profile
+    from atom_memory.profile import profile_md, upsert_profile
 
     conn = connect_for_tests()
     try:
-        assert upsert_profile(
-            conn, "u1", "职业", "value", "工程师",
-            source="user_explicit", confidence=0.9,
-        )
-        # The panel's write path: value plus the pin itself.
-        assert upsert_profile(
-            conn, "u1", "职业", "value", "工程师",
-            source="user_explicit", confidence=0.9, pinned=True,
-        )
-        assert conn.execute(
-            "SELECT pinned FROM user_profile WHERE user_id='u1'"
-        ).fetchone()["pinned"] == 1
-
-        # A derived write of equal (or higher) authority would normally win —
-        # the pin is what stops it, not the source ranking.
-        assert upsert_profile(
-            conn, "u1", "职业", "value", "产品经理",
-            source="user_explicit", confidence=0.9,
-        ) is False
-        assert conn.execute(
-            "SELECT value FROM user_profile WHERE user_id='u1'"
-        ).fetchone()["value"] == "工程师"
-
-        # Unpinning releases the row back to the normal rules.
-        assert upsert_profile(
-            conn, "u1", "职业", "value", "工程师",
-            source="user_explicit", confidence=0.9, pinned=False,
-        )
-        assert upsert_profile(
-            conn, "u1", "职业", "value", "产品经理",
-            source="user_explicit", confidence=0.9,
-        )
-        row = conn.execute(
-            "SELECT value, pinned FROM user_profile WHERE user_id='u1'"
-        ).fetchone()
-        assert row["value"] == "产品经理"
-        assert row["pinned"] == 0
+        for index in range(20):
+            upsert_profile(conn, "u1", f"属性{index}", "value", "值" * 30)
+        md = profile_md(conn, "u1", max_tokens=40)
+        assert "未展示" in md
+        full = profile_md(conn, "u1", max_tokens=4000)
+        assert "未展示" not in full
+        assert "属性19" in full
     finally:
         conn.close()
 
 
-def test_derive_profile_from_facts_single_and_multi():
-    from atom_memory.profile import derive_profile_from_facts
+def test_suggestible_entries_mirror_the_old_projection_rule():
+    """Candidates follow the same mapping the projection used to apply.
+
+    Single-valued attributes imply ``(predicate, 'value')``; multi-valued
+    preferences imply ``('偏好', object)`` with the polarity as the value. The
+    difference is that these are *offers*, not writes — nothing lands in the
+    table until the user accepts.
+    """
+    from atom_memory.profile import suggestible_profile_entries
 
     conn = connect_for_tests()
     try:
         _insert_fact(conn, "f1", "u1", "用户", "偏好", "黑咖啡")
         _insert_fact(conn, "f2", "u1", "用户", "职业", "工程师")
+        # Non-semantic types are not profile material.
+        _insert_fact(
+            conn, "f3", "u1", "用户", "教训", "上线前必须测试", memory_type="lesson"
+        )
         conn.commit()
-        n = derive_profile_from_facts(conn, "u1")
-        assert n >= 2
-        prefs = conn.execute(
-            "SELECT section, key, value FROM user_profile "
-            "WHERE user_id='u1' AND section='偏好'"
-        ).fetchall()
-        assert any(r["key"] == "黑咖啡" and r["value"] == "喜欢" for r in prefs)
-        prof = conn.execute(
-            "SELECT value FROM user_profile WHERE user_id='u1' AND section='职业'"
-        ).fetchone()
-        assert prof["value"] == "工程师"
+
+        entries = suggestible_profile_entries(conn, "u1")
+        pairs = {(e["section"], e["key"]) for e in entries}
+        assert ("偏好", "黑咖啡") in pairs
+        assert ("职业", "value") in pairs
+        assert not any(e["section"] == "教训" for e in entries)
+
+        pref = next(e for e in entries if e["section"] == "偏好")
+        assert pref["value"] == "喜欢"
+
+        # Reading candidates writes nothing.
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM user_profile"
+        ).fetchone()["n"] == 0
     finally:
         conn.close()
 
