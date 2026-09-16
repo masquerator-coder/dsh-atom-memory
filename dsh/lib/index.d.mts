@@ -102,6 +102,26 @@ interface Config {
    * row.
    */
   maxActiveFacts?: number;
+  /**
+   * Per-fact ceiling inside one recall result, in estimated tokens.
+   *
+   * The recall budget is otherwise soft (the first match is always kept so a
+   * tiny budget cannot return nothing), which measured at ~60x overshoot for one
+   * long knowledge body. An oversized body is shortened to this ceiling, the fact
+   * is flagged as truncated, and `memory_get` returns the whole text.
+   */
+  maxFactTokens?: number;
+  /**
+   * Cosine-distance gate for folding a *reworded* knowledge body into the memory
+   * it repeats.
+   *
+   * The fingerprint half of deduplication (identical content, including for
+   * knowledge bodies whose title is derived) is always on. This gate adds the
+   * approximate half and only for bodies long enough to be a document; `0`
+   * disables it. Keep it tight: a false merge removes a distinct memory from the
+   * working set, while a missed merge costs one redundant row.
+   */
+  dedupMaxDistance?: number;
 }
 declare const Config: z<Config>;
 //#endregion
@@ -114,6 +134,16 @@ declare const name = "dsh-atom-memory";
  * (they are optional, model-versioned, or deployment-determined services).
  */
 declare const inject: readonly ["tools", "systemPrompt"];
+/**
+ * Delay before start attempt `attempt` (1-based), doubling each time.
+ *
+ * Exported so the backoff the README promises is testable without spawning a
+ * bridge: the delay is the only part of the retry policy that is pure.
+ *
+ * @param attempt - Which attempt is about to run (1 = the first retry).
+ * @returns Milliseconds to wait, capped at {@link MAX_RETRY_MS}.
+ */
+declare function retryDelayMs(attempt: number): number;
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { Config, apply, inject, name };
+export { Config, apply, inject, name, retryDelayMs };

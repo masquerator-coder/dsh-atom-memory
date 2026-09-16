@@ -66,6 +66,23 @@ const FALLBACK_SCOPE = 'global'
 /** Start attempts before the bridge is declared offline. */
 const MAX_START_ATTEMPTS = 3
 
+/** First retry delay, and the ceiling exponential backoff climbs to. */
+const BASE_RETRY_MS = 1_000
+const MAX_RETRY_MS = 15_000
+
+/**
+ * Delay before start attempt `attempt` (1-based), doubling each time.
+ *
+ * Exported so the backoff the README promises is testable without spawning a
+ * bridge: the delay is the only part of the retry policy that is pure.
+ *
+ * @param attempt - Which attempt is about to run (1 = the first retry).
+ * @returns Milliseconds to wait, capped at {@link MAX_RETRY_MS}.
+ */
+export function retryDelayMs(attempt: number): number {
+  return Math.min(BASE_RETRY_MS * 2 ** (Math.max(1, attempt) - 1), MAX_RETRY_MS)
+}
+
 /**
  * Start params sent to the Python bridge.
  *
@@ -90,6 +107,12 @@ function buildStartParams(config: ConfigShape): Record<string, unknown> {
   }
   if (config.maxActiveFacts !== undefined) {
     params.max_active_facts = config.maxActiveFacts
+  }
+  if (config.maxFactTokens !== undefined) {
+    params.max_fact_tokens = config.maxFactTokens
+  }
+  if (config.dedupMaxDistance !== undefined) {
+    params.dedup_max_distance = config.dedupMaxDistance
   }
   if (config.writeAckTimeoutMs !== undefined) {
     params.write_ack_timeout_ms = config.writeAckTimeoutMs
@@ -189,7 +212,12 @@ export function apply(ctx: Context, config: ConfigShape): void {
     } catch (err) {
       state.value = false
       state.error = (err as Error)?.message ?? String(err)
-      startTimer = setTimeout(() => { void tryStart() }, 1000)
+      // Exponential backoff, which is what the README has always claimed
+      // ("retried at most three times with backoff") while the code retried on a
+      // fixed 1s timer: that hammers an interpreter which is merely slow to warm
+      // up, and a flat delay tells a log reader nothing about how many attempts
+      // have already gone by. The budget itself is unchanged.
+      startTimer = setTimeout(() => { void tryStart() }, retryDelayMs(state.attempt))
     }
   }
   if (config.autostart !== false) void tryStart()

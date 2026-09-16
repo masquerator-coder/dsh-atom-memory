@@ -34,7 +34,8 @@ const zh = {
   modelProtocolOpenai: 'openai（OpenAI 兼容）',
   modelApiKeyLabel: 'API 密钥',
   modelApiKeyPlaceholder: 'sk-...',
-  modelHint: '选择“手动指定模型”后可填 Provider ID 与 Model（跟随默认时留空）；填了 API 地址则由插件直连该 OpenAI 兼容端点，否则走 dsh 默认模型。',
+  modelHint: '选择“手动指定模型”后可填 Provider ID 与 Model（跟随默认时留空）；填了 API 地址则由插件直连该 OpenAI 兼容端点，否则走 dsh 默认模型。'
+    + '注意：API Key 以明文保存在 dsh 的设置文档里（不在密钥库中），导出或分享配置时会一并带出。',
   // 3) 记忆内容 group: summary + profile + memory & facts share one region
   contentGroupHeader: '记忆内容',
   // 3a) summary (compact injected view)
@@ -120,7 +121,8 @@ const en: Record<keyof typeof zh, string> = {
   modelProtocolOpenai: 'openai (OpenAI-compatible)',
   modelApiKeyLabel: 'API key',
   modelApiKeyPlaceholder: 'sk-...',
-  modelHint: 'With “manual model” you can set Provider ID and Model (leave empty to follow default); filling in the API Base URL makes the plugin call that OpenAI-compatible endpoint directly, otherwise the dsh default model is used.',
+  modelHint: 'With “manual model” you can set Provider ID and Model (leave empty to follow default); filling in the API Base URL makes the plugin call that OpenAI-compatible endpoint directly, otherwise the dsh default model is used.'
+    + ' Note: the API key is stored in plain text in the dsh settings document (not in a secret store), so exporting or sharing the configuration carries it along.',
   contentGroupHeader: 'Memory content',
   summaryHeader: 'Memory summary (as injected)',
   summaryDesc: 'Read-only render of the compact memory summary injected into the session system prompt — grouped by type, ordered by importance, no fact_ids — i.e. exactly the text the model sees. For a full list carrying fact_ids (to locate one fact), use the memory_summary_detail tool.',

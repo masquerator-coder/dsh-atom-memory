@@ -109,6 +109,26 @@ export interface Config {
    * row.
    */
   maxActiveFacts?: number
+  /**
+   * Per-fact ceiling inside one recall result, in estimated tokens.
+   *
+   * The recall budget is otherwise soft (the first match is always kept so a
+   * tiny budget cannot return nothing), which measured at ~60x overshoot for one
+   * long knowledge body. An oversized body is shortened to this ceiling, the fact
+   * is flagged as truncated, and `memory_get` returns the whole text.
+   */
+  maxFactTokens?: number
+  /**
+   * Cosine-distance gate for folding a *reworded* knowledge body into the memory
+   * it repeats.
+   *
+   * The fingerprint half of deduplication (identical content, including for
+   * knowledge bodies whose title is derived) is always on. This gate adds the
+   * approximate half and only for bodies long enough to be a document; `0`
+   * disables it. Keep it tight: a false merge removes a distinct memory from the
+   * working set, while a missed merge costs one redundant row.
+   */
+  dedupMaxDistance?: number
 }
 
 export const Config: z<Config> = z.object({
@@ -138,5 +158,7 @@ export const Config: z<Config> = z.object({
   maxVectorDistance: z.number().default(0.70),
   minRelevance: z.number().default(0),
   maxActiveFacts: z.number().default(0),
+  maxFactTokens: z.number().default(600),
+  dedupMaxDistance: z.number().default(0.10),
 })
 

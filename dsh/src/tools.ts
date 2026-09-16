@@ -74,7 +74,14 @@ interface WriteReceipt {
       object?: string
       stored_object?: string
     }>
-    reinforced?: Array<{ fact_id?: string; object?: string; applied?: boolean }>
+    reinforced?: Array<{
+      fact_id?: string
+      object?: string
+      applied?: boolean
+      /** ``fingerprint`` (identical content) or ``embedding`` (reworded body). */
+      on?: string
+    }>
+    truncated?: Array<{ field?: string; original_chars?: number; kept_chars?: number }>
     retracted?: string[]
     purged?: string[]
   }
@@ -150,11 +157,20 @@ export function renderWriteReceipt(receipt: WriteReceipt): string {
   const superseded = outcome.superseded ?? []
   const rejected = outcome.rejected ?? []
   const reinforced = outcome.reinforced ?? []
+  const truncated = outcome.truncated ?? []
   const retracted = outcome.retracted ?? []
   const purged = outcome.purged ?? []
 
+  // Shortening is reported first and unconditionally: it is the one outcome the
+  // caller cannot discover afterwards, because the stored text is already the
+  // shortened one.
+  const shortened = truncated
+    .map(t => `${t.field ?? '内容'}（保留前 ${t.kept_chars ?? '?'} 字符，原 ${t.original_chars ?? '?'}）`)
+    .join('，')
+
   if (receipt.status === 'pending') {
-    return '已入队（尚未落库）。稍后可用 memory_snapshot 或 memory_summary_detail 确认结果。'
+    const head = '已入队（尚未落库）。稍后可用 memory_snapshot 或 memory_summary_detail 确认结果。'
+    return shortened ? `${head}\n注意：内容过长已截断——${shortened}` : head
   }
   if (receipt.status === 'error') {
     return `写入失败：${receipt.reject_reason ?? '存储侧报错'}（未写入任何记忆）`
@@ -170,7 +186,19 @@ export function renderWriteReceipt(receipt: WriteReceipt): string {
       .join('；')
     parts.push(`并替换了 ${superseded.length} 条旧值（${detail}）`)
   }
-  if (reinforced.length > 0) parts.push(`其中 ${reinforced.length} 条已存在，记为复用确认`)
+  if (reinforced.length > 0) {
+    // A repeat is not a write. Saying so explicitly is what stops the model from
+    // believing it added a memory it did not add — and the `on` field tells a
+    // human which test fired: `embedding` means the bodies were an approximate
+    // match, anything else (`idempotent`, `fingerprint`) means identical content.
+    const semantic = reinforced.filter(r => (r.on ?? '') === 'embedding').length
+    const exact = reinforced.length - semantic
+    const how = [
+      exact > 0 ? `${exact} 条内容完全相同` : '',
+      semantic > 0 ? `${semantic} 条语义近似` : '',
+    ].filter(Boolean).join('、')
+    parts.push(`其中 ${reinforced.length} 条与已存记忆重复，已合并为复用确认（${how}）`)
+  }
   if (rejected.length > 0) {
     const first = rejected[0]!
     const reason =
@@ -179,6 +207,7 @@ export function renderWriteReceipt(receipt: WriteReceipt): string {
       || (first.kind === 'conflict' ? '与已存记忆冲突' : String(first.kind ?? '被拒绝'))
     parts.push(`拒绝 ${rejected.length} 条：${reason}`)
   }
+  if (shortened) parts.push(`注意：内容过长已截断——${shortened}`)
   if (parts.length === 0) return '没有可写入的事实（抽取为空）。'
   return `${parts.join('，')}。`
 }
@@ -337,6 +366,7 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
           facts?: Array<{
             fact_id?: string; subject?: string; predicate?: string
             object?: string; type?: string; content?: string | null
+            truncated?: boolean
           }>
           degraded?: string[]
         }
@@ -355,7 +385,13 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
               f.type ? `*(${f.type})*` : '',
             ].filter(Boolean).join(' ')
             const body = (f.content ?? '').trim()
-            return body ? `- ${head}\n    > ${body}` : `- ${head}`
+            if (!body) return `- ${head}`
+            // A shortened body is flagged *with* the way to read the rest: a
+            // truncation the model cannot follow up on is just missing data.
+            const tail = f.truncated
+              ? `\n    > （正文已截断，需要全文请用 memory_get factId=${f.fact_id ?? '?'}）`
+              : ''
+            return `- ${head}\n    > ${body}${tail}`
           }).join('\n'))
         }
         // A degraded index means the answer is partial for a *reason*; saying so
@@ -381,6 +417,39 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
         token_count: r.token_count ?? 0,
         degraded: r.degraded ?? [],
       }
+    },
+  })))
+
+  disposers.push(ctx.tools.register(defineTool({
+    name: 'memory_get',
+    description:
+      '按 fact_id 读取一条记忆的完整内容（含未截断的知识正文）。'
+      + 'memory_recall 为控制上下文会对单条过长的正文截断并标注，需要全文时用本工具。',
+    parameters: {
+      factId: { type: 'string', required: true, description: '记忆 fact id（memory_recall / memory_summary_detail 里可获得）' },
+      user: { type: 'string', description: '可选：归属用户 id（默认当前用户，跨会话共享）' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true },
+      render(_args, value) {
+        const v = value as {
+          fact_id?: string; subject?: string; predicate?: string; object?: string
+          type?: string; content?: string | null; status?: string
+        }
+        const head = `${v.subject ?? ''}${v.predicate ?? ''}: ${v.object ?? ''}`
+        const meta = [v.fact_id ? `[${v.fact_id}]` : '', v.type ? `*(${v.type})*` : '',
+          v.status ? `状态=${v.status}` : ''].filter(Boolean).join(' ')
+        const body = (v.content ?? '').trim()
+        return [{ type: 'text', text: `${head} ${meta}${body ? `\n\n${body}` : ''}` }]
+      },
+    },
+    async execute(args, exec) {
+      if (deps.isEnabled?.() === false) throw disabledError()
+      if (!args.factId) throw new Error('memory_get requires factId')
+      return await call('get_fact', {
+        user_id: args.user ?? userIdOf(exec, scope),
+        fact_id: args.factId,
+      })
     },
   })))
 

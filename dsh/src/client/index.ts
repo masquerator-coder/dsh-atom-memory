@@ -48,7 +48,7 @@ export async function apply(ctx: Context): Promise<() => void> {
     // Never fail the loader entry (that blocks dsh startup): degrade the panel
     // to a surfaced error instead. The settings section still renders and the
     // dynamic-data calls will report the missing namespace through `lastError`.
-    ctx.logger ? ctx.logger.warn('[dsh-atom-memory] remote.atomMemory was not provided after mount; memory panel remote calls disabled') : undefined
+    ctx.logger.warn('[dsh-atom-memory] remote.atomMemory was not provided after mount; memory panel remote calls disabled')
   }
 
   const controller = new MemorySettingsController(
