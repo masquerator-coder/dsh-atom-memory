@@ -3,9 +3,9 @@
 # after editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write README.md
 # (no such script ships in this repository's package.json — record the two
-#  `git hash-object <file>` values by hand; both sides were re-recorded together
-#  after the memory-semantics round, which also repaired a three-commit drift:
-#  README.md, README.zh.md and this file had last changed in three different
+#  `git hash-object <file>` values by hand. Re-recorded after the memory-semantics
+#  round and again after the hardening round, which also repaired a three-commit
+#  drift: README.md, README.zh.md and this file had last changed in three different
 #  commits, so the record could not have verified anything.)
-README.md: 4f47feaf09bac1b3285512628807ef0d60880635
-README.zh.md: 208e586e07e58ecf90472174e5ae151a6fb54a5e
+README.md: e35d51d1af46fe5e0b866df1c99a228bce6c2e35
+README.zh.md: baf416af8d63b75034d059c5cb85ddb44d74e53e

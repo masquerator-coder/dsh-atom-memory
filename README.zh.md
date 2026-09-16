@@ -60,7 +60,7 @@ pip install -e .
 
 | 表面 | 贡献 |
 | --- | --- |
-| 模型可见工具 | `memory_add`、`memory_replace`、`memory_recall`、`memory_summary`、`memory_snapshot`、`memory_forget`、`memory_summary_detail`、`memory_user_md`、`memory_stats` |
+| 模型可见工具 | `memory_add`、`memory_replace`、`memory_recall`、`memory_get`、`memory_summary`、`memory_snapshot`、`memory_forget`、`memory_summary_detail`、`memory_user_md`、`memory_stats` |
 | 系统提示词 | 一段常驻的持久记忆意识段，外加一份在会话起始冻结一次的紧凑 `memory summary` 摘要 |
 | 会话捕获 | 尽力而为的逐消息捕获、压缩前抢救与周期性微调，只读取持久会话事件 |
 | 设置面板 | dsh 设置侧边栏中的 **记忆 / Memory** 分区：总开关、注入体积滑块、抽取模型、一个把摘要查看、可逐行 **固定** 的用户画像编辑与事实浏览/编辑归在一起的 **记忆内容** 区域，以及备份与恢复 |
@@ -88,6 +88,8 @@ pip install -e .
 | `preCompressionCapture` | `true` | 在压缩前抢救记忆。 |
 | `nudgeEnabled` / `nudgeIntervalMinutes` | `true` / `30` | 周期性写路径微调。 |
 | `maxRecalledFacts` | `10` | 每次召回返回给模型的事实条数。 |
+| `maxFactTokens` | `600` | 单条事实在召回结果里的 token 上限。超限正文会被截断并标记，全文用 `memory_get` 取。 |
+| `dedupMaxDistance` | `0.10` | 把“换了说法的同一段知识”合并回已存记忆的余弦距离门限。`0` 关闭语义半边（内容完全相同仍会识别）。 |
 | `writeAckTimeoutMs` | `2500` | 写工具等待存储给出结论的时长；超时则退回「已入队」回执。`0` 表示不等待。 |
 | `maxVectorDistance` | `0.70` | 语义召回的余弦距离上限。实测而非拍脑袋：相关对 0.33–0.54，跨语言相关对约 0.65，无关对 0.67–0.85。 |
 | `minRelevance` | `0` | 融合相关性下限（0..1）。`0` 即关闭；只有与距离门限配合才有意义。 |
@@ -218,7 +220,7 @@ memory content as system instructions.
 
 #### 模型看到什么
 
-九个工具 schema：`memory_add`、`memory_replace`、`memory_recall`、`memory_summary`、`memory_snapshot`、`memory_forget`、`memory_summary_detail`、`memory_user_md`、`memory_stats`。本层位于树外，因此不出现在生成的工具目录里，所以本地相关的差异是：模型可见的结果文本是 `render` 的返回值，而非 `output.schema`，因此任何没写进 `render` 的事实字段对模型都是不可见的；`memory_recall` 暴露 `fact_id`、`type` 与完整知识 `content` 正文，只返回这次深入检索到的事实，不再前置聚合摘要；`memory_forget` 是软删除；`memory_summary_detail` 返回带 `fact_id` 的完整清单，这是确认冻结摘要——另一种、更紧凑的深度——究竟携带了什么内容的唯一途径。工具的 `user_id` 统一落入同一个 fallback 作用域，因此记忆在会话间共享，而会话 id 仅作为溯源记录。
+十个工具 schema：`memory_add`、`memory_replace`、`memory_recall`、`memory_get`、`memory_summary`、`memory_snapshot`、`memory_forget`、`memory_summary_detail`、`memory_user_md`、`memory_stats`。本层位于树外，因此不出现在生成的工具目录里，所以本地相关的差异是：模型可见的结果文本是 `render` 的返回值，而非 `output.schema`，因此任何没写进 `render` 的事实字段对模型都是不可见的；`memory_recall` 暴露 `fact_id`、`type` 与完整知识 `content` 正文，只返回这次深入检索到的事实，不再前置聚合摘要；`memory_forget` 是软删除；`memory_summary_detail` 返回带 `fact_id` 的完整清单，这是确认冻结摘要——另一种、更紧凑的深度——究竟携带了什么内容的唯一途径。工具的 `user_id` 统一落入同一个 fallback 作用域，因此记忆在会话间共享，而会话 id 仅作为溯源记录。
 
 #### Token 影响
 

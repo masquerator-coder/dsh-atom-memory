@@ -7,6 +7,15 @@ way it is. Owner: [`atom_memory/reinforce.py`](../atom_memory/reinforce.py),
 
 ## Reuse reinforcement
 
+> **The curve is configuration.** `A_MAX`, `N_HALF`, `HALF_LIFE_DAYS` and
+> `COOLDOWN_SEC` — the four numbers below — are exposed as
+> `reinforce_a_max` / `reinforce_n_half` / `reinforce_half_life_days` /
+> `reinforce_cooldown_sec` on `MemConfig`, and every calculation takes them as a
+> `ReinforceCurve`. The defaults are the shipped constants, so the behaviour
+> described here is what a default configuration produces. Because the aggregate
+> is replayable from `fact_reinforcements`, retuning the curve is
+> retro-applicable rather than a one-way door.
+
 A fact the user keeps coming back to is worth more than one written once — but
 "more" has to be bounded, or a single loudly repeated claim eventually outranks
 everything. `reinforce.py` turns reuse evidence into an **effective importance**

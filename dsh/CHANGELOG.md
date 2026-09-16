@@ -27,6 +27,23 @@
   off 时依旧直接跳过注入）。补 `tests/context.test.ts` 3 例（开关关闭时 awareness 文本
   为空、开启时保留、装配时不注入快照）。
 
+### Changed (第十六轮：审计遗留项收口 —— 内容身份、截断可见、租约与逐条上限)
+
+上轮列为"仍未修"的 10 项全部收口；语义先行，每条都有测试（`tests/test_hardening.py`、`dsh/tests/tools-hardening.test.ts`）。
+
+- **F19 内容身份（去重）**：新增 `atom_memory/fingerprint.py`，为每条事实计算**内容指纹**（规范化后的"使用者/类型/主体/谓词/对象"，知识类用**正文**作身份、不含标题——因为紧凑摘要里的标题本来就是从正文首行派生的；极性 negated 计入身份，否则"喜欢咖啡/不喜欢咖啡"会被当成重复）。`facts.content_fingerprint`（迁移 008）落库，写路径先查指纹：命中即**复用强化**（写 `fact_deduplicated` 事件 + 回执里说明），不再新增近重复行。另加**语义近重复门限**（`dedup_max_distance=0.10`、`dedup_min_body_chars=200`，仅对同使用者/类型/主体/谓词的长正文比较向量距离）——门限刻意收紧：误合并会把一条独立记忆从工作集里抹掉，漏合并只是多一行。此前"不同对象的多值/知识事实无限重复"正是噪音的主要来源。
+- **F21 截断可见**：`sanitize.clean_*_meta` 返回 `Cleaned`（文本 + 原始长度 + 是否截断），`validate`/`api.add`/`replace`/`edit_fact`/`upsert_profile` 全部把截断记录写进回执（`outcome.truncated`）。存储不再**静默**改写输入——它会告诉你"保留了前 N 字符、原文 M"。
+- **F22 逐条上限**：`max_fact_tokens=600`。召回预算此前是软约束（首条必留 → 实测一条 1.2 万字符 SOP 可超预算 60 倍），现在超限正文按 token 截断并标 `truncated: true`；新增 `get_fact` 接口与 `memory_get` 工具（第 10 个工具）读取全文，使截断安全而非有损。
+- **F03 认领归属与租约**：`task_queue.claimed_by` / `lease_expires_at`（迁移 008）+ `task_lease_sec=600`。认领写入归属者身份；回收只看**租约是否过期**（无租约的迁移前行沿用"早于本进程启动"边界），因此同库第二个消费者不会偷走存活 worker 正在跑的任务。真正的 claim CAS 与构造时刻边界是上一轮重写 worker 时已落地的（账本此前遗漏，本轮已更正）。交付语义仍是 at-least-once。
+- **F07 删除死通道**：`recall.pending` 与 `_load_pending` 删除（三列从未被写入、读取却要求非空，文档却当特性写）。管线的决策点是"抽取即校验即落库"，没有审批阶段，因此不假装有。
+- **F17 拒绝而非静默丢弃**：`llm_extractor` 走线时直接报错（附说明：抽取在 dsh 侧做、经 `persist_candidates` 交付），并改正那段声称"由环境变量注入"却无任何 `os.environ` 读取的注释。
+- **F23 极小预算返回空**：摘要渲染在"连空摘要+页脚都放不下"时返回空串（此前是一句 ✕ 分支不可达的提示文案），注入侧随之不注入——比一句自己就超预算的提示更诚实也更省。
+- **F25 token 估算除数**：非 CJK 由 5 字符/token 改为 4（拉丁文本此前低估 20-25%，纯英文记忆会超预算）。除数提取为 `retriever.CHARS_PER_TOKEN` 单点共享——摘要的增量核算必须与整篇重算用同一常量，否则快路径与参考实现会分叉。
+- **F-2.3 复用-衰减曲线可配**：新增 `ReinforceCurve`（`a_max` / `n_half` / `half_life_days` / `cooldown_sec`），默认值即原常量，全部计算函数接受 `curve` 参数，worker 与 api 按配置构造并透传。"记忆多久变淡""复用最多加多少"不再是改代码才能动的事。
+- **F24 死常量与失真文案**：删除 `TYPE_ORDER`（与 `summary._SECTION_TITLES`/`default_importance` 重复且无人引用）与 `forbid_qualifier_fields`（自述"留给未来"的冗余参数）；`ctx.logger` 客户端侧去掉"作者也不确定"的三元守卫；**README 说的 "retried at most three times with backoff" 现在是真的**——桥接启动重试改为指数退避（1s→2s→4s，上限 15s，`retryDelayMs` 可测）。
+- **F26 API Key 存储位置写明**：面板输入本就是 `type=password`，问题在**明文存在 dsh 设置文档里**（不在密钥库、随配置导出走）——在双侧 locale 的提示文案里明说。
+- **文档**：`docs/memory-semantics.md` 新增 §10 内容身份、§11 改动可见、§12 认领与租约、§13 逐条上限与取回路径；`docs/reinforcement.md` 与 `docs/python-library.md` 同步；README 双语对更新（工具 9→10、新增配置字段、已知限制关于"单条长事实超预算"改为已修复）。
+
 ### Changed (第十五轮：代码审计修复 —— 不动用法层面的记忆语义)
 
 审计发现的 12 项问题，按「先定语义、再落代码」的顺序修复；每条语义都有对应的策略文档与测试。

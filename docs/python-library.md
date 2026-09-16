@@ -221,6 +221,14 @@ class MemConfig:
     privacy_filter: str = "private"
     max_field_chars: int = 500
     max_content_chars: int = 20000
+    dedup_max_distance: float = 0.10
+    dedup_min_body_chars: int = 200
+    max_fact_tokens: int = 600
+    task_lease_sec: float = 600.0
+    reinforce_a_max: float = 0.5
+    reinforce_n_half: float = 3.0
+    reinforce_half_life_days: float = 75.0
+    reinforce_cooldown_sec: float = 600.0
     write_ack_timeout_ms: int = 0
     conflict_confidence_margin: float = 0.05
     rrf_k: int = 60
@@ -253,7 +261,8 @@ and `user_profile` are *derived views* rebuilt from facts.
   to un-reinforced; `006_init.sql` drops the redundant `summaries` aggregate;
   `007_init.sql` adds the write-outcome columns on `fact_candidates`
   (`reject_kind` / `reject_reason` / `result_fact_ids` / `finished_at`),
-  `facts.archived_at`, and the maintenance indexes) with
+  `facts.archived_at`, and the maintenance indexes; `008_init.sql` adds
+  `facts.content_fingerprint` and the task claim columns) with
   `PRAGMA user_version`-gated migrations.
 - **Retrieval**: `sqlite-vec` `vec0` KNN (cosine, 512-dim) ⊕ FTS5 (jieba
   word-segmented for Chinese), fused by Reciprocal Rank Fusion and re-ranked with
@@ -272,6 +281,20 @@ and `user_profile` are *derived views* rebuilt from facts.
   "maximally different in age". See [Recency](reinforcement.md#recency).
 - **Isolation**: every query is scoped to `user_id`; internal lookups for
   conflict/idempotency honour the same boundary.
+- **Content identity**: every fact carries a `content_fingerprint` (owner, type,
+  subject, predicate, object, polarity; the *body* for knowledge types, whose
+  `object` is a derived title). A write whose fingerprint matches an active fact
+  reinforces it instead of adding a row, and a long body that was merely reworded
+  is folded in through an embedding gate (`dedup_max_distance`). See
+  [memory semantics](memory-semantics.md#10-a-memory-keeps-its-identity-so-restating-it-is-reuse-not-a-second-row).
+- **Truncation is reported**: `clean_body_meta` / `clean_field_meta` return a
+  `Cleaned` record (text, original length, truncated flag) and every write path
+  surfaces it, so a capped write says what it kept.
+- **Claims are leased**: `task_queue.claimed_by` / `lease_expires_at` make a claim
+  attributable and time-bounded, so a second consumer over one database reclaims
+  only genuinely abandoned work.
+- **The recall budget is bounded per fact**: `max_fact_tokens` shortens an
+  oversized body and flags it; `get_fact` returns the whole thing.
 - **Soft deletion by policy**: nothing is deleted automatically. `status` moves
   `active → superseded|retracted` (correction / withdrawal) or `active →
   archived` (displaced by `max_active_facts`), and every read filters on `active`.
@@ -355,8 +378,12 @@ pytest tests/test_integration.py -v
 ```
 
 The suite covers storage migrations (including v1→v2 `type`, v2→v3 `content`,
-v3→v4 `pinned`, v4→v5 reinforcement-column upgrades and v6→v7 write-outcome
-columns), ingest sanitisation (`tests/test_sanitize.py`), the conflict-resolution
+v3→v4 `pinned`, v4→v5 reinforcement-column upgrades, v6→v7 write-outcome
+columns and v7→v8 content-identity/lease columns), content identity and the
+hardening round (`tests/test_hardening.py`: fingerprint and embedding dedup,
+truncation reporting, per-fact caps and `get_fact`, claim leases, the token
+divisor, the configured decay curve), ingest sanitisation
+(`tests/test_sanitize.py`), the conflict-resolution
 policy table (`tests/test_conflict.py`), the memory lifecycle
 (`tests/test_lifecycle.py`: atomic-write rollback, supersede/reject through the
 worker, write receipts, archive + capacity protection, retention pruning, index

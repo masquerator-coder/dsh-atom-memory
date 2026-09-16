@@ -309,6 +309,8 @@ switch live, in both directions`.
 
 ---
 
+---
+
 ## 9. The plugin knows whether its backend exists, and says so
 
 **Rule.** Before the bridge is trusted, the configured interpreter is probed once
@@ -331,3 +333,105 @@ into a log full of identical errors.
 
 **Tests.** `dsh/tests/preflight.test.ts`,
 `tests/test_rpc.py::test_lifecycle_and_write_receipts_over_the_wire`.
+
+---
+
+## 10. A memory keeps its identity, so restating it is reuse, not a second row
+
+**Rule.** Every fact is stamped with a **content fingerprint**: the normalised
+identity of its claim — owner, type, subject, predicate, object, and claim
+polarity. For knowledge types (`lesson` / `sop` / `few_shot`) the identity is the
+**body**, because their `object` is a derived label (the compact summary titles
+them from the body's first line), so two captures of one procedure routinely
+carry different titles for identical text.
+
+A write whose fingerprint matches an active fact **reinforces** that fact and
+writes a `fact_deduplicated` event; it does not add a row. A second, narrower
+gate covers a *reworded* body: for bodies long enough to be a document
+(`dedup_min_body_chars`), the candidate's own embedding is compared against
+active facts sharing owner, type, subject and predicate, and a distance inside
+`dedup_max_distance` (0.10) also folds the write.
+
+**Why.** Before this, only an exact SPO repeat of a *single-valued* predicate was
+recognised. Knowledge and multi-valued facts could be stored again and again —
+the single largest source of noise in the store, and the reason "the same thing
+said slightly differently" occupied several recall slots. The gates are
+deliberately asymmetric in strictness because the failure modes are: a false merge
+removes a distinct memory from the working set (recoverable only from the
+reinforcement log), while a missed merge costs one redundant row.
+
+**Owner.** `atom_memory/fingerprint.py`, `atom_memory/worker.py`
+(`_persist_fact` → `_fold_into`, `_near_duplicate`), migration 008.
+
+**Tests.** `tests/test_hardening.py` — same body/two titles folds on the
+fingerprint; a reworded body folds on the embedding; a different document does
+not; `dedup_max_distance = 0` disables only the semantic half; polarity and owner
+are part of the identity; the fingerprint is persisted on the row.
+
+---
+
+## 11. What the store changes about your text, it reports
+
+**Rule.** Normalisation that *loses* information — the field and body caps — is
+reported rather than applied silently. `clean_body_meta` / `clean_field_meta`
+return the text plus its original length and a truncation flag; the validator
+attaches the records to every result; `add`, `replace`, `edit_fact`,
+`upsert_profile` and the worker's write outcome all carry them, and the receipt
+renders "kept the first 20 000 characters of 40 000".
+
+**Why.** Whitespace and invisibility normalisation is reversible in effect; a cap
+is not. A store that quietly keeps a prefix of what the user said will later
+answer questions about text it does not have, and the caller has no way to notice
+— the same class of failure as reporting "queued" for a write that was refused.
+
+**Owner.** `atom_memory/sanitize.py` (`Cleaned`), `atom_memory/validator.py`,
+`atom_memory/api.py`, `dsh/src/tools.ts` (`renderWriteReceipt`).
+
+**Tests.** `tests/test_hardening.py` — a capped write reports field/original/kept;
+an untouched write reports an empty list (the outcome shape is stable); the panel
+write paths report too.
+
+---
+
+## 12. Work is claimed once, and reclaimed only when it is abandoned
+
+**Rule.** A task claim is **attributable** (`claimed_by`) and **time-bounded**
+(`lease_expires_at`, `task_lease_sec`). Claiming is a compare-and-swap on
+`status = 'pending'` whose row count decides the winner. Reclaim on start touches
+only rows whose lease has expired (for pre-lease rows, only those older than the
+starting worker). Finishing or failing a task clears its claim.
+
+**Why.** The previous reclaim reset *every* `running` row, so a second consumer
+over one database — a second dsh instance, a debugging process — re-ran work
+another live worker was in the middle of. That is silent double execution of a
+write path. Delivery remains at-least-once: a task that legitimately outlives its
+lease may be re-run, which is the trade-off a lease buys.
+
+**Owner.** `atom_memory/worker.py` (`_claim_next_task`, `start`, `_record_failure`,
+`_requeue_inflight`), migration 008.
+
+**Tests.** `tests/test_hardening.py` — a live peer's claim is left alone while an
+expired lease is reclaimed; a finished task holds no claim.
+
+---
+
+## 13. The recall budget is bounded, and the rest stays reachable
+
+**Rule.** `max_fact_tokens` caps one fact inside a recall result. A longer body is
+shortened to fit, the fact is returned with `truncated: true`, and its full text
+stays available through `get_fact` (the `memory_get` tool). The first match is
+still always kept, so a tiny budget still returns something.
+
+**Why.** The budget was soft: keeping the first fact unconditionally let a single
+long SOP overshoot a 200-token budget by ~60x in measurement, and captured
+knowledge is exactly where long bodies come from. Truncating without a fetch path
+would just be data loss with extra steps, which is why the cap and `get_fact`
+ship together.
+
+**Owner.** `atom_memory/api.py` (`recall`, `get_fact`),
+`atom_memory/retriever.py` (`truncate_to_tokens`), `dsh/src/tools.ts`
+(`memory_get`, recall render).
+
+**Tests.** `tests/test_hardening.py` — an oversized body comes back shortened and
+flagged while `get_fact` returns it whole; a body under the ceiling is untouched;
+`get_fact` refuses another user's fact.
