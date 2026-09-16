@@ -247,6 +247,16 @@ def test_v1_database_upgrades_to_v2_with_type_default(tmp_path):
             updated_at INTEGER NOT NULL,
             PRIMARY KEY (user_id, section, key)
         );
+        -- A real deployment of this version also has the task queue: migration
+        -- 001 creates it and 008 alters it (claim attribution + lease), so a
+        -- fixture standing in for a legacy database has to carry it.
+        CREATE TABLE task_queue (
+            task_id TEXT PRIMARY KEY, task_type TEXT NOT NULL, payload TEXT,
+            status TEXT NOT NULL DEFAULT 'pending', priority INTEGER DEFAULT 0,
+            retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 3,
+            error TEXT, created_at INTEGER NOT NULL, started_at INTEGER,
+            completed_at INTEGER
+        );
         PRAGMA user_version = 1;
         """
     )
@@ -324,6 +334,16 @@ def test_v2_database_upgrades_to_v3_with_null_content(tmp_path):
             privacy TEXT NOT NULL DEFAULT 'private',
             updated_at INTEGER NOT NULL,
             PRIMARY KEY (user_id, section, key)
+        );
+        -- A real deployment of this version also has the task queue: migration
+        -- 001 creates it and 008 alters it (claim attribution + lease), so a
+        -- fixture standing in for a legacy database has to carry it.
+        CREATE TABLE task_queue (
+            task_id TEXT PRIMARY KEY, task_type TEXT NOT NULL, payload TEXT,
+            status TEXT NOT NULL DEFAULT 'pending', priority INTEGER DEFAULT 0,
+            retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 3,
+            error TEXT, created_at INTEGER NOT NULL, started_at INTEGER,
+            completed_at INTEGER
         );
         PRAGMA user_version = 2;
         """
@@ -419,6 +439,16 @@ def test_v3_database_upgrades_to_v4_unpinned(tmp_path):
             idempotency_key TEXT UNIQUE, created_at INTEGER NOT NULL,
             type TEXT NOT NULL DEFAULT 'semantic', content TEXT
         );
+        -- A real deployment of this version also has the task queue: migration
+        -- 001 creates it and 008 alters it (claim attribution + lease), so a
+        -- fixture standing in for a legacy database has to carry it.
+        CREATE TABLE task_queue (
+            task_id TEXT PRIMARY KEY, task_type TEXT NOT NULL, payload TEXT,
+            status TEXT NOT NULL DEFAULT 'pending', priority INTEGER DEFAULT 0,
+            retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 3,
+            error TEXT, created_at INTEGER NOT NULL, started_at INTEGER,
+            completed_at INTEGER
+        );
         PRAGMA user_version = 3;
         """
     )
@@ -484,6 +514,16 @@ def test_v4_database_upgrades_to_v5_with_zero_reinforcement(tmp_path):
             status TEXT NOT NULL DEFAULT 'pending',
             idempotency_key TEXT UNIQUE, created_at INTEGER NOT NULL,
             type TEXT NOT NULL DEFAULT 'semantic', content TEXT
+        );
+        -- A real deployment of this version also has the task queue: migration
+        -- 001 creates it and 008 alters it (claim attribution + lease), so a
+        -- fixture standing in for a legacy database has to carry it.
+        CREATE TABLE task_queue (
+            task_id TEXT PRIMARY KEY, task_type TEXT NOT NULL, payload TEXT,
+            status TEXT NOT NULL DEFAULT 'pending', priority INTEGER DEFAULT 0,
+            retry_count INTEGER DEFAULT 0, max_retries INTEGER DEFAULT 3,
+            error TEXT, created_at INTEGER NOT NULL, started_at INTEGER,
+            completed_at INTEGER
         );
         PRAGMA user_version = 4;
         """

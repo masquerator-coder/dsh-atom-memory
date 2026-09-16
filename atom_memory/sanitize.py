@@ -38,7 +38,8 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from typing import Optional
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional
 
 # Invisible / structural characters that must never survive into the store.
 # Built from an explicit list rather than "all of category Cf" so ZWJ/ZWNJ can be
@@ -168,8 +169,7 @@ def clean_field(value: Optional[str], limit: int = DEFAULT_MAX_FIELD_CHARS) -> s
         The cleaned field, at most ``limit`` characters (an ellipsis counts
         inside the limit, so ``len(result) <= limit`` always holds).
     """
-    text = normalize_whitespace(strip_invisible(str(value or "")), multiline=False)
-    return _cap(text, limit)
+    return clean_field_meta(value, limit).text
 
 
 def clean_body(value: Optional[str], limit: int = DEFAULT_MAX_CONTENT_CHARS) -> str:
@@ -182,8 +182,91 @@ def clean_body(value: Optional[str], limit: int = DEFAULT_MAX_CONTENT_CHARS) -> 
     Returns:
         The cleaned body, at most ``limit`` characters.
     """
+    return clean_body_meta(value, limit).text
+
+
+@dataclass(frozen=True)
+class Cleaned:
+    """A cleaned value plus the one normalisation that *loses* information.
+
+    Every other step in ``clean_*`` is reversible (whitespace, invisibility,
+    line structure); capping is not. A store that quietly keeps the first N
+    characters of what the user said is a store that answers questions about
+    text it does not have, so the loss travels with the result and the caller
+    decides whether to report it. Callers that do not care use ``clean_field`` /
+    ``clean_body`` and get the text alone.
+    """
+
+    text: str
+    """The text as it will be stored."""
+    original_chars: int
+    """Length after whitespace normalisation, before capping."""
+    truncated: bool
+    """Whether characters were dropped."""
+
+    @property
+    def kept_chars(self) -> int:
+        """Length of the stored text."""
+        return len(self.text)
+
+    def record(self, field: str) -> Dict[str, Any]:
+        """Describe the loss for a write receipt.
+
+        Args:
+            field: Which field this was (``content``, ``object``, ...).
+
+        Returns:
+            A JSON-friendly record, or ``{}`` when nothing was dropped.
+        """
+        if not self.truncated:
+            return {}
+        return {
+            "field": field,
+            "original_chars": self.original_chars,
+            "kept_chars": self.kept_chars,
+        }
+
+
+def clean_field_meta(value: Optional[str], limit: int = DEFAULT_MAX_FIELD_CHARS) -> Cleaned:
+    """``clean_field`` plus whether the value had to be capped.
+
+    Args:
+        value: The raw field value.
+        limit: Maximum number of characters kept.
+
+    Returns:
+        The cleaned field and its truncation state.
+    """
+    text = normalize_whitespace(strip_invisible(str(value or "")), multiline=False)
+    capped = _cap(text, limit)
+    return Cleaned(text=capped, original_chars=len(text), truncated=len(capped) < len(text))
+
+
+def clean_body_meta(value: Optional[str], limit: int = DEFAULT_MAX_CONTENT_CHARS) -> Cleaned:
+    """``clean_body`` plus whether the value had to be capped.
+
+    Args:
+        value: The raw body.
+        limit: Maximum number of characters kept.
+
+    Returns:
+        The cleaned body and its truncation state.
+    """
     text = normalize_whitespace(strip_invisible(str(value or "")), multiline=True)
-    return _cap(text, limit)
+    capped = _cap(text, limit)
+    return Cleaned(text=capped, original_chars=len(text), truncated=len(capped) < len(text))
+
+
+def truncation_records(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Drop the empty entries of a set of truncation records.
+
+    Args:
+        records: Records produced by :meth:`Cleaned.record` (some may be ``{}``).
+
+    Returns:
+        Only the non-empty records, as a list.
+    """
+    return [record for record in records if record]
 
 
 def _cap(text: str, limit: int) -> str:

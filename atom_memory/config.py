@@ -123,6 +123,19 @@ class MemConfig:
     max_field_chars: int = 2000
     max_content_chars: int = 20_000
 
+    # -- content identity (see fingerprint.py) --------------------------------
+    # Cosmetic reformatting of a stored knowledge body (whitespace, a re-typed
+    # title) is caught by the fingerprint alone. This gate additionally merges a
+    # body that was *reworded* but is semantically the same memory, by comparing
+    # the candidate's embedding against existing facts of the same owner,
+    # predicate and type. Keep it tight: a false merge deletes a distinct memory
+    # from the working set, while a missed merge only costs a row. 0 disables it.
+    dedup_max_distance: float = 0.10
+    # Knowledge bodies shorter than this are identified by their fingerprint
+    # only: a two-word object is a phrase, and two facts sharing a short phrase
+    # are usually two facts.
+    dedup_min_body_chars: int = 200
+
     # -- retrieval ------------------------------------------------------------
     rrf_k: int = 60
     w_rrf: float = 0.4
@@ -131,12 +144,35 @@ class MemConfig:
     w_trust: float = 0.2
     min_relevance: float = 0.0
     max_vector_distance: Optional[float] = None
+    # Per-fact ceiling for one recall result, in estimated tokens. The recall
+    # budget is otherwise a soft bound: the first fact is always kept (so a tiny
+    # budget cannot return nothing), which let a single long SOP overshoot
+    # `token_budget` by ~60x in measurement. A fact over this ceiling is
+    # returned with a truncated body and `truncated: true`, and its full text
+    # stays reachable through `get_fact`. 0 disables the ceiling.
+    max_fact_tokens: int = 600
 
     # -- conflict resolution --------------------------------------------------
     conflict_confidence_margin: float = 0.05
 
     # -- write acknowledgement ------------------------------------------------
     write_ack_timeout_ms: int = 0
+
+    # -- worker leases --------------------------------------------------------
+    # A claimed task holds a lease for this long. Reclaim only touches tasks
+    # whose lease has expired, so a second consumer on the same database cannot
+    # steal work from a live worker. Delivery is at-least-once: a task that
+    # legitimately runs longer than its lease may be re-run.
+    task_lease_sec: float = 600.0
+
+    # -- reuse-and-decay curve (see docs/reinforcement.md) --------------------
+    # Defaults are the shipped constants. They are exposed because "how much can
+    # reuse add" and "how fast does strength fade" are policy, not physics, and
+    # the reinforcement log makes a retuned curve retro-applicable.
+    reinforce_a_max: float = 0.5
+    reinforce_n_half: float = 3.0
+    reinforce_half_life_days: float = 75.0
+    reinforce_cooldown_sec: float = 600.0
 
     def resolved_db_path(self) -> str:
         """Return ``db_path`` with ``~`` expanded to the home directory.

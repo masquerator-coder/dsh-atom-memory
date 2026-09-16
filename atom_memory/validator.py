@@ -18,8 +18,9 @@ from .models import ALL_KNOWLEDGE, FactCandidate, ValidationResult
 from .sanitize import (
     DEFAULT_MAX_CONTENT_CHARS,
     DEFAULT_MAX_FIELD_CHARS,
-    clean_body,
-    clean_field,
+    clean_body_meta,
+    clean_field_meta,
+    truncation_records,
 )
 
 # Allowed confidence range (inclusive).
@@ -80,7 +81,6 @@ def validate(
     candidate: FactCandidate,
     conn: Optional[sqlite3.Connection] = None,
     privacy_filter: str = _DEFAULT_PRIVACY,
-    forbid_qualifier_fields: bool = True,
     max_field_chars: int = DEFAULT_MAX_FIELD_CHARS,
     max_content_chars: int = DEFAULT_MAX_CONTENT_CHARS,
 ) -> ValidationResult:
@@ -100,19 +100,38 @@ def validate(
             enforcement still applies via the DB constraints).
         privacy_filter: Configured privacy tag; if ``candidate.privacy`` does
             not match it, the ``privacy`` check fails.
-        forbid_qualifier_fields: Reserved for future use; kept for API
-            stability.
         max_field_chars: Ingest cap for one SPO field.
         max_content_chars: Ingest cap for a knowledge body.
 
     Returns:
         A :class:`ValidationResult` describing the outcome.
     """
-    # 0. Normalise (not a check: it decides what the checks look at).
-    normalize_candidate(
+    # 0. Normalise (not a check: it decides what the checks look at). The
+    #    truncation records are attached to whichever result is returned, so the
+    #    caller can report a shortened write even when it was also rejected.
+    truncated = normalize_candidate_meta(
         candidate, max_field_chars=max_field_chars, max_content_chars=max_content_chars
     )
+    result = _validate_checks(candidate, conn, privacy_filter)
+    result.truncated_fields = truncated
+    return result
 
+
+def _validate_checks(
+    candidate: FactCandidate,
+    conn: Optional[sqlite3.Connection],
+    privacy_filter: str,
+) -> ValidationResult:
+    """Run the check chain on a candidate that has already been normalised.
+
+    Args:
+        candidate: The normalised candidate.
+        conn: Optional connection for the idempotency/conflict lookups.
+        privacy_filter: Configured privacy tag.
+
+    Returns:
+        The first failing result, or a passing one.
+    """
     # 1. Empty
     empty = _check_empty(candidate)
     if not empty.ok:
@@ -146,6 +165,43 @@ def validate(
     return ValidationResult.pass_(candidate.candidate_id)
 
 
+def normalize_candidate_meta(
+    candidate: FactCandidate,
+    max_field_chars: int = DEFAULT_MAX_FIELD_CHARS,
+    max_content_chars: int = DEFAULT_MAX_CONTENT_CHARS,
+) -> List[dict]:
+    """Clean a candidate's text fields in place and report what was shortened.
+
+    ``normalize_candidate`` is the silent form (text only). This one exists
+    because capping is the single normalisation step that *loses* information:
+    a caller that stores the result has to be able to tell the user "kept the
+    first 20 000 characters" instead of quietly answering questions about text
+    it no longer has.
+
+    Args:
+        candidate: The candidate to normalise.
+        max_field_chars: Cap for one SPO field.
+        max_content_chars: Cap for the knowledge body.
+
+    Returns:
+        One record per field that had to be capped (``field``,
+        ``original_chars``, ``kept_chars``); empty when nothing was lost.
+    """
+    records: List[dict] = []
+    for name in ("subject", "predicate", "object"):
+        value = getattr(candidate, name, None)
+        if value is None:
+            continue
+        cleaned = clean_field_meta(value, max_field_chars)
+        setattr(candidate, name, cleaned.text)
+        records.append(cleaned.record(name))
+    if candidate.content is not None:
+        cleaned = clean_body_meta(candidate.content, max_content_chars)
+        candidate.content = cleaned.text or None
+        records.append(cleaned.record("content"))
+    return truncation_records(records)
+
+
 def normalize_candidate(
     candidate: FactCandidate,
     max_field_chars: int = DEFAULT_MAX_FIELD_CHARS,
@@ -167,13 +223,9 @@ def normalize_candidate(
     Returns:
         The same candidate object, normalised.
     """
-    for name in ("subject", "predicate", "object"):
-        value = getattr(candidate, name, None)
-        if value is not None:
-            setattr(candidate, name, clean_field(value, max_field_chars))
-    if candidate.content is not None:
-        cleaned = clean_body(candidate.content, max_content_chars)
-        candidate.content = cleaned or None
+    normalize_candidate_meta(
+        candidate, max_field_chars=max_field_chars, max_content_chars=max_content_chars
+    )
     return candidate
 
 
@@ -436,6 +488,22 @@ def _check_conflict(
         conflict_with=conflicting[0]["fact_id"],
         conflict_rows=conflicting,
     )
+
+
+def has_negation(qualifiers: Optional[str]) -> bool:
+    """Public form of the negation test, for callers that need claim polarity.
+
+    The content fingerprint has to include polarity (see
+    :mod:`~atom_memory.fingerprint`), so the rule for "is this claim negated"
+    lives in one place and is importable rather than duplicated.
+
+    Args:
+        qualifiers: The candidate's/fact's raw ``qualifiers`` JSON, if any.
+
+    Returns:
+        Whether the claim carries a negation.
+    """
+    return _has_negation(qualifiers)
 
 
 def _has_negation(qualifiers: Optional[str]) -> bool:

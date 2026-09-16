@@ -8,7 +8,7 @@ of a validation pass.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional
 
 # Memory-type discriminators stored on facts / fact_candidates. Derived views
 # (the summary view) render each type with its own format.
@@ -52,17 +52,9 @@ TYPE_IMPORTANCE = {
     TYPE_FEW_SHOT: 0.50,
 }
 
-# Precedence when several *buckets* compete for a shared token budget: durable
-# knowledge first, raw chronological events last.
-TYPE_ORDER = [
-    TYPE_DECISION_RULE,
-    TYPE_LESSON,
-    TYPE_SOP,
-    TYPE_PROCEDURAL,
-    TYPE_SEMANTIC,
-    TYPE_FEW_SHOT,
-    TYPE_EPISODIC,
-]
+# (The old `TYPE_ORDER` list was removed: it duplicated `summary._SECTION_TITLES`
+# and `default_importance`, which are the two places that actually decide bucket
+# precedence, and nothing referenced it.)
 
 
 def default_importance(memory_type: Optional[str]) -> float:
@@ -179,6 +171,13 @@ class ValidationResult:
     conflict_with: Optional[str] = None
     conflict_rows: Optional[list] = None
     suppressed: Optional[str] = None
+    truncated_fields: List[dict] = field(default_factory=list)
+    """Fields whose text had to be capped during normalisation, as
+    ``{"field", "original_chars", "kept_chars"}`` records. Empty when nothing was
+    lost. Attached to every result — including a rejected one — because "your
+    text was shortened" is information the caller owes the user regardless of what
+    else validation decided.
+    """
 
     @classmethod
     def pass_(cls, candidate_id: Optional[str] = None) -> "ValidationResult":
