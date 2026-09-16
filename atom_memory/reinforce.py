@@ -191,7 +191,74 @@ def gain_for(kind: str) -> float:
     return KIND_GAINS.get(kind, 0.0)
 
 
-def reinforce_bonus(n: float) -> float:
+@dataclass(frozen=True)
+class ReinforceCurve:
+    """The tunable shape of the reuse-and-decay curve.
+
+    These four numbers are *policy*, not physics: how much reuse can add, how
+    many reuses bank half of it, how fast banked strength fades, and how close
+    together two events may be before the second is treated as noise. They were
+    module constants, which made "my memories fade too fast" or "a single
+    restatement jumps the queue" a code change and a reinstall. They are now
+    configuration (see :class:`~atom_memory.config.MemConfig`), and because the
+    aggregate is replayable from ``fact_reinforcements``, retuning them is
+    retro-applicable rather than a one-way door.
+
+    The defaults are the shipped constants, so a default curve reproduces the
+    documented behaviour exactly.
+
+    Attributes:
+        a_max: Ceiling on the bonus reuse can add (``A_MAX``).
+        n_half: Reuse events needed to bank half of ``a_max`` (``N_HALF``).
+        half_life_days: Days after which banked strength halves (``HALF_LIFE_DAYS``).
+        cooldown_sec: Minimum spacing for a gain to count (``COOLDOWN_SEC``).
+    """
+
+    a_max: float = A_MAX
+    n_half: float = N_HALF
+    half_life_days: float = HALF_LIFE_DAYS
+    cooldown_sec: float = COOLDOWN_SEC
+
+    @property
+    def lambda_n(self) -> float:
+        """Decay rate of the gain curve: ``ln(2) / n_half``."""
+        return math.log(2.0) / max(self.n_half, 1e-9)
+
+    @property
+    def lambda_t(self) -> float:
+        """Decay rate of banked strength: ``ln(2) / half_life_days``."""
+        return math.log(2.0) / max(self.half_life_days, 1e-9)
+
+    @property
+    def cooldown_ms(self) -> int:
+        """The cooldown in milliseconds."""
+        return int(self.cooldown_sec * 1000.0)
+
+    @classmethod
+    def from_config(cls, config: object) -> "ReinforceCurve":
+        """Build the curve a :class:`~atom_memory.config.MemConfig` asks for.
+
+        Args:
+            config: Any object exposing the four ``reinforce_*`` attributes
+                (duck-typed so this module never imports the config module).
+
+        Returns:
+            The configured curve, falling back to the shipped constants for any
+            attribute the object does not define.
+        """
+        return cls(
+            a_max=float(getattr(config, "reinforce_a_max", A_MAX)),
+            n_half=float(getattr(config, "reinforce_n_half", N_HALF)),
+            half_life_days=float(getattr(config, "reinforce_half_life_days", HALF_LIFE_DAYS)),
+            cooldown_sec=float(getattr(config, "reinforce_cooldown_sec", COOLDOWN_SEC)),
+        )
+
+
+#: The curve used whenever a caller does not pass one: the shipped constants.
+DEFAULT_CURVE = ReinforceCurve()
+
+
+def reinforce_bonus(n: float, curve: Optional[ReinforceCurve] = None) -> float:
     """Return the saturating bonus earned by an effective reuse count.
 
     Implemented with :func:`math.expm1` rather than ``1 - exp(-x)``: once ``n``
@@ -209,19 +276,21 @@ def reinforce_bonus(n: float) -> float:
 
     Args:
         n: Effective reinforcement count (negative values clamp to 0).
+        curve: The curve to evaluate under; defaults to the shipped constants.
 
     Returns:
         A value in ``[0, A_MAX)``, concave and strictly increasing in ``n``.
     """
+    shape = curve or DEFAULT_CURVE
     if not n or n <= 0.0:
         return 0.0
-    value = -A_MAX * math.expm1(-LAMBDA * n)
-    if value >= A_MAX:
-        return math.nextafter(A_MAX, 0.0)
+    value = -shape.a_max * math.expm1(-shape.lambda_n * n)
+    if value >= shape.a_max:
+        return math.nextafter(shape.a_max, 0.0)
     return value
 
 
-def decay_factor(elapsed_ms: float) -> float:
+def decay_factor(elapsed_ms: float, curve: Optional[ReinforceCurve] = None) -> float:
     """Return the fraction of banked strength left after ``elapsed_ms``.
 
     The single time-decay primitive in this module. Negative elapsed time (clock
@@ -229,16 +298,23 @@ def decay_factor(elapsed_ms: float) -> float:
 
     Args:
         elapsed_ms: Time since the state snapshot was taken, in milliseconds.
+        curve: The curve to evaluate under; defaults to the shipped constants.
 
     Returns:
         A factor in ``(0, 1]``, halving every ``HALF_LIFE_DAYS``.
     """
+    shape = curve or DEFAULT_CURVE
     if elapsed_ms <= 0:
         return 1.0
-    return math.exp(-LAMBDA_T * (elapsed_ms / MS_PER_DAY))
+    return math.exp(-shape.lambda_t * (elapsed_ms / MS_PER_DAY))
 
 
-def adjust(n: float, last_used_at: Optional[int], at: Optional[int] = None) -> float:
+def adjust(
+    n: float,
+    last_used_at: Optional[int],
+    at: Optional[int] = None,
+    curve: Optional[ReinforceCurve] = None,
+) -> float:
     """Decay a state snapshot ``n`` to the instant ``at``.
 
     This is how a stored snapshot becomes a *current* count. It is the only
@@ -251,6 +327,7 @@ def adjust(n: float, last_used_at: Optional[int], at: Optional[int] = None) -> f
             ``None`` means no event has ever been banked, so there is nothing to
             decay.
         at: The instant to decay to, in ms; defaults to now.
+        curve: The curve to evaluate under; defaults to the shipped constants.
 
     Returns:
         The current count, in ``[0, n]``.
@@ -259,11 +336,15 @@ def adjust(n: float, last_used_at: Optional[int], at: Optional[int] = None) -> f
     if current <= 0.0 or not last_used_at:
         return max(0.0, current)
     when = int(at if at is not None else now_ms())
-    return current * decay_factor(when - int(last_used_at))
+    return current * decay_factor(when - int(last_used_at), curve)
 
 
 def effective_importance_at(
-    base: float, n: float, last_used_at: Optional[int], at: Optional[int] = None
+    base: float,
+    n: float,
+    last_used_at: Optional[int],
+    at: Optional[int] = None,
+    curve: Optional[ReinforceCurve] = None,
 ) -> float:
     """Return a fact's *current* effective importance from its raw state.
 
@@ -274,14 +355,17 @@ def effective_importance_at(
         n: Banked state snapshot (``facts.reinforce_count``).
         last_used_at: When that snapshot was taken (``facts.last_used_at``).
         at: The instant to evaluate at, in ms; defaults to now.
+        curve: The curve to evaluate under; defaults to the shipped constants.
 
     Returns:
         ``clamp(base + A(adjust(n, last_used_at, at)), 0, 1)``.
     """
-    return effective_importance(base, adjust(n, last_used_at, at))
+    return effective_importance(base, adjust(n, last_used_at, at, curve), curve)
 
 
-def effective_importance(base: float, n: float) -> float:
+def effective_importance(
+    base: float, n: float, curve: Optional[ReinforceCurve] = None
+) -> float:
     """Combine a base importance with an already-current count.
 
     Prefer :func:`effective_importance_at` when reading persisted state; this
@@ -291,28 +375,35 @@ def effective_importance(base: float, n: float) -> float:
     Args:
         base: The ``importance`` stored at write time.
         n: A *current* reinforcement count (not a stored snapshot).
+        curve: The curve to evaluate under; defaults to the shipped constants.
 
     Returns:
         ``clamp(base + reinforce_bonus(n), 0, 1)``.
     """
-    value = float(base or 0.0) + reinforce_bonus(n)
+    value = float(base or 0.0) + reinforce_bonus(n, curve)
     return 0.0 if value < 0.0 else (1.0 if value > 1.0 else value)
 
 
-def is_saturated(n: float, tolerance: float = 1e-3) -> bool:
+def is_saturated(
+    n: float, tolerance: float = 1e-3, curve: Optional[ReinforceCurve] = None
+) -> bool:
     """Whether further reuse is below ``tolerance`` of the ceiling.
 
     Args:
         n: Effective reinforcement count.
         tolerance: Fraction of ``A_MAX`` considered negligible.
+        curve: The curve to evaluate under; defaults to the shipped constants.
 
     Returns:
         ``True`` when the remaining headroom is smaller than the tolerance.
     """
-    return (A_MAX - reinforce_bonus(n)) <= tolerance * A_MAX
+    shape = curve or DEFAULT_CURVE
+    return (shape.a_max - reinforce_bonus(n, shape)) <= tolerance * shape.a_max
 
 
-def saturated_after(tolerance: float = 1e-3) -> int:
+def saturated_after(
+    tolerance: float = 1e-3, curve: Optional[ReinforceCurve] = None
+) -> int:
     """Return the effective count at which reuse stops mattering.
 
     Useful for reporting and for bounding the useful range of ``n``; the exact
@@ -320,13 +411,15 @@ def saturated_after(tolerance: float = 1e-3) -> int:
 
     Args:
         tolerance: Fraction of ``A_MAX`` considered negligible.
+        curve: The curve to evaluate under; defaults to the shipped constants.
 
     Returns:
         The smallest integer ``n`` for which :func:`is_saturated` holds.
     """
+    shape = curve or DEFAULT_CURVE
     if tolerance <= 0.0:
         return 0
-    remaining = math.log(max(tolerance, 1e-15)) / -LAMBDA
+    remaining = math.log(max(tolerance, 1e-15)) / -shape.lambda_n
     return max(0, math.ceil(remaining))
 
 
@@ -359,8 +452,9 @@ def roll(
     gain: float,
     base: float,
     now: Optional[int] = None,
-    cooldown_sec: float = COOLDOWN_SEC,
+    cooldown_sec: Optional[float] = None,
     event_at: Optional[int] = None,
+    curve: Optional[ReinforceCurve] = None,
 ) -> RollResult:
     """Decay ``n`` to ``now``, then add one reinforcement event's gain.
 
@@ -374,10 +468,12 @@ def roll(
         gain: The incoming event's evidence weight (see :func:`gain_for`).
         base: The fact's base importance (for the reported strengths only).
         now: Current timestamp in ms; defaults to :func:`~atom_memory.db.now_ms`.
-        cooldown_sec: Minimum spacing for a gain to count.
+        cooldown_sec: Minimum spacing for a gain to count. ``None`` takes it from
+            ``curve`` (which defaults to the shipped constant).
         event_at: Timestamp of the event being folded; defaults to ``now``. The
             decay is measured to this instant so that a backdated event (or a
             replay in chronological order) decays correctly.
+        curve: The curve to evaluate under; defaults to the shipped constants.
 
     Returns:
         A :class:`RollResult` describing what the event *would* do. Two fields
@@ -415,14 +511,16 @@ def roll(
     if interval_ms < 0:
         interval_ms = 0
 
-    strong_before = effective_importance(base, current)
-    decayed = current * decay_factor(interval_ms)
+    strong_before = effective_importance(base, current, curve)
+    decayed = current * decay_factor(interval_ms, curve)
 
+    spacing = (curve.cooldown_sec if curve is not None
+               else (COOLDOWN_SEC if cooldown_sec is None else cooldown_sec))
     suppressed = bool(
         last_used_at is not None
         and gain > 0.0
-        and cooldown_sec > 0
-        and interval_ms < cooldown_sec * 1000.0
+        and spacing > 0
+        and interval_ms < spacing * 1000.0
     )
     if suppressed:
         new_n = decayed
@@ -436,7 +534,7 @@ def roll(
         last_used_at=at,
         gain=banked,
         strong_before=round(strong_before, 6),
-        strong_after=round(effective_importance(base, new_n), 6),
+        strong_after=round(effective_importance(base, new_n, curve), 6),
         suppressed=suppressed,
         applied=(last_used_at is None) or not suppressed,
     )
@@ -452,6 +550,7 @@ def record_reinforcement(
     session_id: str,
     kind: str,
     event_at: Optional[int] = None,
+    curve: Optional[ReinforceCurve] = None,
 ) -> Optional[RollResult]:
     """Record one reinforcement event and update the fact's aggregate.
 
@@ -467,6 +566,8 @@ def record_reinforcement(
         session_id: Session the evidence came from (idempotency scope).
         kind: One of the ``KIND_*`` constants.
         event_at: Event timestamp in ms; defaults to now.
+        curve: The reuse-and-decay curve to fold the event under; defaults to
+            the shipped constants.
 
     Returns:
         The :class:`RollResult` that was applied, or ``None`` when the event was
@@ -516,6 +617,7 @@ def record_reinforcement(
         gain=gain,
         base=float(row["importance"] or 0.0),
         event_at=at,
+        curve=curve,
     )
 
     # Three outcomes, and the distinction between the last two is load-bearing:
