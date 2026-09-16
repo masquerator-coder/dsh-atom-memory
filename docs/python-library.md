@@ -210,11 +210,32 @@ class MemConfig:
     summary_token_limit: int = 1500
     user_md_token_limit: int = 800
     candidate_retention_days: int = 7
+    task_retention_days: int = 14
+    event_retention_days: int = 180
+    max_active_facts: int = 0
+    archive_protect_days: int = 30
+    maintenance_interval_sec: float = 900.0
     max_retries: int = 3
     worker_poll_interval_sec: float = 0.5
     llm_extractor: Optional[Callable] = None
     privacy_filter: str = "private"
+    max_field_chars: int = 500
+    max_content_chars: int = 20000
+    write_ack_timeout_ms: int = 0
+    conflict_confidence_margin: float = 0.05
+    rrf_k: int = 60
+    w_rrf: float = 0.4
+    w_importance: float = 0.2
+    w_recency: float = 0.2
+    w_trust: float = 0.2
+    min_relevance: float = 0.0
+    max_vector_distance: Optional[float] = None
 ```
+
+`candidate_retention_days` was declared but unused before the maintenance pass
+existed; it now bounds `fact_candidates` pruning alongside the other two
+retention windows. `max_active_facts = 0` means unlimited, so the archive tier
+stays dormant until it is configured.
 
 ## Design
 
@@ -229,10 +250,21 @@ and `user_profile` are *derived views* rebuilt from facts.
   user's 固定 flag, defaulting every pre-existing row to unpinned;
   `005_init.sql` adds `facts.reinforce_count` / `last_used_at` / `last_seen_at`
   and the `fact_reinforcements` evidence log, defaulting every pre-existing fact
-  to un-reinforced) with `PRAGMA user_version`-gated migrations.
+  to un-reinforced; `006_init.sql` drops the redundant `summaries` aggregate;
+  `007_init.sql` adds the write-outcome columns on `fact_candidates`
+  (`reject_kind` / `reject_reason` / `result_fact_ids` / `finished_at`),
+  `facts.archived_at`, and the maintenance indexes) with
+  `PRAGMA user_version`-gated migrations.
 - **Retrieval**: `sqlite-vec` `vec0` KNN (cosine, 512-dim) ⊕ FTS5 (jieba
   word-segmented for Chinese), fused by Reciprocal Rank Fusion and re-ranked with
-  `0.4·rrf + 0.2·effective_importance + 0.2·recency + 0.2·trust`. Neither
+  `w_rrf·relevance + w_importance·effective_importance + w_recency·recency +
+  w_trust·trust` (weights configurable, defaults `0.4/0.2/0.2/0.2`). `relevance`
+  is the fused RRF score normalised against its *ceiling* (`2/(k+1)`, the score
+  two top-ranked hits produce) rather than against the best candidate in the
+  current result set, so a score is comparable across queries and a single
+  candidate no longer scores a perfect 1.0. Two optional filters use it:
+  `max_vector_distance` (cosine-distance ceiling, the only signal that can say
+  "different topic area") and `min_relevance` (fused-score floor). Neither
   `importance` nor `recency` is min-max normalised: min-max rescales per query,
   so a negligible gap between two candidates (in relevance, or in age) is
   stretched across the term's whole weight — enough to cancel the entire
@@ -240,8 +272,18 @@ and `user_profile` are *derived views* rebuilt from facts.
   "maximally different in age". See [Recency](reinforcement.md#recency).
 - **Isolation**: every query is scoped to `user_id`; internal lookups for
   conflict/idempotency honour the same boundary.
-- **Soft deletion**: facts are never physically deleted; `status` moves
-  `active → superseded|retracted` and retrieval filters on `active`.
+- **Soft deletion by policy**: nothing is deleted automatically. `status` moves
+  `active → superseded|retracted` (correction / withdrawal) or `active →
+  archived` (displaced by `max_active_facts`), and every read filters on `active`.
+  Explicit erasure exists and is irreversible: `forget(purge=True)` deletes the
+  fact rows, their FTS and vec entries, and their reinforcement log.
+- **Conflict resolution**: under a single-valued predicate a contradicting claim
+  is resolved by evidence weight (`0.7·confidence + 0.3·importance`) against the
+  *strongest* stored claim: comparable-or-better evidence supersedes every stored
+  claim under that key (recording a `fact_superseded` event with both values),
+  weaker evidence is rejected (recording `fact_rejected`). Both outcomes are
+  reported back to the caller through the candidate's
+  `result_fact_ids`/`reject_kind`, which is what `wait_ms` waits for.
 - **Extraction precedence (LLM-first)**: when `MemConfig.llm_extractor` is
   set, its non-empty result is authoritative and rule-based extraction only
   runs as a **fallback** — i.e. when the LLM throws/times out or returns
@@ -296,7 +338,10 @@ Provider behavior notes:
 
 - **Procedural** — extraction splits ordered steps (numbered lists or
   `首先/然后/最后`), stored as `qualifiers.steps`; conflict is single-valued
-  per workflow name (an updated step list goes through `replace`).
+  per workflow name, so an updated step list replaces the stored one under the
+  same evidence rule (comparable-or-better evidence supersedes, weaker evidence
+  is rejected and reported). `replace` remains the way to retire a *named* fact
+  regardless of evidence.
 - **Episodic** — events are naturally many and independent, so different
   events never conflict; the time word is captured as `qualifiers.when`.
 - `user_profile` reflects only `semantic` facts (it answers "who is the
@@ -310,7 +355,14 @@ pytest tests/test_integration.py -v
 ```
 
 The suite covers storage migrations (including v1→v2 `type`, v2→v3 `content`,
-v3→v4 `pinned` and v4→v5 reinforcement-column upgrades), rule extraction
+v3→v4 `pinned`, v4→v5 reinforcement-column upgrades and v6→v7 write-outcome
+columns), ingest sanitisation (`tests/test_sanitize.py`), the conflict-resolution
+policy table (`tests/test_conflict.py`), the memory lifecycle
+(`tests/test_lifecycle.py`: atomic-write rollback, supersede/reject through the
+worker, write receipts, archive + capacity protection, retention pruning, index
+self-repair, read-through profile projection), budget selection against a
+brute-force reference (`tests/test_summary.py`), the ranking gates
+(`tests/test_retriever.py`), rule extraction
 (semantic / procedural / episodic + the
 `lesson` / `sop` / `decision_rule` knowledge categories), the validation chain
 (episodic non-conflict, procedural single-valued, degenerate

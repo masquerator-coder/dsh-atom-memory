@@ -2,5 +2,10 @@
 # side as of the last confirmed-consistent state. Both languages carry equal authority;
 # after editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write README.md
-README.md: e12943970071ca9c8ccfb472483e99840ac54c9e
-README.zh.md: bc95d04efcf36d8ce382d22a13836e96cf903f7d
+# (no such script ships in this repository's package.json — record the two
+#  `git hash-object <file>` values by hand; both sides were re-recorded together
+#  after the memory-semantics round, which also repaired a three-commit drift:
+#  README.md, README.zh.md and this file had last changed in three different
+#  commits, so the record could not have verified anything.)
+README.md: 4f47feaf09bac1b3285512628807ef0d60880635
+README.zh.md: 208e586e07e58ecf90472174e5ae151a6fb54a5e
