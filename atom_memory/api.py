@@ -27,12 +27,13 @@ from .embedder import Embedder
 from .profile import derive_profile_from_facts, profile_md
 from .reinforce import (
     KIND_USER_CONFIRMED,
+    ReinforceCurve,
     adjust,
     effective_importance_at,
     record_reinforcement,
 )
-from .retriever import Retriever, estimate_tokens, segment_text
-from .sanitize import clean_body, clean_field
+from .retriever import Retriever, estimate_tokens, segment_text, truncate_to_tokens
+from .sanitize import clean_body, clean_body_meta, clean_field, clean_field_meta, truncation_records
 from .summary import generate_summary
 from .validator import is_multi_valued
 from .worker import Worker
@@ -85,6 +86,10 @@ class AtomMem:
             model_name=self.config.embedding_model,
             dim=self.config.embedding_dim,
         )
+        # The configured reuse-and-decay curve, used by every strength read on
+        # this object (the stored columns are state; the curve turns them into a
+        # current score, so it must be the same curve the worker wrote under).
+        self.curve = ReinforceCurve.from_config(self.config)
         self.retriever = Retriever(
             conn=self.db,
             embed_one=self.embedder.embed_one,
@@ -169,7 +174,9 @@ class AtomMem:
         candidate_id = str(uuid.uuid4())
         trace_id = str(uuid.uuid4())
         created_at = now_ms()
-        text = clean_body(text, self.config.max_content_chars)
+        cleaned = clean_body_meta(text, self.config.max_content_chars)
+        text = cleaned.text
+        truncated = truncation_records([cleaned.record("content")])
 
         with self.db:
             self.db.execute(
@@ -198,10 +205,14 @@ class AtomMem:
                 ),
             )
 
-        return await self._write_receipt(candidate_id, trace_id, wait_ms)
+        return await self._write_receipt(candidate_id, trace_id, wait_ms, truncated)
 
     async def _write_receipt(
-        self, candidate_id: str, trace_id: str, wait_ms: Optional[int]
+        self,
+        candidate_id: str,
+        trace_id: str,
+        wait_ms: Optional[int],
+        truncated: Optional[list] = None,
     ) -> dict:
         """Return the enqueue receipt, waiting for the outcome when asked to.
 
@@ -209,6 +220,10 @@ class AtomMem:
             candidate_id: The candidate this call produced.
             trace_id: Trace id to echo back.
             wait_ms: Wait budget; ``None`` uses the configured default.
+            truncated: Fields this call had to shorten before enqueueing. Carried
+                on the receipt whichever way the wait goes out, because the text
+                was already shortened by the time this method runs: the loss is a
+                fact about the write, not about what the store later decides.
 
         Returns:
             ``{"candidate_id", "status", "trace_id"}`` plus ``"outcome"``,
@@ -220,6 +235,8 @@ class AtomMem:
             "status": "pending",
             "trace_id": trace_id,
         }
+        if truncated:
+            receipt["outcome"] = {"truncated": list(truncated)}
         timeout_ms = (
             self.config.write_ack_timeout_ms if wait_ms is None else int(wait_ms)
         )
@@ -235,7 +252,10 @@ class AtomMem:
             ).fetchone()
             if row is not None and row["status"] in _TERMINAL_CANDIDATE_STATUS:
                 receipt["status"] = row["status"]
-                receipt["outcome"] = _decode_outcome(row["result_fact_ids"])
+                outcome = _decode_outcome(row["result_fact_ids"])
+                if truncated:
+                    outcome["truncated"] = list(outcome.get("truncated") or []) + list(truncated)
+                receipt["outcome"] = outcome
                 if row["reject_kind"]:
                     receipt["reject_kind"] = row["reject_kind"]
                 if row["reject_reason"]:
@@ -321,20 +341,19 @@ class AtomMem:
         query: str,
         token_budget: int = 2000,
         top_k: int = 10,
-        include_pending: bool = True,
     ) -> dict:
         """Retrieve the user's most relevant active facts for a query.
 
         Runs FTS + vector retrieval, RRF fusion and re-ranking, then trims the
-        result to ``token_budget``. Optionally attaches still-pending candidate
-        utterances (reported by ``candidate_id`` only, never ``fact_id``).
+        result to ``token_budget``. A single fact larger than
+        ``max_fact_tokens`` is returned with a shortened body and
+        ``truncated: true``; :meth:`get_fact` returns its full text.
 
         Args:
             user_id: The user whose memory is searched.
             query: The natural-language query.
             token_budget: Upper bound on the estimated tokens returned.
             top_k: Maximum number of facts to consider before trimming.
-            include_pending: Whether to include not-yet-persisted candidates.
 
         Returns:
             A dict with keys ``facts``, ``pending``, ``conflicts``,
@@ -346,6 +365,7 @@ class AtomMem:
         ranked = await self.retriever.search(user_id, query, top_k=top_k)
         facts: list = []
         used = 0
+        ceiling = int(self.config.max_fact_tokens or 0)
         for fact in ranked:
             line = f"{fact['subject']}{fact['predicate']}{fact['object']}"
             body = fact.get("content") or ""
@@ -355,6 +375,18 @@ class AtomMem:
             t = estimate_tokens(line) + estimate_tokens(body)
             if used + t > token_budget and facts:
                 break
+            # A single fact can be larger than the whole budget, and the first
+            # match is always kept so a tiny budget cannot return nothing. The
+            # per-fact ceiling is what stops that from turning into an unbounded
+            # overshoot (measured at ~60x before): the body is shortened to fit
+            # and flagged, and the full text stays reachable through `get_fact`.
+            truncated = False
+            if ceiling > 0 and t > ceiling:
+                body = truncate_to_tokens(
+                    body, max(ceiling - estimate_tokens(line), 1)
+                )
+                t = estimate_tokens(line) + estimate_tokens(body)
+                truncated = True
             facts.append(
                 {
                     "fact_id": fact["fact_id"],
@@ -362,7 +394,8 @@ class AtomMem:
                     "predicate": fact["predicate"],
                     "object": fact["object"],
                     "type": fact.get("type", "semantic"),
-                    "content": fact.get("content"),
+                    "content": body or fact.get("content"),
+                    "truncated": truncated,
                     "confidence": fact["confidence"],
                     "importance": fact["importance"],
                     "effective_importance": fact.get(
@@ -379,13 +412,8 @@ class AtomMem:
             )
             used += t
 
-        pending = (
-            self._load_pending(user_id) if include_pending else []
-        )
-
         return {
             "facts": facts,
-            "pending": pending,
             "conflicts": self._load_conflicts(user_id),
             "degraded": list(getattr(self.retriever, "last_degraded", []) or []),
             "token_count": used,
@@ -449,27 +477,49 @@ class AtomMem:
                     )
         return conflicts
 
-    def _load_pending(self, user_id: str) -> list:
-        """Load still-pending fact candidates for a user (candidate_id only)."""
-        rows = self.db.execute(
-            "SELECT candidate_id, subject, predicate, object, status "
-            "FROM fact_candidates WHERE user_id = ? AND status = 'pending'",
-            (user_id,),
-        ).fetchall()
-        pending = []
-        for r in rows:
-            if not all((r["subject"], r["predicate"], r["object"])):
-                continue
-            pending.append(
-                {
-                    "candidate_id": r["candidate_id"],
-                    "subject": r["subject"],
-                    "predicate": r["predicate"],
-                    "object": r["object"],
-                    "status": r["status"],
-                }
-            )
-        return pending
+    def get_fact(self, user_id: str, fact_id: str) -> dict:
+        """Return one fact in full, including any knowledge body.
+
+        ``recall`` shortens a body that exceeds its per-fact ceiling and flags it
+        as ``truncated``, so there has to be a way to read the rest. This is that
+        way: a plain lookup by id, with no retrieval and no scoring, which is what
+        makes shortening a recall result safe rather than lossy.
+
+        Args:
+            user_id: Owner of the fact (isolation scope).
+            fact_id: The fact to read.
+
+        Returns:
+            The fact's stored fields, with its body in full.
+
+        Raises:
+            ValueError: When no fact with that id belongs to the user.
+        """
+        if self.db is None:
+            raise RuntimeError("AtomMem is not started; call start() first")
+        row = self.db.execute(
+            "SELECT fact_id, subject, predicate, object, type, content, status, "
+            "importance, confidence, created_at, reinforce_count, last_used_at, "
+            "superseded_by FROM facts WHERE user_id = ? AND fact_id = ?",
+            (user_id, fact_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"no fact {fact_id} for user {user_id}")
+        return {
+            "fact_id": row["fact_id"],
+            "subject": row["subject"],
+            "predicate": row["predicate"],
+            "object": row["object"],
+            "type": row["type"] or "semantic",
+            "content": row["content"],
+            "status": row["status"],
+            "importance": row["importance"],
+            "confidence": row["confidence"],
+            "created_at": row["created_at"],
+            "reinforce_count": float(row["reinforce_count"] or 0.0),
+            "last_used_at": row["last_used_at"],
+            "superseded_by": row["superseded_by"],
+        }
 
     async def summary(
         self,
@@ -557,7 +607,9 @@ class AtomMem:
 
         candidate_id = str(uuid.uuid4())
         created_at = now_ms()
-        text = clean_body(new_text, self.config.max_content_chars)
+        cleaned = clean_body_meta(new_text, self.config.max_content_chars)
+        text = cleaned.text
+        truncated = truncation_records([cleaned.record("content")])
         with self.db:
             self.db.execute(
                 "INSERT INTO fact_candidates(candidate_id, user_id, session_id, "
@@ -586,7 +638,7 @@ class AtomMem:
                 ),
             )
         return await self._write_receipt(
-            candidate_id, str(uuid.uuid4()), wait_ms
+            candidate_id, str(uuid.uuid4()), wait_ms, truncated
         )
 
     async def forget(
@@ -715,11 +767,17 @@ class AtomMem:
                         float(r["reinforce_count"] or 0.0),
                         r["last_used_at"],
                         at,
+                        curve=self.curve,
                     ),
                     6,
                 ),
                 "strength": round(
-                    adjust(float(r["reinforce_count"] or 0.0), r["last_used_at"], at),
+                    adjust(
+                        float(r["reinforce_count"] or 0.0),
+                        r["last_used_at"],
+                        at,
+                        curve=self.curve,
+                    ),
                     6,
                 ),
                 "reinforce_count": float(r["reinforce_count"] or 0.0),
@@ -773,16 +831,23 @@ class AtomMem:
         # so it must not be able to put an invisible character or an unbounded
         # value into the store that ingest would have stripped.
         updates: dict = {}
+        truncated: list = []
         if subject is not None:
-            updates["subject"] = clean_field(subject, self.config.max_field_chars)
+            cleaned = clean_field_meta(subject, self.config.max_field_chars)
+            updates["subject"] = cleaned.text
+            truncated.append(cleaned.record("subject"))
         if predicate is not None:
-            updates["predicate"] = clean_field(predicate, self.config.max_field_chars)
+            cleaned = clean_field_meta(predicate, self.config.max_field_chars)
+            updates["predicate"] = cleaned.text
+            truncated.append(cleaned.record("predicate"))
         if object is not None:
-            updates["object"] = clean_field(object, self.config.max_field_chars)
+            cleaned = clean_field_meta(object, self.config.max_field_chars)
+            updates["object"] = cleaned.text
+            truncated.append(cleaned.record("object"))
         if content is not None:
-            updates["content"] = (
-                clean_body(content, self.config.max_content_chars) or None
-            )
+            body = clean_body_meta(content, self.config.max_content_chars)
+            truncated.append(body.record("content"))
+            updates["content"] = body.text or None
         if type is not None:
             updates["type"] = clean_field(type, 64) or "semantic"
 
@@ -804,7 +869,13 @@ class AtomMem:
         # panel mint the strongest signal in the model (gain 1.0) for free.
         # Callers that genuinely mean "the user confirmed this" call
         # `reinforce(...)` themselves, which is explicit and auditable.
-        return self._fetch_fact(user_id, fact_id)
+        result = self._fetch_fact(user_id, fact_id)
+        shortened = truncation_records(truncated)
+        if shortened:
+            # The panel is a write path: if it shortened what was typed, it says
+            # so instead of showing a value that is not what the user entered.
+            result["truncated"] = shortened
+        return result
 
     def reinforce(
         self,
@@ -855,7 +926,7 @@ class AtomMem:
         base = float(base_row["importance"] or 0.0)
 
         result = record_reinforcement(
-            self.db, fact_id, user_id, session_id, kind
+            self.db, fact_id, user_id, session_id, kind, curve=self.curve
         )
         if result is None:
             # The kind is unregistered, or this session already contributed this
@@ -867,7 +938,7 @@ class AtomMem:
             ).fetchone()
             snapshot = float(row["reinforce_count"] or 0.0)
             strength = effective_importance_at(
-                base, snapshot, row["last_used_at"]
+                base, snapshot, row["last_used_at"], curve=self.curve
             )
             return {
                 "fact_id": fact_id,
@@ -966,9 +1037,12 @@ class AtomMem:
         """
         if self.db is None:
             raise RuntimeError("AtomMem is not started; call start() first")
-        section = clean_field(section, 200)
-        key = clean_field(key, 200)
-        value = clean_body(value, self.config.max_content_chars)
+        section_clean = clean_field_meta(section, 200)
+        key_clean = clean_field_meta(key, 200)
+        value_clean = clean_body_meta(value, self.config.max_content_chars)
+        section = section_clean.text
+        key = key_clean.text
+        value = value_clean.text
         if not section or not key:
             raise ValueError("profile section and key are required")
         pinned_flag = None if pinned is None else (1 if pinned else 0)
@@ -989,7 +1063,13 @@ class AtomMem:
             "WHERE user_id = ? AND section = ? AND key = ?",
             (user_id, section, key),
         ).fetchone()
-        return {"ok": True, "pinned": bool(row["pinned"]) if row else False}
+        result = {"ok": True, "pinned": bool(row["pinned"]) if row else False}
+        shortened = truncation_records(
+            (section_clean.record("section"), key_clean.record("key"), value_clean.record("value"))
+        )
+        if shortened:
+            result["truncated"] = shortened
+        return result
 
     def delete_profile(self, user_id: str, section: str, key: str) -> dict:
         """Delete one user-profile row.
@@ -1081,11 +1161,17 @@ class AtomMem:
                     float(row["importance"] or 0.0),
                     float(row["reinforce_count"] or 0.0),
                     row["last_used_at"],
+                    curve=self.curve,
                 ),
                 6,
             ),
             "strength": round(
-                adjust(float(row["reinforce_count"] or 0.0), row["last_used_at"]), 6
+                adjust(
+                    float(row["reinforce_count"] or 0.0),
+                    row["last_used_at"],
+                    curve=self.curve,
+                ),
+                6,
             ),
             "reinforce_count": float(row["reinforce_count"] or 0.0),
             "last_used_at": row["last_used_at"],

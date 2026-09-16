@@ -74,6 +74,7 @@ _METHODS: Dict[str, str] = {
     "stats": "stats",
     # UI-facing edit / backup / restore surface.
     "list_facts": "list_facts",
+    "get_fact": "get_fact",
     "edit_fact": "edit_fact",
     "reinforce": "reinforce",
     "list_profile": "list_profile",
@@ -266,10 +267,19 @@ class RpcServer:
             return {"already_started": True}
         try:
             if "llm_extractor" in params:
-                # Never accepted over the wire: LLM extraction is injected by
-                # the dsh host via the Python process environment, not via RPC.
-                params = dict(params)
-                params.pop("llm_extractor")
+                # A callable cannot cross the wire. Silently dropping it used to
+                # sit next to a comment claiming the dsh host injects the
+                # extractor through the child's environment — which no code ever
+                # read, so the parameter looked supported while doing nothing.
+                # Refusing loudly is the honest version: LLM extraction happens in
+                # the dsh host (llm-extractor.ts) and reaches this store as
+                # pre-extracted candidates over `persist_candidates`, while
+                # `MemConfig.llm_extractor` stays usable only when the library is
+                # embedded in-process (see tests/test_extractor.py).
+                raise _RpcError(
+                    "llm_extractor cannot be sent over the wire; extraction runs in "
+                    "the dsh host and is delivered through persist_candidates"
+                )
             config = MemConfig(**params)
         except TypeError as e:
             raise _RpcError(f"invalid start params: {e}") from e
