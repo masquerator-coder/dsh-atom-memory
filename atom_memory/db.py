@@ -8,6 +8,7 @@ migrations from the bundled ``migrations/`` package.
 from __future__ import annotations
 
 import importlib.resources
+import json
 import logging
 import os
 import sqlite3
@@ -22,7 +23,7 @@ from .config import MemConfig
 logger = logging.getLogger(__name__)
 
 # The highest schema version the bundled migrations know about.
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def now_ms() -> int:
@@ -108,6 +109,97 @@ def age_offset(age: float, min_age: float, window: float) -> float:
     if window <= 0:
         raise ValueError("window must be positive")
     return min(max(0.0, float(age) - max(0.0, float(min_age))), float(window))
+
+
+def record_event(
+    conn: sqlite3.Connection,
+    event_type: str,
+    payload: dict,
+    user_id: str = "",
+    trace_id: Optional[str] = None,
+) -> bool:
+    """Append one row to the audit log, best-effort.
+
+    The audit log is what makes a decision (a supersede, a rejection, an
+    archive, a repair) explainable after the fact, so every policy path in the
+    library writes one. It is written *around* the work rather than inside it:
+    an audit failure must never fail the operation it describes.
+
+    Args:
+        conn: Open SQLite connection.
+        event_type: Machine-readable event type (e.g. ``fact_conflict``).
+        payload: JSON-serializable event body.
+        user_id: Owner the event belongs to (``""`` for system events).
+        trace_id: Optional trace id.
+
+    Returns:
+        ``True`` when the row was written.
+    """
+    import uuid as _uuid
+
+    try:
+        conn.execute(
+            "INSERT INTO events(event_id, user_id, type, payload, trace_id, "
+            "created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                str(_uuid.uuid4()),
+                user_id,
+                event_type,
+                json.dumps(payload, ensure_ascii=False, default=str),
+                trace_id,
+                now_ms(),
+            ),
+        )
+        conn.commit()
+        return True
+    except Exception:  # pragma: no cover - audit must never break the caller
+        logger.exception("Failed to record %s event", event_type)
+        return False
+
+
+def index_orphans(
+    conn: sqlite3.Connection, user_id: Optional[str] = None
+) -> dict:
+    """Report where ``facts`` and its two indexes disagree.
+
+    The three writes that make a fact visible (the row, its FTS entry, its
+    vector) are meant to be atomic; anything that goes wrong between them leaves
+    a fact that only *some* paths can see. This returns those rows so the
+    maintenance pass can repair them and so health reporting can say so instead
+    of silently answering with a smaller result set.
+
+    Args:
+        conn: Open SQLite connection.
+        user_id: Restrict to one user; ``None`` checks every user.
+
+    Returns:
+        ``{"missing_vector": [...], "missing_fts": [...], "orphan_vector": [...],
+        "orphan_fts": [...]}`` — each a list of fact ids.
+    """
+    scope = "AND f.user_id = ? " if user_id else ""
+    args: tuple = (user_id,) if user_id else ()
+
+    def _ids(sql: str) -> list:
+        return [r[0] for r in conn.execute(sql, args).fetchall()]
+
+    return {
+        "missing_vector": _ids(
+            "SELECT f.fact_id FROM facts f WHERE f.status = 'active' " + scope
+            + "AND NOT EXISTS (SELECT 1 FROM facts_vec v WHERE v.fact_id = f.fact_id)"
+        ),
+        "missing_fts": _ids(
+            "SELECT f.fact_id FROM facts f WHERE f.status = 'active' " + scope
+            + "AND NOT EXISTS (SELECT 1 FROM facts_fts t WHERE t.fact_id = f.fact_id)"
+        ),
+        "orphan_vector": _ids(
+            "SELECT v.fact_id FROM facts_vec v WHERE NOT EXISTS "
+            "(SELECT 1 FROM facts f WHERE f.fact_id = v.fact_id)"
+        ),
+        "orphan_fts": _ids(
+            "SELECT t.fact_id FROM facts_fts t WHERE NOT EXISTS "
+            "(SELECT 1 FROM facts f WHERE f.fact_id = t.fact_id)"
+        ),
+    }
 
 
 def _read_migration(name: str) -> str:

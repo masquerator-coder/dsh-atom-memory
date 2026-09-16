@@ -406,6 +406,19 @@ def test_v3_database_upgrades_to_v4_unpinned(tmp_path):
         );
         INSERT INTO user_profile(user_id, section, key, value, updated_at)
             VALUES ('u1','职业','value','工程师',1000);
+        -- A real deployment also has the candidate table: migration 001 creates
+        -- it and 002/003/007 alter it, so a fixture without it is not a schema a
+        -- v3 database could actually be in.
+        CREATE TABLE fact_candidates (
+            candidate_id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
+            session_id TEXT NOT NULL, turn_id INTEGER NOT NULL,
+            raw_text TEXT, subject TEXT, predicate TEXT, object TEXT,
+            qualifiers TEXT, confidence REAL DEFAULT 0.5,
+            importance REAL DEFAULT 0.5, privacy TEXT DEFAULT 'private',
+            status TEXT NOT NULL DEFAULT 'pending',
+            idempotency_key TEXT UNIQUE, created_at INTEGER NOT NULL,
+            type TEXT NOT NULL DEFAULT 'semantic', content TEXT
+        );
         PRAGMA user_version = 3;
         """
     )
@@ -459,6 +472,18 @@ def test_v4_database_upgrades_to_v5_with_zero_reinforcement(tmp_path):
             updated_at INTEGER NOT NULL,
             pinned INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (user_id, section, key)
+        );
+        -- Present in any real v3/v4 deployment: 001 creates it, 002/003 alter
+        -- it, and 007 adds the write-outcome columns to it.
+        CREATE TABLE fact_candidates (
+            candidate_id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
+            session_id TEXT NOT NULL, turn_id INTEGER NOT NULL,
+            raw_text TEXT, subject TEXT, predicate TEXT, object TEXT,
+            qualifiers TEXT, confidence REAL DEFAULT 0.5,
+            importance REAL DEFAULT 0.5, privacy TEXT DEFAULT 'private',
+            status TEXT NOT NULL DEFAULT 'pending',
+            idempotency_key TEXT UNIQUE, created_at INTEGER NOT NULL,
+            type TEXT NOT NULL DEFAULT 'semantic', content TEXT
         );
         PRAGMA user_version = 4;
         """

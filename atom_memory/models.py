@@ -159,8 +159,15 @@ class ValidationResult:
             ``privacy``).
         reason: Human-readable explanation.
         candidate_id: The candidate this result refers to.
-        conflict_with: When ``kind == "conflict"``, the fact_id the candidate
-            conflicts with.
+        conflict_with: When ``kind == "conflict"``, the most recent fact_id the
+            candidate contradicts. Kept for logs and for callers that only need
+            the single worst case.
+        conflict_rows: When ``kind == "conflict"``, every active row the
+            candidate contradicts (same user, subject and single-valued
+            predicate, different object), newest first. The write path needs all
+            of them, not just one: replacing a single-valued key means replacing
+            *every* stale value under it, and the evidence comparison has to see
+            the weakest of them.
         suppressed: For ``kind == "idempotent"``, the existing fact_id that
             already represents this candidate.
     """
@@ -170,6 +177,7 @@ class ValidationResult:
     reason: str = ""
     candidate_id: Optional[str] = None
     conflict_with: Optional[str] = None
+    conflict_rows: Optional[list] = None
     suppressed: Optional[str] = None
 
     @classmethod

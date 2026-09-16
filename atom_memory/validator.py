@@ -15,6 +15,12 @@ import sqlite3
 from typing import Optional
 
 from .models import ALL_KNOWLEDGE, FactCandidate, ValidationResult
+from .sanitize import (
+    DEFAULT_MAX_CONTENT_CHARS,
+    DEFAULT_MAX_FIELD_CHARS,
+    clean_body,
+    clean_field,
+)
 
 # Allowed confidence range (inclusive).
 _MIN_CONFIDENCE = 0.0
@@ -75,11 +81,20 @@ def validate(
     conn: Optional[sqlite3.Connection] = None,
     privacy_filter: str = _DEFAULT_PRIVACY,
     forbid_qualifier_fields: bool = True,
+    max_field_chars: int = DEFAULT_MAX_FIELD_CHARS,
+    max_content_chars: int = DEFAULT_MAX_CONTENT_CHARS,
 ) -> ValidationResult:
     """Run the full validation chain on a candidate.
 
+    The chain starts by **normalising the candidate in place** (whitespace and
+    invisible-character removal, field/body length caps). That is deliberate:
+    this function is the single gate every fact write passes through, so
+    cleaning here is what guarantees the store never holds a value that carries
+    hidden instructions or an unbounded field — and it means the later checks
+    judge exactly the text that will be stored, not the raw text.
+
     Args:
-        candidate: The candidate to validate.
+        candidate: The candidate to validate (normalised in place).
         conn: Optional connection used for idempotency and conflict lookups.
             If ``None`` those checks short-circuit to passing (write-time
             enforcement still applies via the DB constraints).
@@ -87,10 +102,17 @@ def validate(
             not match it, the ``privacy`` check fails.
         forbid_qualifier_fields: Reserved for future use; kept for API
             stability.
+        max_field_chars: Ingest cap for one SPO field.
+        max_content_chars: Ingest cap for a knowledge body.
 
     Returns:
         A :class:`ValidationResult` describing the outcome.
     """
+    # 0. Normalise (not a check: it decides what the checks look at).
+    normalize_candidate(
+        candidate, max_field_chars=max_field_chars, max_content_chars=max_content_chars
+    )
+
     # 1. Empty
     empty = _check_empty(candidate)
     if not empty.ok:
@@ -122,6 +144,37 @@ def validate(
         return priv
 
     return ValidationResult.pass_(candidate.candidate_id)
+
+
+def normalize_candidate(
+    candidate: FactCandidate,
+    max_field_chars: int = DEFAULT_MAX_FIELD_CHARS,
+    max_content_chars: int = DEFAULT_MAX_CONTENT_CHARS,
+) -> FactCandidate:
+    """Clean a candidate's text fields in place and return it.
+
+    Subject / predicate / object become single-line, invisible-character-free
+    and length-capped; content keeps its line structure but loses its invisible
+    characters and is length-capped. ``qualifiers`` is left alone: it is JSON,
+    and mangling it would corrupt the structured fields (``negation``, ``when``,
+    ``steps``) the rest of the library reads from it.
+
+    Args:
+        candidate: The candidate to normalise.
+        max_field_chars: Cap for one SPO field.
+        max_content_chars: Cap for the knowledge body.
+
+    Returns:
+        The same candidate object, normalised.
+    """
+    for name in ("subject", "predicate", "object"):
+        value = getattr(candidate, name, None)
+        if value is not None:
+            setattr(candidate, name, clean_field(value, max_field_chars))
+    if candidate.content is not None:
+        cleaned = clean_body(candidate.content, max_content_chars)
+        candidate.content = cleaned or None
+    return candidate
 
 
 def _check_empty(candidate: FactCandidate) -> ValidationResult:
@@ -313,25 +366,23 @@ def _check_conflict(
 ) -> ValidationResult:
     """Detect a contradiction against an existing active fact.
 
-    Comparisons use the (subject, predicate) pair of the candidate against
-    active facts of the same user:
+    The comparison runs in **two passes over the same, deterministically ordered
+    row set**, because the answer must not depend on which row SQLite happens to
+    return first:
 
-    - identical object *and* identical negation  -> duplicate reinforcement,
-      reported as ``idempotent`` (superseded by the existing fact);
-    - identical object *but* flipped negation     -> direct contradiction,
-      reported as ``conflict``;
-    - different object:
-        * multi-valued predicate (preferences, interests...) -> an independent
-          claim, **not** a conflict;
-        * knowledge fact (sop / few_shot / decision_rule / lesson) -> independent
-          items that legitimately share one predicate (two SOPs, two lessons...),
-          **not** a conflict;
-        * episodic event (type=episodic or predicate ``事件``) -> events are
-          naturally many and independent, **not** a conflict;
-        * single-valued predicate (attribute or one workflow name) -> the
-          previous value conflicts, reported as ``conflict``.
+    - **Pass 1 — is this claim already stored?** Any active row with the same
+      object decides the outcome: same negation is a restatement
+      (``idempotent``), a flipped negation is a direct contradiction
+      (``conflict`` against *that* row).
+    - **Pass 2 — a different object under the same key.** Multi-valued
+      predicates, knowledge items and episodic events hold many objects, so this
+      is an independent claim, not a conflict. Under a single-valued predicate
+      it is a contradiction against *every* active value under the key, and all
+      of those rows are handed back in ``conflict_rows`` (newest first) so the
+      write path can resolve the whole key rather than one arbitrary row.
 
-    Inactive (e.g. ``superseded`` / ``retracted``) facts are ignored.
+    Inactive (e.g. ``superseded`` / ``retracted`` / ``archived``) facts are
+    ignored throughout.
     """
     if conn is None or not candidate.subject or not candidate.predicate:
         return ValidationResult.pass_(candidate.candidate_id)
@@ -344,45 +395,47 @@ def _check_conflict(
     multi_valued = is_multi_valued(candidate.predicate, cand_type)
 
     rows = conn.execute(
-        "SELECT fact_id, object, qualifiers FROM facts "
+        "SELECT fact_id, object, qualifiers, confidence, importance, created_at "
+        "FROM facts "
         "WHERE user_id = ? AND subject = ? AND predicate = ? "
-        "AND status = 'active'",
+        "AND status = 'active' "
+        "ORDER BY created_at DESC, rowid DESC",
         (candidate.user_id, candidate.subject, candidate.predicate),
     ).fetchall()
+
+    # -- Pass 1: the claim itself ---------------------------------------------
     for row in rows:
-        row_obj = (row["object"] or "").strip()
-        row_neg = _has_negation(row["qualifiers"])
-
-        if row_obj == cand_obj:
-            # Same underlying claim.
-            if row_neg == cand_neg:
-                return ValidationResult.fail(
-                    "idempotent",
-                    f"identical active fact already exists: {row['fact_id']}",
-                    candidate.candidate_id,
-                    suppressed=row["fact_id"],
-                )
+        if (row["object"] or "").strip() != cand_obj:
+            continue
+        if _has_negation(row["qualifiers"]) == cand_neg:
             return ValidationResult.fail(
-                "conflict",
-                f"contradicts active fact {row['fact_id']}",
+                "idempotent",
+                f"identical active fact already exists: {row['fact_id']}",
                 candidate.candidate_id,
-                conflict_with=row["fact_id"],
+                suppressed=row["fact_id"],
             )
+        return ValidationResult.fail(
+            "conflict",
+            f"negation contradicts active fact {row['fact_id']}",
+            candidate.candidate_id,
+            conflict_with=row["fact_id"],
+            conflict_rows=[dict(row)],
+        )
 
-        # Different object text.
-        if not multi_valued:
-            return ValidationResult.fail(
-                "conflict",
-                f"conflicts with active fact {row['fact_id']}",
-                candidate.candidate_id,
-                conflict_with=row["fact_id"],
-            )
-        # Multi-valued predicate, knowledge item or episodic event with a
-        # different object: independent claim, keep scanning other matching
-        # facts.
-        continue
+    # -- Pass 2: a different object under the same key -------------------------
+    if multi_valued or not rows:
+        return ValidationResult.pass_(candidate.candidate_id)
 
-    return ValidationResult.pass_(candidate.candidate_id)
+    conflicting = [dict(row) for row in rows]
+    objects = ", ".join(repr(r["object"]) for r in conflicting[:3])
+    return ValidationResult.fail(
+        "conflict",
+        f"{candidate.predicate!r} is single-valued but holds "
+        f"{len(conflicting)} active value(s): {objects}",
+        candidate.candidate_id,
+        conflict_with=conflicting[0]["fact_id"],
+        conflict_rows=conflicting,
+    )
 
 
 def _has_negation(qualifiers: Optional[str]) -> bool:
