@@ -468,7 +468,6 @@ describe('MemorySettingsSection client render', () => {
     // The profile has no pin column any more: rows are user-owned outright, so
     // there is nothing for a pin to protect against.
     expect(screen.queryByText('固定')).toBeNull()
-    expect(screen.getByText(zh.profileHint)).toBeTruthy()
 
     const row = screen.getAllByRole('row')[1]!
     expect(within(row).getAllByRole('textbox')).toHaveLength(3)
@@ -484,10 +483,10 @@ describe('MemorySettingsSection client render', () => {
     ])
   })
 
-  it('generates profile suggestions and adds the ticked ones to the draft table', async () => {
+  it('writes the ticked suggestions on save, with no separate accept step', async () => {
     const controller = buildController(false, false)
     const { props } = bind(controller)
-    // A generated run: two proposals, one of which the user ticks.
+    // A generated run: two proposals, one of which the user unticks.
     props.generateProfile = (async () => ({
       suggestions: [
         { section: '职业', key: 'value', value: '工程师' },
@@ -521,24 +520,56 @@ describe('MemorySettingsSection client render', () => {
     expect(boxes).toHaveLength(2)
     expect(boxes.every(b => b.checked)).toBe(true)
 
-    // Untick one, then accept: only the ticked entry joins the table.
+    // There is no "accept" button: the tick is the decision and 保存全部 commits it.
+    expect(screen.queryByText('加入所选')).toBeNull()
+
     await act(async () => {
       fireEvent.click(boxes[1]!)
     })
     await act(async () => {
-      fireEvent.click(screen.getByText('加入所选'))
+      fireEvent.click(screen.getAllByText('保存全部')[0]!)
     })
-    // The proposal list is consumed, and the chosen row is now an editable row.
-    expect(screen.queryByText(zh.suggestionIntro)).toBeNull()
-    expect((screen.getByDisplayValue('工程师') as HTMLInputElement).value).toBe('工程师')
-    expect(screen.queryByDisplayValue('天津')).toBeNull()
+    await act(async () => {})
 
+    // Only the still-ticked suggestion is written.
+    expect(saved).toHaveLength(1)
+    expect(saved[0]).toEqual([
+      { section: '职业', key: 'value', value: '工程师', deleted: false },
+    ])
+  })
+
+  it('folds ticked suggestions into a save alongside the draft rows', async () => {
+    const controller = buildController(false, true)
+    const { props } = bind(controller)
+    props.generateProfile = (async () => ({
+      suggestions: [{ section: '城市', key: 'value', value: '天津' }],
+      existing: 1,
+      limit: 50,
+      full: false,
+    })) as never
+    const saved: ProfileEditRow[][] = []
+    props.saveAllProfile = (async (rows: ProfileEditRow[]) => { saved.push(rows) }) as never
+
+    await act(async () => {
+      render(createElement(MemorySettingsSection, props))
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.click(screen.getByText('编辑画像'))
+    })
+    await act(async () => {
+      fireEvent.click(screen.getByText('生成画像'))
+    })
+    await act(async () => {})
     await act(async () => {
       fireEvent.click(screen.getAllByText('保存全部')[0]!)
     })
     await act(async () => {})
+
+    // The seeded row and the accepted suggestion are one batch.
     expect(saved[0]).toEqual([
-      { section: '职业', key: 'value', value: '工程师', deleted: false },
+      { section: '偏好', key: '回答语言', value: '中文', deleted: false },
+      { section: '城市', key: 'value', value: '天津', deleted: false },
     ])
   })
 

@@ -704,10 +704,35 @@ function ProfileEditorModal(props: {
       uid: nextDraftUid(), section: '', key: '', value: '', deleted: false,
     }])
 
+  /**
+   * The rows one save writes: the draft table, plus whichever suggestions are
+   * still ticked.
+   *
+   * Ticked suggestions are folded in here rather than staged into the table by
+   * a separate action, so "生成画像 → 勾选 → 保存全部" is the whole flow and the
+   * save is the single commit point. A ticked suggestion is a row the user has
+   * already decided to keep; making them confirm it twice (accept, then save)
+   * added a step that could be skipped by accident, leaving the choice silently
+   * discarded when the modal closed. A ticked suggestion whose (section, key) is
+   * already an editable row defers to that row, which may carry the user's edits.
+   */
+  const saveEnvelope = (): Omit<ProfileDraft, 'uid'>[] => {
+    const draft = withoutUid(rows).filter(r => !r.deleted)
+    const present = new Set(draft.map(r => `${r.section}\u0000${r.key}`))
+    const additions = (suggestions ?? [])
+      .filter(s => picked.has(suggestionId(s)))
+      .filter(s => !present.has(suggestionId(s)))
+      .map(s => ({ section: s.section, key: s.key, value: s.value, deleted: false }))
+    return [...draft, ...additions]
+  }
+
   const save = () => {
     setSaving(true)
     setSaveError(undefined)
-    void Promise.resolve(onSave(withoutUid(rows)))
+    // The envelope, not the bare draft: the row cap is enforced in the store, so
+    // a save that would exceed it must be refused with the count the user is
+    // actually asking for (draft + accepted suggestions).
+    void Promise.resolve(onSave(saveEnvelope()))
       .then(() => onClose())
       // Keep the editor open on refusal (e.g. the row cap): closing it would
       // swallow the reason and the edits with it.
@@ -732,21 +757,6 @@ function ProfileEditorModal(props: {
       })
       .catch((err: unknown) => setGenerateError((err as Error)?.message ?? String(err)))
       .finally(() => { setGenerating(false) })
-  }
-
-  /** Add the ticked suggestions to the draft table (they are not saved yet). */
-  const addSelected = () => {
-    const chosen = (suggestions ?? []).filter(s => picked.has(suggestionId(s)))
-    if (chosen.length === 0) return
-    setRows(prev => [
-      ...prev.filter(r => !r.deleted),
-      ...chosen.map(s => ({
-        uid: nextDraftUid(), section: s.section, key: s.key, value: s.value,
-        deleted: false,
-      })),
-    ])
-    setSuggestions(undefined)
-    setPicked(new Set())
   }
 
   const toggleSuggestion = (s: ProfileSuggestion) => {
@@ -858,20 +868,9 @@ function ProfileEditorModal(props: {
                 </label>
               ))}
             </div>
-            <button
-              type="button"
-              className={css.btnPrimary}
-              style={{ marginTop: 8 }}
-              onClick={addSelected}
-              disabled={picked.size === 0}
-            >
-              {t('suggestionAddSelected')}
-            </button>
           </div>
         ) : null}
       </div>
-
-      <p className={css.hint} style={{ marginTop: 8 }}>{t('profileHint')}</p>
     </Modal>
   )
 }

@@ -401,14 +401,12 @@ window.__ModuleLoader__.load({
 				profileCapacity: "已用 {count}/{limit} 条（画像会写入系统提示词，每条都占用每个请求的固定开销）",
 				profileCapacityUnlimited: "已有 {count} 条（未设置上限）",
 				profileCapacityFull: "画像已达上限（{count}/{limit}），先删掉一些条目才能再添加。",
-				profileHint: "画像不是从记忆自动生成的：只有你在这里手动添加、或从“生成画像”的推荐里采纳的条目才会进入。删除即彻底移除（不会自动回来），记忆库里的原子事实不受影响。",
 				generateProfile: "生成画像",
 				generateProfileGenerating: "生成中…",
 				generateProfileHint: "由当前记忆库提炼推荐条目（已在画像中的不会重复推荐），你再决定保留哪些。",
 				generateProfileEmpty: "没有可推荐的新条目。已收录的条目不会被重复推荐。",
 				generateProfileFull: "画像已满（{count}/{limit}），先生成不了新条目——删掉一些再试。",
-				suggestionIntro: "以下条目由模型根据记忆库提炼。勾选要加入画像的条目，然后点“加入所选”。",
-				suggestionAddSelected: "加入所选",
+				suggestionIntro: "以下条目由模型根据记忆库提炼。勾选要加入画像的条目，保存后即写入。",
 				suggestionSelectAll: "全选",
 				suggestionSelectNone: "全不选",
 				suggestionName: "推荐条目",
@@ -495,14 +493,12 @@ window.__ModuleLoader__.load({
 				profileCapacity: "{count}/{limit} rows used (the profile is written into the system prompt, so every row costs on every request)",
 				profileCapacityUnlimited: "{count} rows (no cap configured)",
 				profileCapacityFull: "The profile is at its cap ({count}/{limit}) — delete a row before adding another.",
-				profileHint: "The profile is not generated from memory automatically: only entries you add here, or accept from \"Generate profile\", enter it. Deleting one removes it for good (it does not come back), and the underlying atomic facts are untouched.",
 				generateProfile: "Generate profile",
 				generateProfileGenerating: "Generating…",
 				generateProfileHint: "Distil suggestions from the current memory store (entries already in the profile are not offered again); you decide which to keep.",
 				generateProfileEmpty: "No new entries to suggest. Anything already in the profile is never offered again.",
 				generateProfileFull: "The profile is full ({count}/{limit}) — delete some rows before generating.",
-				suggestionIntro: "The model distilled these from your memory store. Tick the ones to add, then choose \"Add selected\".",
-				suggestionAddSelected: "Add selected",
+				suggestionIntro: "The model distilled these from your memory store. Tick the ones to add; saving writes them.",
 				suggestionSelectAll: "Select all",
 				suggestionSelectNone: "Select none",
 				suggestionName: "Suggested entries",
@@ -1305,10 +1301,33 @@ window.__ModuleLoader__.load({
 				value: "",
 				deleted: false
 			}]);
+			/**
+			* The rows one save writes: the draft table, plus whichever suggestions are
+			* still ticked.
+			*
+			* Ticked suggestions are folded in here rather than staged into the table by
+			* a separate action, so "生成画像 → 勾选 → 保存全部" is the whole flow and the
+			* save is the single commit point. A ticked suggestion is a row the user has
+			* already decided to keep; making them confirm it twice (accept, then save)
+			* added a step that could be skipped by accident, leaving the choice silently
+			* discarded when the modal closed. A ticked suggestion whose (section, key) is
+			* already an editable row defers to that row, which may carry the user's edits.
+			*/
+			const saveEnvelope = () => {
+				const draft = withoutUid(rows).filter((r) => !r.deleted);
+				const present = new Set(draft.map((r) => `${r.section}\u0000${r.key}`));
+				const additions = (suggestions ?? []).filter((s) => picked.has(suggestionId(s))).filter((s) => !present.has(suggestionId(s))).map((s) => ({
+					section: s.section,
+					key: s.key,
+					value: s.value,
+					deleted: false
+				}));
+				return [...draft, ...additions];
+			};
 			const save = () => {
 				setSaving(true);
 				setSaveError(void 0);
-				Promise.resolve(onSave(withoutUid(rows))).then(() => onClose()).catch((err) => setSaveError(err?.message ?? String(err))).finally(() => {
+				Promise.resolve(onSave(saveEnvelope())).then(() => onClose()).catch((err) => setSaveError(err?.message ?? String(err))).finally(() => {
 					setSaving(false);
 				});
 			};
@@ -1327,20 +1346,6 @@ window.__ModuleLoader__.load({
 				}).catch((err) => setGenerateError(err?.message ?? String(err))).finally(() => {
 					setGenerating(false);
 				});
-			};
-			/** Add the ticked suggestions to the draft table (they are not saved yet). */
-			const addSelected = () => {
-				const chosen = (suggestions ?? []).filter((s) => picked.has(suggestionId(s)));
-				if (chosen.length === 0) return;
-				setRows((prev) => [...prev.filter((r) => !r.deleted), ...chosen.map((s) => ({
-					uid: nextDraftUid(),
-					section: s.section,
-					key: s.key,
-					value: s.value,
-					deleted: false
-				}))]);
-				setSuggestions(void 0);
-				setPicked(/* @__PURE__ */ new Set());
 			};
 			const toggleSuggestion = (s) => {
 				const id = suggestionId(s);
@@ -1508,23 +1513,10 @@ window.__ModuleLoader__.load({
 												s.value
 											]
 										}, suggestionId(s)))
-									}),
-									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-										type: "button",
-										className: css.btnPrimary,
-										style: { marginTop: 8 },
-										onClick: addSelected,
-										disabled: picked.size === 0,
-										children: t("suggestionAddSelected")
 									})
 								]
 							}) : null
 						]
-					}),
-					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
-						className: css.hint,
-						style: { marginTop: 8 },
-						children: t("profileHint")
 					})
 				]
 			});
