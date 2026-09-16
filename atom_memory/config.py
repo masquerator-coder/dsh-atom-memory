@@ -104,6 +104,13 @@ class MemConfig:
     default_token_budget: int = 2000
     summary_token_limit: int = 1500
     user_md_token_limit: int = 800
+    # Hard cap on the number of rows in `user_profile`. The profile is rendered
+    # into the session system prompt (through `user_md`), so every row is a cost
+    # paid on every request of every session — an unbounded table is an
+    # unbounded recurring prompt cost. Writes that would exceed the cap are
+    # refused with the current count and the limit, rather than silently
+    # dropping the oldest entry. 0 disables the cap.
+    max_profile_rows: int = 50
 
     # -- retention / lifecycle ------------------------------------------------
     candidate_retention_days: int = 7

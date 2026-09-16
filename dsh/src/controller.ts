@@ -16,6 +16,12 @@ import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import type { PythonBridge } from './bridge.ts'
 import { clampInjectedSummaryTokens } from './injection-budget.ts'
 import type { LiveRuntime, Runtime } from './runtime.ts'
+import type { LlmCompleter } from './llm-extractor.ts'
+import {
+  synthesizeProfileSuggestions,
+  type ProfileCandidate,
+  type ProfileSuggestion as SynthesizedSuggestion,
+} from './profile-synthesis.ts'
 
 /** One active fact as the panel edits it. */
 export interface FactEditInput {
@@ -32,11 +38,26 @@ export interface ProfileEditInput {
   section: string
   key?: string
   value: string
-  /**
-   * Pin the row against automatic memory writes. Omitted means "leave the
-   * existing pin state alone" — the panel only sends what it knows.
-   */
-  pinned?: boolean
+}
+
+/**
+ * One profile-table row edit from the panel's batch save.
+ *
+ * `deleted` marks a row the user removed. The row still has to name its
+ * `section`/`key`, because that is what identifies which row to delete.
+ */
+export interface ProfileRowEdit {
+  section: string
+  key: string
+  value?: string
+  deleted?: boolean
+}
+
+/** One suggested profile entry awaiting the user's approval. */
+export interface ProfileSuggestion {
+  section: string
+  key: string
+  value: string
 }
 
 declare module '@deepseek-ai/cordis' {
@@ -64,6 +85,14 @@ export class AtomMemoryController extends TypertRemoteService {
      * surface can produce.
      */
     private readonly startupError: () => string | undefined = () => undefined,
+    /**
+     * The completion used for profile synthesis, resolved from the dsh LLM.
+     *
+     * `undefined` when no model is available: profile generation is then an
+     * honest "no model configured" error rather than an empty suggestion list
+     * that would read as "your memory has nothing worth keeping".
+     */
+    private readonly complete: LlmCompleter | undefined = undefined,
   ) {
     super(ctx, 'atomMemoryController', { namespace: 'atomMemory' })
   }
@@ -189,7 +218,7 @@ export class AtomMemoryController extends TypertRemoteService {
     return this.bridge.call('list_profile', { user_id: args.user }) as Promise<Record<string, unknown>>
   }
 
-  /** Add or update one profile row (an explicit user edit — pins included). */
+  /** Add or update one profile row (a user edit from the panel). */
   @Remote
   async upsertProfile(args: { user: string } & ProfileEditInput): Promise<Record<string, unknown>> {
     this.assertReady()
@@ -199,7 +228,6 @@ export class AtomMemoryController extends TypertRemoteService {
       section: args.section,
       key: args.key,
       value: args.value,
-      pinned: args.pinned,
     }) as Promise<Record<string, unknown>>
   }
 
@@ -212,6 +240,71 @@ export class AtomMemoryController extends TypertRemoteService {
       section: args.section,
       key: args.key,
     }) as Promise<Record<string, unknown>>
+  }
+
+  /** Apply the panel's batch profile edits (upserts + deletions) in one pass. */
+  @Remote
+  async writeProfile(args: { user: string; rows: ProfileRowEdit[] }): Promise<Record<string, unknown>> {
+    this.assertReady()
+    return this.bridge.call('write_profile', {
+      user_id: args.user,
+      rows: args.rows ?? [],
+    }) as Promise<Record<string, unknown>>
+  }
+
+  /**
+   * Propose profile entries for the user to approve.
+   *
+   * The flow spans both halves on purpose: Python owns which slots are *filable*
+   * (the deterministic aggregation excludes facts that are already represented),
+   * and the model — which lives here on the dsh side — owns which of those are
+   * worth keeping. Nothing is written: the result is a proposal list, and the
+   * rows land only when the user accepts them through {@link writeProfile}.
+   */
+  @Remote
+  async generateProfile(args: { user: string }): Promise<Record<string, unknown>> {
+    this.assertReady()
+    if (this.complete === undefined) {
+      throw new Error('未配置可用模型：请在插件设置里指定抽取模型，或让 dsh 有默认模型')
+    }
+    const raw = await this.bridge.call('profile_candidates', { user_id: args.user }) as {
+      candidates?: ProfileCandidate[]
+      existing_keys?: Array<[string, string]>
+      existing?: number
+      limit?: number
+      remaining?: number
+    }
+    const candidates = Array.isArray(raw?.candidates) ? raw.candidates : []
+    const limit = Number(raw?.limit ?? 0)
+    const remaining = Number(raw?.remaining ?? 0)
+
+    // Nothing filable, or no free slot: say which, rather than reporting an
+    // empty suggestion list that reads as "your memory has nothing to offer".
+    if (limit > 0 && remaining <= 0) {
+      return { suggestions: [], existing: Number(raw?.existing ?? 0), limit, full: true }
+    }
+    if (candidates.length === 0) {
+      return { suggestions: [], existing: Number(raw?.existing ?? 0), limit, full: false }
+    }
+
+    // The profile's own pairs come back with the candidates, so filtering needs
+    // no second round trip (and cannot race an edit made in between).
+    const existingPairs = new Set(
+      (Array.isArray(raw?.existing_keys) ? raw.existing_keys : [])
+        .map(pair => `${String(pair?.[0] ?? '')}\u0000${String(pair?.[1] ?? '')}`),
+    )
+
+    const suggestions: SynthesizedSuggestion[] = await synthesizeProfileSuggestions(
+      this.complete,
+      candidates,
+      { existing: existingPairs, remaining, limit },
+    )
+    return {
+      suggestions,
+      existing: Number(raw?.existing ?? 0),
+      limit,
+      full: false,
+    }
   }
 
   /** Export the user's memory as a JSON snapshot (for download). */

@@ -135,10 +135,11 @@ window.__ModuleLoader__.load({
 					saveFact: (fact) => this.saveFact(fact),
 					deleteFact: (factId) => this.deleteFact(factId),
 					fetchSummary: () => this.fetchSummary(),
-					upsertProfile: (section, key, value, pinned) => this.upsertProfile(section, key, value, pinned),
+					upsertProfile: (section, key, value) => this.upsertProfile(section, key, value),
 					deleteProfile: (section, key) => this.deleteProfile(section, key),
 					saveAllFacts: (rows) => this.saveAllFacts(rows),
 					saveAllProfile: (rows) => this.saveAllProfile(rows),
+					generateProfile: () => this.generateProfile(),
 					backup: () => this.backup(),
 					restore: (payload) => this.restore(payload)
 				};
@@ -172,7 +173,9 @@ window.__ModuleLoader__.load({
 						...this.store.getSnapshot(),
 						data: {
 							facts: Array.isArray(facts.facts) ? facts.facts : [],
-							profile: Array.isArray(profile.profile) ? profile.profile : []
+							profile: Array.isArray(profile.profile) ? profile.profile : [],
+							profileCount: Number(profile.count ?? (Array.isArray(profile.profile) ? profile.profile.length : 0)),
+							profileLimit: Number(profile.limit ?? 0)
 						},
 						lastError: void 0
 					});
@@ -236,14 +239,13 @@ window.__ModuleLoader__.load({
 					throw err;
 				}
 			}
-			async upsertProfile(section, key, value, pinned) {
+			async upsertProfile(section, key, value) {
 				try {
 					await this.r().upsertProfile({
 						user: USER,
 						section,
 						key,
-						value,
-						pinned
+						value
 					});
 					await this.refreshData();
 				} catch (err) {
@@ -293,25 +295,28 @@ window.__ModuleLoader__.load({
 			}
 			async saveAllProfile(rows) {
 				try {
-					for (const row of rows) if (row.deleted) await this.r().deleteProfile({
+					unwrap(await this.r().writeProfile({
 						user: USER,
-						section: row.section,
-						key: row.key
-					});
-					else await this.r().upsertProfile({
-						user: USER,
-						section: row.section,
-						key: row.key,
-						value: row.value,
-						pinned: row.pinned === true
-					});
+						rows
+					}));
 					await this.refreshData();
 				} catch (err) {
+					const message = err?.message ?? String(err);
 					this.store.set({
 						...this.store.getSnapshot(),
-						lastError: err?.message ?? String(err)
+						lastError: message
 					});
+					throw err;
 				}
+			}
+			async generateProfile() {
+				const result = unwrap(await this.r().generateProfile({ user: USER }));
+				return {
+					suggestions: Array.isArray(result?.suggestions) ? result.suggestions : [],
+					existing: Number(result?.existing ?? 0),
+					limit: Number(result?.limit ?? 0),
+					full: result?.full === true
+				};
 			}
 			async backup() {
 				return unwrap(await this.r().backup({ user: USER }));
@@ -390,8 +395,23 @@ window.__ModuleLoader__.load({
 				profileColSection: "Section",
 				profileColKey: "Key",
 				profileColValue: "Value",
-				profileColPinned: "固定",
-				profilePinnedHint: "勾选“固定”的画像条目不会被记忆自动更新或替代——只有你在这里手动改动它才会变。",
+				profileColSource: "来源",
+				profileSourceUser: "手动",
+				profileSourceGenerated: "生成",
+				profileCapacity: "已用 {count}/{limit} 条（画像会写入系统提示词，每条都占用每个请求的固定开销）",
+				profileCapacityUnlimited: "已有 {count} 条（未设置上限）",
+				profileCapacityFull: "画像已达上限（{count}/{limit}），先删掉一些条目才能再添加。",
+				profileHint: "画像不是从记忆自动生成的：只有你在这里手动添加、或从“生成画像”的推荐里采纳的条目才会进入。删除即彻底移除（不会自动回来），记忆库里的原子事实不受影响。",
+				generateProfile: "生成画像",
+				generateProfileGenerating: "生成中…",
+				generateProfileHint: "由当前记忆库提炼推荐条目（已在画像中的不会重复推荐），你再决定保留哪些。",
+				generateProfileEmpty: "没有可推荐的新条目。已收录的条目不会被重复推荐。",
+				generateProfileFull: "画像已满（{count}/{limit}），先生成不了新条目——删掉一些再试。",
+				suggestionIntro: "以下条目由模型根据记忆库提炼。勾选要加入画像的条目，然后点“加入所选”。",
+				suggestionAddSelected: "加入所选",
+				suggestionSelectAll: "全选",
+				suggestionSelectNone: "全不选",
+				suggestionName: "推荐条目",
 				memoryHeader: "记忆与编辑",
 				factsHeader: "原子事实",
 				factsEmpty: "暂无原子事实。",
@@ -469,8 +489,23 @@ window.__ModuleLoader__.load({
 				profileColSection: "Section",
 				profileColKey: "Key",
 				profileColValue: "Value",
-				profileColPinned: "Pinned",
-				profilePinnedHint: "A pinned profile row is never updated or replaced by memory automatically — only your own edit here changes it.",
+				profileColSource: "Source",
+				profileSourceUser: "Manual",
+				profileSourceGenerated: "Generated",
+				profileCapacity: "{count}/{limit} rows used (the profile is written into the system prompt, so every row costs on every request)",
+				profileCapacityUnlimited: "{count} rows (no cap configured)",
+				profileCapacityFull: "The profile is at its cap ({count}/{limit}) — delete a row before adding another.",
+				profileHint: "The profile is not generated from memory automatically: only entries you add here, or accept from \"Generate profile\", enter it. Deleting one removes it for good (it does not come back), and the underlying atomic facts are untouched.",
+				generateProfile: "Generate profile",
+				generateProfileGenerating: "Generating…",
+				generateProfileHint: "Distil suggestions from the current memory store (entries already in the profile are not offered again); you decide which to keep.",
+				generateProfileEmpty: "No new entries to suggest. Anything already in the profile is never offered again.",
+				generateProfileFull: "The profile is full ({count}/{limit}) — delete some rows before generating.",
+				suggestionIntro: "The model distilled these from your memory store. Tick the ones to add, then choose \"Add selected\".",
+				suggestionAddSelected: "Add selected",
+				suggestionSelectAll: "Select all",
+				suggestionSelectNone: "Select none",
+				suggestionName: "Suggested entries",
 				memoryHeader: "Memory & edit",
 				factsHeader: "Atomic facts",
 				factsEmpty: "No atomic facts yet.",
@@ -1089,7 +1124,10 @@ window.__ModuleLoader__.load({
 					modal === "profile" ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ProfileEditorModal, {
 						t,
 						initial: profile,
+						count: state.data.profileCount ?? profile.length,
+						limit: state.data.profileLimit ?? 0,
 						onSave: (rows) => props.saveAllProfile(rows),
+						onGenerate: () => props.generateProfile(),
 						onClose: () => setModal(void 0)
 					}) : null
 				]
@@ -1241,16 +1279,21 @@ window.__ModuleLoader__.load({
 		}
 		/** Modal editor for the user profile: Excel-like editable table + single save all. */
 		function ProfileEditorModal(props) {
-			const { t, initial, onSave, onClose } = props;
+			const { t, initial, count, limit, onSave, onGenerate, onClose } = props;
 			const [rows, setRows] = (0, react.useState)(() => initial.map((r) => ({
 				uid: nextDraftUid(),
 				section: r.section,
 				key: r.key,
 				value: r.value,
-				pinned: r.pinned === true,
 				deleted: false
 			})));
 			const [saving, setSaving] = (0, react.useState)(false);
+			const [saveError, setSaveError] = (0, react.useState)();
+			const [suggestions, setSuggestions] = (0, react.useState)();
+			const [picked, setPicked] = (0, react.useState)(/* @__PURE__ */ new Set());
+			const [generating, setGenerating] = (0, react.useState)(false);
+			const [generateError, setGenerateError] = (0, react.useState)();
+			const [generateNote, setGenerateNote] = (0, react.useState)();
 			const setRow = (index, patch) => setRows((prev) => prev.map((r, i) => i === index ? {
 				...r,
 				...patch
@@ -1260,16 +1303,55 @@ window.__ModuleLoader__.load({
 				section: "",
 				key: "",
 				value: "",
-				pinned: false,
 				deleted: false
 			}]);
 			const save = () => {
 				setSaving(true);
-				Promise.resolve(onSave(withoutUid(rows))).finally(() => {
+				setSaveError(void 0);
+				Promise.resolve(onSave(withoutUid(rows))).then(() => onClose()).catch((err) => setSaveError(err?.message ?? String(err))).finally(() => {
 					setSaving(false);
-					onClose();
 				});
 			};
+			const generate = () => {
+				setGenerating(true);
+				setGenerateError(void 0);
+				setGenerateNote(void 0);
+				setSuggestions(void 0);
+				onGenerate().then((result) => {
+					setSuggestions(result.suggestions);
+					setPicked(new Set(result.suggestions.map((s) => suggestionId(s))));
+					if (result.suggestions.length === 0) setGenerateNote(result.full ? t("generateProfileFull", {
+						count: result.existing,
+						limit: result.limit
+					}) : t("generateProfileEmpty"));
+				}).catch((err) => setGenerateError(err?.message ?? String(err))).finally(() => {
+					setGenerating(false);
+				});
+			};
+			/** Add the ticked suggestions to the draft table (they are not saved yet). */
+			const addSelected = () => {
+				const chosen = (suggestions ?? []).filter((s) => picked.has(suggestionId(s)));
+				if (chosen.length === 0) return;
+				setRows((prev) => [...prev.filter((r) => !r.deleted), ...chosen.map((s) => ({
+					uid: nextDraftUid(),
+					section: s.section,
+					key: s.key,
+					value: s.value,
+					deleted: false
+				}))]);
+				setSuggestions(void 0);
+				setPicked(/* @__PURE__ */ new Set());
+			};
+			const toggleSuggestion = (s) => {
+				const id = suggestionId(s);
+				setPicked((prev) => {
+					const next = new Set(prev);
+					if (next.has(id)) next.delete(id);
+					else next.add(id);
+					return next;
+				});
+			};
+			const setAllSuggestions = (on) => setPicked(on ? new Set((suggestions ?? []).map(suggestionId)) : /* @__PURE__ */ new Set());
 			const footer = /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
 				type: "button",
 				className: css.btn,
@@ -1283,19 +1365,33 @@ window.__ModuleLoader__.load({
 				disabled: saving,
 				children: saving ? t("saving") : t("saveAll")
 			})] });
+			const projectedCount = rows.filter((r) => !r.deleted).length;
 			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(Modal, {
 				t,
 				title: t("profileModalTitle"),
 				footer,
 				onClose,
 				children: [
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+						className: css.hint,
+						style: { marginBottom: 8 },
+						children: limit > 0 ? t("profileCapacity", {
+							count: projectedCount,
+							limit
+						}) : t("profileCapacityUnlimited", { count: projectedCount })
+					}),
+					saveError ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+						className: css.hint,
+						style: { color: "#c0392b" },
+						children: saveError
+					}) : null,
 					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("table", {
 						className: css.editor,
 						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("thead", { children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("tr", { children: [
 							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("th", { children: t("profileColSection") }),
 							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("th", { children: t("profileColKey") }),
 							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("th", { children: t("profileColValue") }),
-							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("th", { children: t("profileColPinned") }),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("th", { children: t("profileColSource") }),
 							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("th", { children: t("colActions") })
 						] }) }), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("tbody", { children: rows.map((row, i) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("tr", {
 							style: row.deleted ? { opacity: .45 } : void 0,
@@ -1315,14 +1411,7 @@ window.__ModuleLoader__.load({
 									disabled: row.deleted,
 									onChange: (e) => setRow(i, { value: e.currentTarget.value })
 								}) }),
-								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("td", { children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
-									type: "checkbox",
-									className: css.pin,
-									"aria-label": t("profileColPinned"),
-									checked: row.pinned === true,
-									disabled: row.deleted,
-									onChange: (e) => setRow(i, { pinned: e.currentTarget.checked })
-								}) }),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("td", { children: initial.some((r) => r.section === row.section && r.key === row.key && r.source === "generated") ? t("profileSourceGenerated") : t("profileSourceUser") }),
 								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("td", { children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 									className: css.editorRowActions,
 									children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
@@ -1335,20 +1424,114 @@ window.__ModuleLoader__.load({
 							]
 						}, row.uid)) })]
 					}),
-					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
-						className: css.hint,
-						style: { marginTop: 8 },
-						children: t("profilePinnedHint")
-					}),
 					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
 						type: "button",
 						className: css.add,
 						style: { marginTop: 10 },
 						onClick: addRow,
 						children: t("addRow")
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						style: {
+							marginTop: 14,
+							borderTop: "1px solid rgba(128,128,128,0.25)",
+							paddingTop: 10
+						},
+						children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+								className: css.hint,
+								children: t("generateProfileHint")
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+								type: "button",
+								className: css.btn,
+								style: { marginTop: 6 },
+								onClick: generate,
+								disabled: generating || saving,
+								children: generating ? t("generateProfileGenerating") : t("generateProfile")
+							}),
+							generateError ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+								className: css.hint,
+								style: {
+									color: "#c0392b",
+									marginTop: 6
+								},
+								children: generateError
+							}) : null,
+							generateNote ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+								className: css.hint,
+								style: { marginTop: 6 },
+								children: generateNote
+							}) : null,
+							suggestions && suggestions.length > 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+								style: { marginTop: 10 },
+								children: [
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+										className: css.hint,
+										children: t("suggestionIntro")
+									}),
+									/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+										style: {
+											display: "flex",
+											gap: 8,
+											margin: "6px 0"
+										},
+										children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+											type: "button",
+											className: css.btn,
+											onClick: () => setAllSuggestions(true),
+											children: t("suggestionSelectAll")
+										}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+											type: "button",
+											className: css.btn,
+											onClick: () => setAllSuggestions(false),
+											children: t("suggestionSelectNone")
+										})]
+									}),
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+										"aria-label": t("suggestionName"),
+										children: suggestions.map((s) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
+											style: {
+												display: "block",
+												padding: "2px 0"
+											},
+											children: [
+												/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+													type: "checkbox",
+													checked: picked.has(suggestionId(s)),
+													onChange: () => toggleSuggestion(s)
+												}),
+												" ",
+												/* @__PURE__ */ (0, react_jsx_runtime.jsx)("strong", { children: s.section }),
+												s.key === "value" ? "" : ` · ${s.key}`,
+												": ",
+												s.value
+											]
+										}, suggestionId(s)))
+									}),
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+										type: "button",
+										className: css.btnPrimary,
+										style: { marginTop: 8 },
+										onClick: addSelected,
+										disabled: picked.size === 0,
+										children: t("suggestionAddSelected")
+									})
+								]
+							}) : null
+						]
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+						className: css.hint,
+						style: { marginTop: 8 },
+						children: t("profileHint")
 					})
 				]
 			});
+		}
+		/** Stable identity of a suggestion, used for the tick set. */
+		function suggestionId(s) {
+			return `${s.section}\u0000${s.key}`;
 		}
 		//#endregion
 		//#region src/client/remote.ts
@@ -1420,6 +1603,8 @@ window.__ModuleLoader__.load({
 				jsonArgsMethod("listProfile", true),
 				jsonArgsMethod("upsertProfile", true),
 				jsonArgsMethod("deleteProfile", true),
+				jsonArgsMethod("writeProfile", true),
+				jsonArgsMethod("generateProfile", true),
 				jsonArgsMethod("backup", true),
 				jsonArgsMethod("restore", true),
 				jsonArgsMethod("getRuntime", false),

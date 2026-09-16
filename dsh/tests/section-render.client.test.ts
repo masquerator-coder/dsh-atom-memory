@@ -42,13 +42,11 @@ function useSnapshotHook<T>(store: { getSnapshot(): T; subscribe(fn: () => void)
  * @param seedFacts - Seed one active fact so the facts table has a row.
  * @param seedProfile - Seed one profile row so the profile table has a row.
  * @param budget - Initial injection budget; `undefined` keeps the default gear.
- * @param profilePinned - Whether the seeded profile row starts out pinned.
  */
 function buildController(
   seedFacts = false,
   seedProfile = false,
   budget: number | undefined = DEFAULT_INJECTED_SUMMARY_TOKENS,
-  profilePinned = false,
 ) {
   // A real in-memory settings scope: `set` persists the key and notifies
   // subscribers, so the controller's publish -> re-render -> draft-resync path
@@ -86,12 +84,19 @@ function buildController(
       ok: true,
       value: {
         profile: seedProfile
-          ? [{ section: '偏好', key: '回答语言', value: '中文', pinned: profilePinned }]
+          ? [{ section: '偏好', key: '回答语言', value: '中文', source: 'user' }]
           : [],
+        count: seedProfile ? 1 : 0,
+        limit: 50,
       },
     }),
     upsertProfile: async () => ({ ok: true, value: {} }),
     deleteProfile: async () => ({ ok: true, value: {} }),
+    writeProfile: async () => ({ ok: true, value: { written: 1, deleted: 0 } }),
+    generateProfile: async () => ({
+      ok: true,
+      value: { suggestions: [], existing: 0, limit: 50, full: false },
+    }),
     backup: async () => ({ ok: true, value: { version: 1, facts: [], profile: [] } }),
     restore: async () => ({ ok: true, value: { facts_written: 0, profile_written: 0 } }),
   }
@@ -445,7 +450,7 @@ describe('MemorySettingsSection client render', () => {
     expect(screen.queryByText(/不在挡位梯上/)).toBeNull()
   })
 
-  it('renders the profile 固定 column and writes the pin with the row', async () => {
+  it('saves the profile table without any pin flag', async () => {
     const controller = buildController(false, true)
     const { props } = bind(controller)
     // Spy before render: React freezes the props object it was handed.
@@ -460,21 +465,14 @@ describe('MemorySettingsSection client render', () => {
     })
     await act(async () => {})
 
-    // Header + the explanation of what the flag does.
-    expect(screen.getByText('固定')).toBeTruthy()
-    expect(screen.getByText(zh.profilePinnedHint)).toBeTruthy()
+    // The profile has no pin column any more: rows are user-owned outright, so
+    // there is nothing for a pin to protect against.
+    expect(screen.queryByText('固定')).toBeNull()
+    expect(screen.getByText(zh.profileHint)).toBeTruthy()
 
     const row = screen.getAllByRole('row')[1]!
-    const box = within(row).getByRole('checkbox') as HTMLInputElement
-    expect(box.checked).toBe(false)
-    expect(box.className).toBe('atom-memory-pin')
-    // The pin is not a text cell: the row still has exactly three inputs.
     expect(within(row).getAllByRole('textbox')).toHaveLength(3)
 
-    await act(async () => {
-      fireEvent.click(box)
-    })
-    expect(box.checked).toBe(true)
     await act(async () => {
       fireEvent.click(screen.getAllByText('保存全部')[0]!)
     })
@@ -482,13 +480,26 @@ describe('MemorySettingsSection client render', () => {
 
     expect(saved).toHaveLength(1)
     expect(saved[0]).toEqual([
-      { section: '偏好', key: '回答语言', value: '中文', pinned: true, deleted: false },
+      { section: '偏好', key: '回答语言', value: '中文', deleted: false },
     ])
   })
 
-  it('renders an already-pinned profile row as checked', async () => {
-    const controller = buildController(false, true, undefined, true)
+  it('generates profile suggestions and adds the ticked ones to the draft table', async () => {
+    const controller = buildController(false, false)
     const { props } = bind(controller)
+    // A generated run: two proposals, one of which the user ticks.
+    props.generateProfile = (async () => ({
+      suggestions: [
+        { section: '职业', key: 'value', value: '工程师' },
+        { section: '城市', key: 'value', value: '天津' },
+      ],
+      existing: 0,
+      limit: 50,
+      full: false,
+    })) as never
+    const saved: ProfileEditRow[][] = []
+    props.saveAllProfile = (async (rows: ProfileEditRow[]) => { saved.push(rows) }) as never
+
     await act(async () => {
       render(createElement(MemorySettingsSection, props))
     })
@@ -496,9 +507,85 @@ describe('MemorySettingsSection client render', () => {
     await act(async () => {
       fireEvent.click(screen.getByText('编辑画像'))
     })
+    await act(async () => {
+      fireEvent.click(screen.getByText('生成画像'))
+    })
     await act(async () => {})
-    const row = screen.getAllByRole('row')[1]!
-    expect((within(row).getByRole('checkbox') as HTMLInputElement).checked).toBe(true)
+
+    // Both proposals are shown, ticked by default. Scoped to the suggestion
+    // region: the panel has other checkboxes, so a page-wide query would count
+    // the wrong set.
+    expect(screen.getByText(zh.suggestionIntro)).toBeTruthy()
+    const region = screen.getByLabelText(zh.suggestionName)
+    const boxes = within(region).getAllByRole('checkbox') as HTMLInputElement[]
+    expect(boxes).toHaveLength(2)
+    expect(boxes.every(b => b.checked)).toBe(true)
+
+    // Untick one, then accept: only the ticked entry joins the table.
+    await act(async () => {
+      fireEvent.click(boxes[1]!)
+    })
+    await act(async () => {
+      fireEvent.click(screen.getByText('加入所选'))
+    })
+    // The proposal list is consumed, and the chosen row is now an editable row.
+    expect(screen.queryByText(zh.suggestionIntro)).toBeNull()
+    expect((screen.getByDisplayValue('工程师') as HTMLInputElement).value).toBe('工程师')
+    expect(screen.queryByDisplayValue('天津')).toBeNull()
+
+    await act(async () => {
+      fireEvent.click(screen.getAllByText('保存全部')[0]!)
+    })
+    await act(async () => {})
+    expect(saved[0]).toEqual([
+      { section: '职业', key: 'value', value: '工程师', deleted: false },
+    ])
+  })
+
+  it('reports an empty generation run instead of a blank panel', async () => {
+    const controller = buildController(false, false)
+    const { props } = bind(controller)
+    props.generateProfile = (async () => ({
+      suggestions: [], existing: 50, limit: 50, full: true,
+    })) as never
+
+    await act(async () => {
+      render(createElement(MemorySettingsSection, props))
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.click(screen.getByText('编辑画像'))
+    })
+    await act(async () => {
+      fireEvent.click(screen.getByText('生成画像'))
+    })
+    await act(async () => {})
+
+    expect(screen.getByText(zh.generateProfileFull.replace('{count}', '50').replace('{limit}', '50'))).toBeTruthy()
+  })
+
+  it('keeps the editor open and shows why when a profile save is refused', async () => {
+    const controller = buildController(false, true)
+    const { props } = bind(controller)
+    props.saveAllProfile = (async () => {
+      throw new Error('用户画像已达上限（50/50 条）')
+    }) as never
+
+    await act(async () => {
+      render(createElement(MemorySettingsSection, props))
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.click(screen.getByText('编辑画像'))
+    })
+    await act(async () => {
+      fireEvent.click(screen.getAllByText('保存全部')[0]!)
+    })
+    await act(async () => {})
+
+    // The reason is on screen and the table is still there to fix.
+    expect(screen.getByText(/已达上限/u)).toBeTruthy()
+    expect(screen.getByDisplayValue('中文')).toBeTruthy()
   })
 
   /**
@@ -509,7 +596,7 @@ describe('MemorySettingsSection client render', () => {
    */
   it('defines a stylesheet rule for the slider and pin classes it renders', async () => {
     const { memorySettingsStyleText } = await import('../src/client/styles.ts')
-    for (const cls of ['atom-memory-slider', 'atom-memory-ticks', 'atom-memory-tick-active', 'atom-memory-pin', 'atom-memory-content-actions', 'atom-memory-toggle', 'atom-memory-tooltip', 'atom-memory-group', 'atom-memory-group-title', 'atom-memory-switch', 'atom-memory-switch-input', 'atom-memory-switch-track', 'atom-memory-switch-thumb', 'atom-memory-summary-view']) {
+    for (const cls of ['atom-memory-slider', 'atom-memory-ticks', 'atom-memory-tick-active', 'atom-memory-content-actions', 'atom-memory-toggle', 'atom-memory-tooltip', 'atom-memory-group', 'atom-memory-group-title', 'atom-memory-switch', 'atom-memory-switch-input', 'atom-memory-switch-track', 'atom-memory-switch-thumb', 'atom-memory-summary-view']) {
       expect(memorySettingsStyleText).toContain(`.${cls}`)
     }
   })

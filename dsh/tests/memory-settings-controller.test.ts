@@ -55,11 +55,18 @@ function fakeRemote() {
   const backup = vi.fn(async () => ({ ok: true, value: { version: 1, facts: [], profile: [] } }))
   const restore = vi.fn(async () => ({ ok: true, value: { facts_written: 2, profile_written: 1 } }))
   const listFacts = vi.fn(async (): Promise<{ ok: boolean; value: { facts: Array<{ fact_id: string; subject: string; predicate: string; object: string }>; total: number } }> => ({ ok: true, value: { facts: [], total: 0 } }))
-  const listProfile = vi.fn(async () => ({ ok: true, value: { profile: [] } }))
+  const listProfile = vi.fn(async () => ({ ok: true, value: { profile: [], count: 0, limit: 50 } }))
   const deleteFact = vi.fn(async () => ({ ok: true, value: {} }))
+  // Typed as `unknown` result so a test can make one call fail (or return a
+  // malformed payload) without fighting the inferred success shape.
+  const writeProfile = vi.fn(async (): Promise<unknown> => ({ ok: true, value: { written: 0, deleted: 0 } }))
+  const generateProfile = vi.fn(async (): Promise<unknown> => ({
+    ok: true,
+    value: { suggestions: [], existing: 0, limit: 50, full: false },
+  }))
   const summary = vi.fn(async () => ({ ok: true, value: '# 记忆摘要 (Summary) — global\n决策规则\n- 一条规则' }))
-  const remote: Record<string, unknown> = { listFacts, editFact: vi.fn(async () => ({ ok: true, value: {} })), deleteFact, summary, listProfile, upsertProfile: vi.fn(async () => ({ ok: true, value: {} })), deleteProfile: vi.fn(async () => ({ ok: true, value: {} })), backup, restore }
-  return { remote, backup, restore, listFacts, listProfile, deleteFact, summary }
+  const remote: Record<string, unknown> = { listFacts, editFact: vi.fn(async () => ({ ok: true, value: {} })), deleteFact, summary, listProfile, upsertProfile: vi.fn(async () => ({ ok: true, value: {} })), deleteProfile: vi.fn(async () => ({ ok: true, value: {} })), writeProfile, generateProfile, backup, restore }
+  return { remote, backup, restore, listFacts, listProfile, deleteFact, summary, writeProfile, generateProfile }
 }
 
 describe('MemorySettingsController', () => {
@@ -225,44 +232,82 @@ describe('MemorySettingsController', () => {
     expect(listFacts.mock.calls.length).toBeGreaterThan(0)
   })
 
-  it('batch-saves a profile table: upserts non-deleted rows, deletes marked rows', async () => {
+  it('batch-saves a profile table in one call: upserts and deletions together', async () => {
     const { scope } = fakeScope(snapshot({}))
-    const { remote } = fakeRemote()
-    const upsertProfile = remote.upsertProfile as ReturnType<typeof vi.fn>
-    const deleteProfile = remote.deleteProfile as ReturnType<typeof vi.fn>
+    const { remote, writeProfile } = fakeRemote()
     const listProfile = remote.listProfile as ReturnType<typeof vi.fn>
-    listProfile.mockResolvedValue({ ok: true, value: { profile: [] } })
     const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, remote)
     await controller.inject().saveAllProfile([
       { section: '背景', key: '职业', value: '工程师', deleted: false },
       { section: '偏好', key: '语言', value: 'Python', deleted: true },
     ])
-    // Rows without an explicit pin are saved unpinned; the flag is always sent
-    // so an omitted one cannot leave a stale pin behind.
-    expect(upsertProfile).toHaveBeenCalledWith({
-      user: 'global', section: '背景', key: '职业', value: '工程师', pinned: false,
+    // One batch call, not a row-by-row loop: the store enforces the row cap on
+    // the whole batch, so a refusal cannot leave half the edits applied.
+    expect(writeProfile).toHaveBeenCalledTimes(1)
+    expect(writeProfile).toHaveBeenCalledWith({
+      user: 'global',
+      rows: [
+        { section: '背景', key: '职业', value: '工程师', deleted: false },
+        { section: '偏好', key: '语言', value: 'Python', deleted: true },
+      ],
     })
-    expect(deleteProfile).toHaveBeenCalledWith({ user: 'global', section: '偏好', key: '语言' })
     expect(listProfile.mock.calls.length).toBeGreaterThan(0)
   })
 
-  it('carries the 固定 flag through a profile batch save and a single upsert', async () => {
+  it('rethrows a refused profile save so the editor can stay open', async () => {
+    const { scope } = fakeScope(snapshot({}))
+    const { remote, writeProfile } = fakeRemote()
+    writeProfile.mockResolvedValueOnce({ ok: false, error: { message: '用户画像已达上限（50/50 条）' } })
+    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, remote)
+    const face = controller.inject()
+
+    await expect(face.saveAllProfile([{ section: '背景', key: '职业', value: '工程师' }]))
+      .rejects.toThrow(/已达上限/u)
+    expect(face.hooks.memorySettings.getSnapshot().lastError).toContain('已达上限')
+  })
+
+  it('forwards a profile generation run and normalises its result', async () => {
+    const { scope } = fakeScope(snapshot({}))
+    const { remote, generateProfile } = fakeRemote()
+    generateProfile.mockResolvedValueOnce({
+      ok: true,
+      value: {
+        suggestions: [{ section: '职业', key: 'value', value: '工程师' }],
+        existing: 3,
+        limit: 50,
+        full: false,
+      },
+    })
+    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, remote)
+    const result = await controller.inject().generateProfile()
+
+    expect(generateProfile).toHaveBeenCalledWith({ user: 'global' })
+    expect(result.suggestions).toEqual([{ section: '职业', key: 'value', value: '工程师' }])
+    expect(result.existing).toBe(3)
+    expect(result.limit).toBe(50)
+    expect(result.full).toBe(false)
+  })
+
+  it('reports a malformed generation result as an empty, non-full proposal', async () => {
+    const { scope } = fakeScope(snapshot({}))
+    const { remote, generateProfile } = fakeRemote()
+    generateProfile.mockResolvedValueOnce({ ok: true, value: {} })
+    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, remote)
+    const result = await controller.inject().generateProfile()
+    expect(result.suggestions).toEqual([])
+    expect(result.full).toBe(false)
+  })
+
+  it('carries a single profile edit without any pin flag', async () => {
     const { scope } = fakeScope(snapshot({}))
     const { remote } = fakeRemote()
     const upsertProfile = remote.upsertProfile as ReturnType<typeof vi.fn>
     const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, remote)
     const face = controller.inject()
 
-    await face.saveAllProfile([
-      { section: '背景', key: '职业', value: '工程师', pinned: true, deleted: false },
-    ])
-    expect(upsertProfile).toHaveBeenCalledWith({
-      user: 'global', section: '背景', key: '职业', value: '工程师', pinned: true,
-    })
-
-    await face.upsertProfile('背景', '职业', '工程师', false)
+    await face.upsertProfile('背景', '职业', '工程师')
     expect(upsertProfile).toHaveBeenLastCalledWith({
-      user: 'global', section: '背景', key: '职业', value: '工程师', pinned: false,
+      user: 'global', section: '背景', key: '职业', value: '工程师',
     })
   })
 })

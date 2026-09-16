@@ -80,6 +80,11 @@ _METHODS: Dict[str, str] = {
     "list_profile": "list_profile",
     "upsert_profile": "upsert_profile",
     "delete_profile": "delete_profile",
+    # The profile is user-owned: candidates are read out of the facts for the
+    # dsh-side LLM to turn into suggestions, and the accepted ones are written
+    # back in one batch.
+    "profile_candidates": "profile_candidates",
+    "write_profile": "write_profile",
     "backup": "backup",
     "restore": "restore",
     # Lifecycle: the archive tier, erasure, housekeeping, and the write outcomes

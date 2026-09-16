@@ -63,7 +63,7 @@ pip install -e .
 | 模型可见工具 | `memory_add`、`memory_replace`、`memory_recall`、`memory_get`、`memory_summary`、`memory_snapshot`、`memory_forget`、`memory_summary_detail`、`memory_user_md`、`memory_stats` |
 | 系统提示词 | 一段常驻的持久记忆意识段，外加一份在会话起始冻结一次的紧凑 `memory summary` 摘要 |
 | 会话捕获 | 尽力而为的逐消息捕获、压缩前抢救与周期性微调，只读取持久会话事件 |
-| 设置面板 | dsh 设置侧边栏中的 **记忆 / Memory** 分区：总开关、注入体积滑块、抽取模型、一个把摘要查看、可逐行 **固定** 的用户画像编辑与事实浏览/编辑归在一起的 **记忆内容** 区域，以及备份与恢复 |
+| 设置面板 | dsh 设置侧边栏中的 **记忆 / Memory** 分区：总开关、注入体积滑块、抽取模型、一个把摘要查看、用户画像编辑（手动增删改 + 「生成画像」推荐后逐条采纳，带条目上限）与事实浏览/编辑归在一起的 **记忆内容** 区域，以及备份与恢复 |
 | 存储 | 位于 `dbPath` 的单个 SQLite 文件（默认 `~/.dsh/atom-memory/memory.db`） |
 
 设置分区写入 `atom-memory` 设置命名空间，因此它拥有的六个字段实时生效、无需重启；其余字段都是部署期配置。
@@ -136,15 +136,15 @@ AtomMem (worker, retriever,     tagged background events and logs on stderr
 
 抽取则以相反方向跨越这条边界。宿主用 dsh 当前默认模型执行 LLM 抽取，并把类型化候选通过 `persist_candidates` 送回；Python 内部的规则抽取仍是回退路径，因此没有默认模型的预设会降级而不是中断。
 
-桥接方法：`start`、`stop`、`health`、`add`、`recall`、`replace`、`forget`、`forget_all`、`persist_candidates`、`summary`、`user_md`、`stats`、`list_facts`、`edit_fact`、`list_profile`、`upsert_profile`、`delete_profile`、`backup`、`restore`。
+桥接方法：`start`、`stop`、`health`、`add`、`recall`、`replace`、`forget`、`forget_all`、`persist_candidates`、`summary`、`user_md`、`stats`、`list_facts`、`edit_fact`、`list_profile`、`profile_candidates`、`write_profile`、`upsert_profile`、`delete_profile`、`backup`、`restore`。
 
 ### 一份权威事实，多个派生视图
 
-原子事实是唯一被存储的记忆。`summary` 视图（两种深度）与 `user_md` 都是由它们重建出来的投影——画像在读取时即时刷新，因此不会滞后于事实——这正是为什么编辑一条事实会同时改变所有视图，也是为什么一条被固定的画像行能够对抗该投影。按策略不存在删除：`status` 由 `active` 变为 `superseded | retracted`（更正与撤回，仍可由 `list_facts(include_retracted=True)` 列出）或 `active → archived`（被容量控制挤出，可由 `unarchive` 复原），而每一次读取都按 `active` 过滤。删除是显式且不可恢复的：`memory_forget` 带 `purge=true`，或 `forget_all(purge=true)`，会连同索引行与复用证据一并抹除。这些策略见[记忆语义](docs/memory-semantics.md)。
+原子事实是唯一被存储的记忆。`summary` 视图（两种深度）由它们重建；**用户画像是独立的持久表**，不由事实派生——条目只在你手动添加、或采纳「生成画像」的推荐时进入，只在你删除时离开，删除后不会自动回来，记忆库里的原子事实不受影响。事实仍是画像推荐的**来源**（`profile_candidates` 给出可填充的槽位，dsh 侧的模型把它们提炼成推荐，你再逐条决定保留哪些）。画像表有条目上限（`maxProfileRows`，默认 50），渲染另有 token 上限，因为画像会写进系统提示词、每个请求都要付费。按策略不存在删除：`status` 由 `active` 变为 `superseded | retracted`（更正与撤回，仍可由 `list_facts(include_retracted=True)` 列出）或 `active → archived`（被容量控制挤出，可由 `unarchive` 复原），而每一次读取都按 `active` 过滤。删除是显式且不可恢复的：`memory_forget` 带 `purge=true`，或 `forget_all(purge=true)`，会连同索引行与复用证据一并抹除。这些策略见[记忆语义](docs/memory-semantics.md)。
 
 检索融合两个彼此独立的索引——`sqlite-vec` `vec0` KNN（余弦、512 维、本地 FastEmbed 嵌入）与使用 jieba 分词的 SQLite FTS5——采用 Reciprocal Rank Fusion，再用 `0.4·rrf + 0.2·effective_importance + 0.2·recency + 0.2·trust` 重排。重要度项与近期项都不做 min-max 归一化；每查询一次的重缩放为何会同时毁掉这两项，见[复用强化](docs/reinforcement.md)。
 
-数据库 schema 通过 `PRAGMA user_version` 门控，跨五个迁移：`001` 基础表与虚拟表、`002` `type` 判别列、`003` 知识 `content` 正文、`004` `user_profile.pinned`、`005` 强化相关列以及 `fact_reinforcements` 证据日志。
+数据库 schema 通过 `PRAGMA user_version` 门控，共十个迁移：`001` 基础表与虚拟表、`002` `type` 判别列、`003` 知识 `content` 正文、`004` `user_profile.pinned`、`005` 强化相关列以及 `fact_reinforcements` 证据日志、`006` 删除冗余的 `summaries` 表、`007`–`008` 后续基础变更、`009` 空占位（其版本号被一个发布前已回滚的设计占用，但编号不能留空洞）、`010` 把画像改为用户自有的表（清空旧投影输出并删除 `user_profile.pinned`）。
 
 ### 为什么浏览器 bundle 要提交进仓库
 

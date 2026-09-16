@@ -66,6 +66,7 @@ import {
 } from '../injection-budget.ts'
 import type {
   FactEditRow, MemorySettingsFace, MemorySettingsState, ProfileEditRow,
+  ProfileSuggestion, ProfileSuggestionResult,
 } from './memory-settings-controller.ts'
 
 /** Locale key of each gear shown in the panel, smallest gear first. */
@@ -523,7 +524,10 @@ export function MemorySettingsSection(props: MemorySettingsSectionProps) {
         <ProfileEditorModal
           t={t}
           initial={profile}
+          count={state.data.profileCount ?? profile.length}
+          limit={state.data.profileLimit ?? 0}
           onSave={(rows) => props.saveAllProfile(rows)}
+          onGenerate={() => props.generateProfile()}
           onClose={() => setModal(undefined)}
         />
       ) : null}
@@ -670,30 +674,93 @@ function FactsEditorModal(props: {
 function ProfileEditorModal(props: {
   t: RowTranslate
   initial: MemorySettingsState['data']['profile']
+  /** Rows currently stored, and the cap (0 = uncapped). */
+  count: number
+  limit: number
   onSave: (rows: ProfileEditRow[]) => void
+  onGenerate: () => Promise<ProfileSuggestionResult>
   onClose: () => void
 }) {
-  const { t, initial, onSave, onClose } = props
+  const { t, initial, count, limit, onSave, onGenerate, onClose } = props
   const [rows, setRows] = useState<ProfileDraft[]>(() =>
     initial.map(r => ({
       uid: nextDraftUid(), section: r.section, key: r.key, value: r.value,
-      pinned: r.pinned === true, deleted: false,
+      deleted: false,
     })),
   )
   const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string>()
+  const [suggestions, setSuggestions] = useState<ProfileSuggestion[]>()
+  const [picked, setPicked] = useState<Set<string>>(new Set())
+  const [generating, setGenerating] = useState(false)
+  const [generateError, setGenerateError] = useState<string>()
+  const [generateNote, setGenerateNote] = useState<string>()
 
   const setRow = (index: number, patch: Partial<ProfileDraft>) =>
     setRows(prev => prev.map((r, i) => i === index ? { ...r, ...patch } : r))
 
   const addRow = () =>
     setRows(prev => [...prev, {
-      uid: nextDraftUid(), section: '', key: '', value: '', pinned: false, deleted: false,
+      uid: nextDraftUid(), section: '', key: '', value: '', deleted: false,
     }])
 
   const save = () => {
     setSaving(true)
-    void Promise.resolve(onSave(withoutUid(rows))).finally(() => { setSaving(false); onClose() })
+    setSaveError(undefined)
+    void Promise.resolve(onSave(withoutUid(rows)))
+      .then(() => onClose())
+      // Keep the editor open on refusal (e.g. the row cap): closing it would
+      // swallow the reason and the edits with it.
+      .catch((err: unknown) => setSaveError((err as Error)?.message ?? String(err)))
+      .finally(() => { setSaving(false) })
   }
+
+  const generate = () => {
+    setGenerating(true)
+    setGenerateError(undefined)
+    setGenerateNote(undefined)
+    setSuggestions(undefined)
+    void onGenerate()
+      .then(result => {
+        setSuggestions(result.suggestions)
+        setPicked(new Set(result.suggestions.map(s => suggestionId(s))))
+        if (result.suggestions.length === 0) {
+          setGenerateNote(result.full
+            ? t('generateProfileFull', { count: result.existing, limit: result.limit })
+            : t('generateProfileEmpty'))
+        }
+      })
+      .catch((err: unknown) => setGenerateError((err as Error)?.message ?? String(err)))
+      .finally(() => { setGenerating(false) })
+  }
+
+  /** Add the ticked suggestions to the draft table (they are not saved yet). */
+  const addSelected = () => {
+    const chosen = (suggestions ?? []).filter(s => picked.has(suggestionId(s)))
+    if (chosen.length === 0) return
+    setRows(prev => [
+      ...prev.filter(r => !r.deleted),
+      ...chosen.map(s => ({
+        uid: nextDraftUid(), section: s.section, key: s.key, value: s.value,
+        deleted: false,
+      })),
+    ])
+    setSuggestions(undefined)
+    setPicked(new Set())
+  }
+
+  const toggleSuggestion = (s: ProfileSuggestion) => {
+    const id = suggestionId(s)
+    setPicked(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const setAllSuggestions = (on: boolean) =>
+    setPicked(on ? new Set((suggestions ?? []).map(suggestionId)) : new Set())
 
   const footer = (
     <>
@@ -704,15 +771,25 @@ function ProfileEditorModal(props: {
     </>
   )
 
+  const editableRows = rows.filter(r => !r.deleted)
+  const projectedCount = editableRows.length
+
   return (
     <Modal t={t} title={t('profileModalTitle')} footer={footer} onClose={onClose}>
+      <div className={css.hint} style={{ marginBottom: 8 }}>
+        {limit > 0
+          ? t('profileCapacity', { count: projectedCount, limit })
+          : t('profileCapacityUnlimited', { count: projectedCount })}
+      </div>
+      {saveError ? <div className={css.hint} style={{ color: '#c0392b' }}>{saveError}</div> : null}
+
       <table className={css.editor}>
         <thead>
           <tr>
             <th>{t('profileColSection')}</th>
             <th>{t('profileColKey')}</th>
             <th>{t('profileColValue')}</th>
-            <th>{t('profileColPinned')}</th>
+            <th>{t('profileColSource')}</th>
             <th>{t('colActions')}</th>
           </tr>
         </thead>
@@ -722,16 +799,9 @@ function ProfileEditorModal(props: {
               <td><input value={row.section} disabled={row.deleted} onChange={(e) => setRow(i, { section: e.currentTarget.value })} /></td>
               <td><input value={row.key} disabled={row.deleted} onChange={(e) => setRow(i, { key: e.currentTarget.value })} /></td>
               <td><input value={row.value} disabled={row.deleted} onChange={(e) => setRow(i, { value: e.currentTarget.value })} /></td>
-              <td>
-                <input
-                  type="checkbox"
-                  className={css.pin}
-                  aria-label={t('profileColPinned')}
-                  checked={row.pinned === true}
-                  disabled={row.deleted}
-                  onChange={(e) => setRow(i, { pinned: e.currentTarget.checked })}
-                />
-              </td>
+              <td>{initial.some(r => r.section === row.section && r.key === row.key && r.source === 'generated')
+                ? t('profileSourceGenerated')
+                : t('profileSourceUser')}</td>
               <td>
                 <div className={css.editorRowActions}>
                   <button
@@ -747,8 +817,66 @@ function ProfileEditorModal(props: {
           ))}
         </tbody>
       </table>
-      <p className={css.hint} style={{ marginTop: 8 }}>{t('profilePinnedHint')}</p>
+
       <button type="button" className={css.add} style={{ marginTop: 10 }} onClick={addRow}>{t('addRow')}</button>
+
+      {/* Generation: the model proposes, the user approves. Nothing is written
+          until the row lands in the table above and the user saves. */}
+      <div style={{ marginTop: 14, borderTop: '1px solid rgba(128,128,128,0.25)', paddingTop: 10 }}>
+        <div className={css.hint}>{t('generateProfileHint')}</div>
+        <button
+          type="button"
+          className={css.btn}
+          style={{ marginTop: 6 }}
+          onClick={generate}
+          disabled={generating || saving}
+        >
+          {generating ? t('generateProfileGenerating') : t('generateProfile')}
+        </button>
+        {generateError ? (
+          <div className={css.hint} style={{ color: '#c0392b', marginTop: 6 }}>{generateError}</div>
+        ) : null}
+        {generateNote ? <div className={css.hint} style={{ marginTop: 6 }}>{generateNote}</div> : null}
+
+        {suggestions && suggestions.length > 0 ? (
+          <div style={{ marginTop: 10 }}>
+            <div className={css.hint}>{t('suggestionIntro')}</div>
+            <div style={{ display: 'flex', gap: 8, margin: '6px 0' }}>
+              <button type="button" className={css.btn} onClick={() => setAllSuggestions(true)}>{t('suggestionSelectAll')}</button>
+              <button type="button" className={css.btn} onClick={() => setAllSuggestions(false)}>{t('suggestionSelectNone')}</button>
+            </div>
+            <div aria-label={t('suggestionName')}>
+              {suggestions.map(s => (
+                <label key={suggestionId(s)} style={{ display: 'block', padding: '2px 0' }}>
+                  <input
+                    type="checkbox"
+                    checked={picked.has(suggestionId(s))}
+                    onChange={() => toggleSuggestion(s)}
+                  />{' '}
+                  <strong>{s.section}</strong>
+                  {s.key === 'value' ? '' : ` · ${s.key}`}: {s.value}
+                </label>
+              ))}
+            </div>
+            <button
+              type="button"
+              className={css.btnPrimary}
+              style={{ marginTop: 8 }}
+              onClick={addSelected}
+              disabled={picked.size === 0}
+            >
+              {t('suggestionAddSelected')}
+            </button>
+          </div>
+        ) : null}
+      </div>
+
+      <p className={css.hint} style={{ marginTop: 8 }}>{t('profileHint')}</p>
     </Modal>
   )
+}
+
+/** Stable identity of a suggestion, used for the tick set. */
+function suggestionId(s: ProfileSuggestion): string {
+  return `${s.section}\u0000${s.key}`
 }

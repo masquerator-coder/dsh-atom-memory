@@ -42,6 +42,8 @@ describe('ATOM_MEMORY_REMOTE', () => {
       'listProfile',
       'upsertProfile',
       'deleteProfile',
+      'writeProfile',
+      'generateProfile',
       'backup',
       'restore',
       'getRuntime',

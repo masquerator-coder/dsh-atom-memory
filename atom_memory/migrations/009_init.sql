@@ -1,0 +1,13 @@
+-- Placeholder: no schema change.
+--
+-- This revision number was consumed by an interim design (a `profile_deletions`
+-- tombstone table, keeping the profile an auto-refreshed projection). That
+-- design was abandoned in favour of making the profile a table the user owns —
+-- see 010_init.sql — and its migration was rolled back before release.
+--
+-- `_apply_migrations` walks revisions consecutively (current+1 .. target), so a
+-- gap in the numbering makes opening any database fail outright. The file stays
+-- as an explicit no-op rather than being skipped over, which also keeps
+-- `PRAGMA user_version` meaning the same thing it did for anyone who happened
+-- to run the interim revision.
+SELECT 1;

@@ -1,38 +1,77 @@
-"""User-profile management with source-priority upserts.
+"""The user profile: an independent table the user owns.
 
-``user_profile`` is a *derived view* over atomic facts. This module owns the
-priority rule: when the same (section, key) is written by two sources, the
-more authoritative source wins and never gets downgraded. It also derives
-profile rows from active facts and renders the profile as markdown for
-``user_md``.
+The profile is **not** derived from active facts any more. It used to be a
+projection that every read rebuilt, which made the settings panel's controls
+partly fictional: a deleted row came back on the next read (the source fact was
+still active), and a row whose fact had been retracted was never removed at all
+(the projection only ever upserted). Both follow from the same thing — the table
+was a cache, so the user's edits were addressed to the cache.
+
+What replaces it:
+
+- rows enter the profile only when the **user** accepts a generated suggestion
+  or types one;
+- rows leave it only when the **user** deletes one;
+- facts are a *source of suggestions* (:func:`suggestible_profile_entries`),
+  consumed by the LLM synthesis on the dsh side and shown to the user for
+  approval — never written straight into the table.
+
+This module owns the table's rules: what a valid row is, how many may exist,
+and how the table renders for the model.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
-from typing import Optional
+from typing import Iterable, Optional
 
 from .db import now_ms
 from .retriever import estimate_tokens
 from .validator import MULTI_VALUED_PREDICATES
 
-# Authoritative-to-weak ordering (higher = more trusted). Mirrors the
-# credibility scores in retriever.SOURCE_CREDIBILITY.
-SOURCE_RANK = {
-    "user_explicit": 100,
-    "user_confirmed": 95,
-    "external_tool": 80,
-    "system_inferred_high": 70,
-    "indirect_inferred": 60,
-    "system_inferred_low": 50,
-    "model_generated": 40,
-}
+# Provenance stored in `user_profile.source`. Distinct from the credibility
+# source tags on facts: this one answers "where did the row come from", which
+# decides nothing at runtime but tells the user which rows they wrote and which
+# they accepted from a suggestion.
+SOURCE_USER = "user"
+SOURCE_GENERATED = "generated"
+
+# Field caps for a stored row. A profile row is one line in the prompt, so a
+# runaway value must not be able to push the render budget out on its own.
+_MAX_SECTION_CHARS = 200
+_MAX_KEY_CHARS = 200
+_MAX_VALUE_CHARS = 2000
 
 
-def source_priority(source: str) -> int:
-    """Return the numeric priority of a source (higher is more trusted)."""
-    return int(SOURCE_RANK.get(source, 0))
+class ProfileLimitExceeded(Exception):
+    """A write was refused because the profile is at its row cap.
+
+    Carries the numbers so the caller can report a real limit rather than a
+    generic failure — "50/50" is actionable, "write failed" is not.
+    """
+
+    def __init__(self, limit: int, current: int) -> None:
+        self.limit = limit
+        self.current = current
+        super().__init__(
+            f"用户画像已达上限（{current}/{limit} 条）：请先删除部分条目再新增"
+        )
+
+
+def profile_row_count(conn: sqlite3.Connection, user_id: str) -> int:
+    """Return how many rows the user's profile currently holds."""
+    return int(
+        conn.execute(
+            "SELECT COUNT(*) AS n FROM user_profile WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()["n"]
+    )
+
+
+def _clean(text: object, limit: int) -> str:
+    """Normalise one stored field: stripped, single-spaced, length-bounded."""
+    return " ".join(str(text or "").split())[:limit]
 
 
 def upsert_profile(
@@ -41,129 +80,193 @@ def upsert_profile(
     section: str,
     key: str,
     value: str,
-    source: str = "system_inferred",
-    confidence: float = 0.5,
-    privacy: str = "private",
-    pinned: Optional[bool] = None,
+    source: str = SOURCE_USER,
 ) -> bool:
-    """Insert or update a profile row under source-priority rules.
+    """Insert or update one profile row.
 
-    If the key already exists with a *more* authoritative source, the incoming
-    (weaker) value is dropped and ``False`` is returned. Otherwise the row is
-    written (or upgraded) and ``True`` is returned.
-
-    A **pinned** row (the user's 固定 flag) is frozen against this path
-    entirely: the projection from facts is derived, and a derived write must
-    never update or replace something the user declared fixed. Passing ``pinned``
-    — ``True`` or ``False`` — is the pin owner's write (the settings panel
-    deciding the row's state, including releasing it), and is the only way
-    through; every automatic caller leaves ``pinned`` at ``None``.
+    Updating an *existing* row never counts against the cap (it does not add a
+    row), so editing stays available even at the cap; only a genuinely new
+    ``(section, key)`` can be refused, and the cap itself is enforced by the
+    caller that knows the config (see :func:`write_profile_rows`).
 
     Args:
         conn: The SQLite connection.
-        user_id: Owner of the profile row.
-        section: Profile section (e.g. a predicate like ``职业``).
-        key: Key within the section.
+        user_id: Owner of the profile.
+        section: Profile section (a label like ``职业`` or ``偏好``).
+        key: Key within the section (``value`` for simple rows).
         value: The stored value.
-        source: Credibility source tag.
-        confidence: 0..1 confidence.
-        privacy: Privacy tag.
-        pinned: New pin state; ``None`` keeps the row's current state (and means
-            "not pinned" for a brand-new row).
+        source: ``user`` for a typed row, ``generated`` for an accepted
+            suggestion.
 
     Returns:
-        ``True`` if the write was applied, ``False`` if a stronger source
-        already held the key or the row is pinned and the caller did not state a
-        pin state.
+        ``True`` when the row was written.
     """
-    existing = conn.execute(
-        "SELECT source, pinned FROM user_profile "
-        "WHERE user_id = ? AND section = ? AND key = ?",
-        (user_id, section, key),
-    ).fetchone()
-
-    if existing is not None and bool(existing["pinned"]) and pinned is None:
-        return False
-
-    if existing is not None and source_priority(source) < source_priority(
-        existing["source"]
-    ):
-        return False
-
-    if pinned is None:
-        pinned_flag = int(bool(existing["pinned"])) if existing is not None else 0
-    else:
-        pinned_flag = int(bool(pinned))
-
     conn.execute(
         "INSERT INTO user_profile(user_id, section, key, value, source, "
-        "confidence, privacy, pinned, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "confidence, privacy, updated_at) VALUES (?, ?, ?, ?, ?, 0.9, "
+        "'private', ?) "
         "ON CONFLICT(user_id, section, key) DO UPDATE SET "
         "value = excluded.value, source = excluded.source, "
-        "confidence = excluded.confidence, privacy = excluded.privacy, "
-        "pinned = excluded.pinned, updated_at = excluded.updated_at",
-        (user_id, section, key, value, source, confidence, privacy, pinned_flag, now_ms()),
+        "updated_at = excluded.updated_at",
+        (user_id, section, key, value, source, now_ms()),
     )
     conn.commit()
     return True
 
 
-def derive_profile_from_facts(conn: sqlite3.Connection, user_id: str) -> int:
-    """Rebuild the user's profile from their active facts.
+def write_profile_rows(
+    conn: sqlite3.Connection,
+    user_id: str,
+    rows: Iterable[dict],
+    limit: int = 0,
+    source: str = SOURCE_USER,
+) -> dict:
+    """Apply a batch of row edits (upserts and deletions) atomically.
 
-    Mapping:
-        - single-valued attribute facts  -> (section=predicate, key='value',
-          value=object)
-        - multi-valued preference facts  -> (section='偏好', key=object,
-          value='喜欢'/'不喜欢')
-
-    Existing rows are updated under source priority, so more recent,
-    more-authoritative facts can override but never get downgraded. Rows the
-    user pinned are skipped outright — this projection is derived, and a fixed
-    row is by definition not the projection's to change.
+    This is what the settings panel's one "save all" button drives. The cap is
+    checked up front against the size the table *would* have, so a rejected
+    batch leaves the table exactly as it was — no half-applied edit list, which
+    is the failure mode that makes an editor untrustworthy.
 
     Args:
         conn: The SQLite connection.
         user_id: Owner of the profile.
+        rows: Each row is ``{"section", "key", "value", "deleted"?}``.
+        limit: Row cap; ``0`` disables it.
+        source: Provenance tag for the rows this batch writes.
 
     Returns:
-        Number of profile rows written or updated.
+        ``{"written", "deleted"}`` counts.
+
+    Raises:
+        ProfileLimitExceeded: The batch would push the table past ``limit``.
+        ValueError: A row is missing its section or key.
+    """
+    cleaned: list = []
+    for row in rows:
+        section = _clean(row.get("section"), _MAX_SECTION_CHARS)
+        key = _clean(row.get("key"), _MAX_KEY_CHARS)
+        value = _clean(row.get("value"), _MAX_VALUE_CHARS)
+        deleted = bool(row.get("deleted"))
+        # Every row — including a deletion — has to identify its target.
+        if not section or not key:
+            raise ValueError("profile section and key are required")
+        cleaned.append((section, key, value, deleted))
+
+    if limit > 0:
+        existing = {
+            (r["section"], r["key"])
+            for r in conn.execute(
+                "SELECT section, key FROM user_profile WHERE user_id = ?",
+                (user_id,),
+            ).fetchall()
+        }
+        projected = set(existing)
+        for section, key, _value, deleted in cleaned:
+            if deleted:
+                projected.discard((section, key))
+            else:
+                projected.add((section, key))
+        if len(projected) > limit:
+            raise ProfileLimitExceeded(limit, len(projected))
+
+    written = 0
+    deleted_count = 0
+    for section, key, value, deleted in cleaned:
+        if deleted:
+            deleted_count += int(delete_profile_row(conn, user_id, section, key))
+        else:
+            upsert_profile(conn, user_id, section, key, value, source=source)
+            written += 1
+
+    return {"written": written, "deleted": deleted_count}
+
+
+def delete_profile_row(
+    conn: sqlite3.Connection, user_id: str, section: str, key: str
+) -> bool:
+    """Delete one profile row.
+
+    This is now a *real* delete: nothing re-derives the table, so the row stays
+    gone. The underlying facts are untouched — the attribute is still remembered
+    and still recallable, it is simply not a profile entry any more.
+
+    Returns:
+        ``True`` when a row was removed.
+    """
+    cur = conn.execute(
+        "DELETE FROM user_profile WHERE user_id = ? AND section = ? AND key = ?",
+        (user_id, section, key),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def list_profile_rows(conn: sqlite3.Connection, user_id: str) -> list:
+    """Read the user's profile rows, ordered for display."""
+    return conn.execute(
+        "SELECT section, key, value, source, privacy, updated_at "
+        "FROM user_profile WHERE user_id = ? ORDER BY section, key",
+        (user_id,),
+    ).fetchall()
+
+
+def known_profile_keys(conn: sqlite3.Connection, user_id: str) -> set:
+    """Return the ``(section, key)`` pairs already in the profile.
+
+    The suggestion path excludes these, so a generation run never offers back
+    something the user already has.
+    """
+    return {
+        (r["section"], r["key"])
+        for r in conn.execute(
+            "SELECT section, key FROM user_profile WHERE user_id = ?",
+            (user_id,),
+        ).fetchall()
+    }
+
+
+def suggestible_profile_entries(conn: sqlite3.Connection, user_id: str) -> list:
+    """Collect the profile entries the active facts *imply*, as suggestions.
+
+    This is the original projection rule, reused as a suggestion source rather
+    than as a writer: single-valued attributes imply ``(predicate, 'value')``
+    and multi-valued preferences imply ``('偏好', object)``. Nothing is written
+    to the table — the result is candidate material for the LLM synthesis, which
+    the user then approves entry by entry.
+
+    Returns:
+        ``[{"section", "key", "value"}]``, de-duplicated by ``(section, key)``
+        and ordered deterministically.
     """
     facts = conn.execute(
-        "SELECT subject, predicate, object, qualifiers, confidence, "
-        "privacy, source_type, type FROM facts "
+        "SELECT predicate, object, qualifiers, type FROM facts "
         "WHERE user_id = ? AND status = 'active'",
         (user_id,),
     ).fetchall()
 
-    written = 0
+    seen: set = set()
+    out: list = []
     for f in facts:
-        # The profile answers "who is the user", so it only reflects semantic
-        # knowledge (preferences / attributes). Procedural workflows and
-        # episodic events are not profile attributes and are skipped.
         if (f["type"] or "semantic") != "semantic":
             continue
         predicate = f["predicate"]
         if predicate in MULTI_VALUED_PREDICATES:
-            # Preference: section 偏好, key = object, value = like/dislike.
-            neg = _negation(f["qualifiers"])
-            section, key, value = "偏好", f["object"], ("不喜欢" if neg else "喜欢")
+            section = "偏好"
+            key = _clean(f["object"], _MAX_KEY_CHARS)
+            value = "不喜欢" if _negation(f["qualifiers"]) else "喜欢"
         else:
-            # Single-valued attribute: section = predicate, key = value.
-            section, key, value = predicate, "value", f["object"]
-
-        if upsert_profile(
-            conn,
-            user_id,
-            section,
-            key,
-            value,
-            source=f["source_type"],
-            confidence=f["confidence"],
-            privacy=f["privacy"],
-        ):
-            written += 1
-    return written
+            section = _clean(predicate, _MAX_SECTION_CHARS)
+            key = "value"
+            value = _clean(f["object"], _MAX_VALUE_CHARS)
+        if not section or not key or not value:
+            continue
+        if (section, key) in seen:
+            continue
+        seen.add((section, key))
+        out.append({"section": section, "key": key, "value": value})
+    out.sort(key=lambda r: (r["section"], r["key"]))
+    return out
 
 
 def profile_md(
@@ -173,6 +276,11 @@ def profile_md(
 ) -> str:
     """Render the user's profile as markdown for ``user_md``.
 
+    The rendering budget is a second, independent bound from the row cap: the
+    table holds at most ``MemConfig.max_profile_rows`` rows, and this caps what
+    those rows may cost in the prompt. Rows past the budget are left out *with a
+    count*, so a truncated profile says so instead of looking complete.
+
     Args:
         conn: The SQLite connection.
         user_id: Owner of the profile.
@@ -181,11 +289,7 @@ def profile_md(
     Returns:
         Markdown string, or a notice when the profile is empty.
     """
-    rows = conn.execute(
-        "SELECT section, key, value, source, pinned FROM user_profile "
-        "WHERE user_id = ? ORDER BY section, key",
-        (user_id,),
-    ).fetchall()
+    rows = list_profile_rows(conn, user_id)
 
     if not rows:
         return (
@@ -195,29 +299,28 @@ def profile_md(
 
     lines = [f"# 用户画像 (User Profile) — {user_id}", ""]
     budget = max_tokens
+    rendered = 0
     for r in rows:
         line = _render_row(r)
-        if estimate_tokens(line) > budget:
+        cost = estimate_tokens(line)
+        if cost > budget:
             break
         lines.append(line)
-        budget -= estimate_tokens(line)
+        budget -= cost
+        rendered += 1
 
+    if rendered < len(rows):
+        lines.append(f"（另有 {len(rows) - rendered} 条未展示）")
     return "\n".join(lines)
 
 
 def _render_row(r) -> str:
-    """Render one profile row, including its key when it is not 'value'.
-
-    Pinned rows carry an explicit 固定 marker: a reader (the model, through the
-    ``memory_user_md`` tool) should know which attributes the user froze against
-    automatic memory, since those are the ones whose stability is deliberate.
-    """
+    """Render one profile row, including its key when it is not 'value'."""
     if r["key"] == "value":
         body = f"**{r['section']}**: {r['value']}"
     else:
         body = f"**{r['section']}**: {r['key']} = {r['value']}"
-    pinned = " · 固定" if r["pinned"] else ""
-    return f"- {body}  *(来源 {r['source']}{pinned})*"
+    return f"- {body}"
 
 
 def _negation(qualifiers: Optional[str]) -> bool:

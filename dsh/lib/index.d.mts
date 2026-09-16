@@ -98,10 +98,19 @@ interface Config {
    *
    * When exceeded, the maintenance pass moves the least valuable *unprotected*
    * facts to the archive tier — never deletes them, and never touches facts
-   * that are fresh, reinforced, durable knowledge, or backing a pinned profile
-   * row.
+   * that are fresh, reinforced, or durable knowledge.
    */
   maxActiveFacts?: number;
+  /**
+   * Hard cap on the number of user-profile rows. `0` disables the cap.
+   *
+   * The profile is rendered into the session system prompt through `user_md`,
+   * so every row is a cost paid on every request: this is what keeps that cost
+   * bounded. A write that would exceed it is refused with the count and the
+   * limit (editing an existing row is always allowed), rather than silently
+   * dropping the oldest entry.
+   */
+  maxProfileRows?: number;
   /**
    * Per-fact ceiling inside one recall result, in estimated tokens.
    *

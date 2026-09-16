@@ -47,7 +47,10 @@ export interface MemoryData {
     type?: string
     content?: string
   }>
-  profile: Array<{ section: string; key: string; value: string; pinned?: boolean }>
+  profile: Array<{ section: string; key: string; value: string; source?: string }>
+  /** Row cap and current count for the profile table (`limit` 0 = uncapped). */
+  profileCount?: number
+  profileLimit?: number
   /** The rendered `summary` view (injected system-prompt memory), lazy-loaded. */
   summary?: string
 }
@@ -90,12 +93,18 @@ export interface MemorySettingsFace {
   deleteFact: (factId: string) => Promise<void>
   /** Lazy-load the user's compact summary (the view injected into the prompt). */
   fetchSummary: () => Promise<string>
-  upsertProfile: (section: string, key: string, value: string, pinned: boolean) => Promise<void>
+  upsertProfile: (section: string, key: string, value: string) => Promise<void>
   deleteProfile: (section: string, key: string) => Promise<void>
   /** Batch-save an Excel-style facts table (edit changed rows, delete marked rows) in one pass. */
   saveAllFacts: (rows: FactEditRow[]) => Promise<void>
-  /** Batch-save an Excel-style profile table (upsert changed rows, delete marked rows) in one pass. */
+  /** Batch-save the profile table (upsert changed rows, delete marked rows) in one pass. */
   saveAllProfile: (rows: ProfileEditRow[]) => Promise<void>
+  /**
+   * Ask the store + model for profile entries to propose, excluding rows the
+   * profile already has. Returns the proposals for the user to approve; nothing
+   * is written until {@link saveAllProfile} is called with them.
+   */
+  generateProfile: () => Promise<ProfileSuggestionResult>
   backup: () => Promise<Record<string, unknown>>
   restore: (payload: Record<string, unknown>) => Promise<{ facts_written: number; profile_written: number }>
 }
@@ -117,13 +126,26 @@ export interface ProfileEditRow {
   section: string
   key: string
   value: string
-  /**
-   * Pinned rows are frozen against the memory pipeline: derived writes from
-   * facts never update or replace them. Only this editor changes a pinned row.
-   */
-  pinned?: boolean
-  /** Marked for deletion when saving. */
+  /** Marked for deletion when saving. The section/key still identify the row. */
   deleted?: boolean
+}
+
+/** One generated profile entry awaiting approval. */
+export interface ProfileSuggestion {
+  section: string
+  key: string
+  value: string
+}
+
+/** The outcome of a "生成画像" run. */
+export interface ProfileSuggestionResult {
+  suggestions: ProfileSuggestion[]
+  /** Rows already in the profile. */
+  existing: number
+  /** Row cap; 0 means uncapped. */
+  limit: number
+  /** The table is at its cap, so nothing can be accepted until a row is freed. */
+  full: boolean
 }
 
 /** A minimal view of the wire result the client namespace methods resolve to.
@@ -154,9 +176,11 @@ interface RemoteAtomMemory {
   }): Promise<WireResult<unknown>>
   deleteFact(args: { user: string; fact_id: string }): Promise<WireResult<unknown>>
   summary(args: { user: string; maxTokens?: number }): Promise<WireResult<string>>
-  listProfile(args: { user: string }): Promise<WireResult<{ profile: MemoryData['profile'] }>>
-  upsertProfile(args: { user: string; section: string; key: string; value: string; pinned?: boolean }): Promise<WireResult<unknown>>
+  listProfile(args: { user: string }): Promise<WireResult<{ profile: MemoryData['profile']; count?: number; limit?: number }>>
+  upsertProfile(args: { user: string; section: string; key: string; value: string }): Promise<WireResult<unknown>>
   deleteProfile(args: { user: string; section: string; key: string }): Promise<WireResult<unknown>>
+  writeProfile(args: { user: string; rows: ProfileEditRow[] }): Promise<WireResult<unknown>>
+  generateProfile(args: { user: string }): Promise<WireResult<ProfileSuggestionResult>>
   backup(args: { user: string }): Promise<WireResult<Record<string, unknown>>>
   restore(args: { user: string; payload: Record<string, unknown> }): Promise<WireResult<{ facts_written: number; profile_written: number }>>
 }
@@ -213,10 +237,11 @@ export class MemorySettingsController {
       saveFact: (fact) => this.saveFact(fact),
       deleteFact: (factId) => this.deleteFact(factId),
       fetchSummary: () => this.fetchSummary(),
-      upsertProfile: (section, key, value, pinned) => this.upsertProfile(section, key, value, pinned),
+      upsertProfile: (section, key, value) => this.upsertProfile(section, key, value),
       deleteProfile: (section, key) => this.deleteProfile(section, key),
       saveAllFacts: (rows) => this.saveAllFacts(rows),
       saveAllProfile: (rows) => this.saveAllProfile(rows),
+      generateProfile: () => this.generateProfile(),
       backup: () => this.backup(),
       restore: (payload) => this.restore(payload),
     }
@@ -255,6 +280,8 @@ export class MemorySettingsController {
         data: {
           facts: Array.isArray(facts.facts) ? facts.facts : [],
           profile: Array.isArray(profile.profile) ? profile.profile : [],
+          profileCount: Number(profile.count ?? (Array.isArray(profile.profile) ? profile.profile.length : 0)),
+          profileLimit: Number(profile.limit ?? 0),
         },
         lastError: undefined,
       })
@@ -312,9 +339,9 @@ export class MemorySettingsController {
     }
   }
 
-  private async upsertProfile(section: string, key: string, value: string, pinned: boolean): Promise<void> {
+  private async upsertProfile(section: string, key: string, value: string): Promise<void> {
     try {
-      await this.r().upsertProfile({ user: USER, section, key, value, pinned })
+      await this.r().upsertProfile({ user: USER, section, key, value })
       await this.refreshData()
     } catch (err) {
       this.store.set({
@@ -361,21 +388,31 @@ export class MemorySettingsController {
 
   private async saveAllProfile(rows: ProfileEditRow[]): Promise<void> {
     try {
-      for (const row of rows) {
-        if (row.deleted) {
-          await this.r().deleteProfile({ user: USER, section: row.section, key: row.key })
-        } else {
-          await this.r().upsertProfile({
-            user: USER, section: row.section, key: row.key, value: row.value,
-            pinned: row.pinned === true,
-          })
-        }
-      }
+      // One batch call rather than a row-by-row loop: the store enforces the
+      // row cap on the whole batch, so a save that would exceed it is refused
+      // as a unit and the table keeps its previous state. A per-row loop could
+      // apply half the edits and then fail on the row that crossed the cap.
+      // `unwrap` matters here: without it a `{ok:false}` refusal would be read
+      // as success and the panel would report a save that never happened.
+      unwrap(await this.r().writeProfile({ user: USER, rows }))
       await this.refreshData()
     } catch (err) {
-      this.store.set({
-        ...this.store.getSnapshot(), lastError: (err as Error)?.message ?? String(err),
-      })
+      const message = (err as Error)?.message ?? String(err)
+      this.store.set({ ...this.store.getSnapshot(), lastError: message })
+      // The panel's save handler closes the modal unconditionally, so a refusal
+      // would otherwise vanish. Re-throw to let it keep the editor open.
+      throw err
+    }
+  }
+
+  private async generateProfile(): Promise<ProfileSuggestionResult> {
+    const result = unwrap(await this.r().generateProfile({ user: USER }))
+    const suggestions = Array.isArray(result?.suggestions) ? result.suggestions : []
+    return {
+      suggestions,
+      existing: Number(result?.existing ?? 0),
+      limit: Number(result?.limit ?? 0),
+      full: result?.full === true,
     }
   }
 

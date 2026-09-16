@@ -1500,9 +1500,7 @@ class Worker:
           enough that no reuse could have been observed yet
           (``archive_protect_days``), facts with any reinforcement evidence
           (someone has used them), durable knowledge types (decision rule,
-          lesson, SOP — the material whose value is least time-dependent), and
-          facts whose predicate backs a **pinned** profile row (the user
-          declared that row fixed).
+          lesson, SOP — the material whose value is least time-dependent).
         - **Order** — everything else is archived oldest-and-least-important
           first, by its *effective* importance (base rank, plus the decayed
           reuse bonus), so a fact that was once heavily used but has not been
@@ -1532,20 +1530,6 @@ class Worker:
         cutoff = now_ms() - protect_ms
         durable = {"decision_rule", "lesson", "sop"}
 
-        # A pinned profile row protects the facts whose predicate it mirrors.
-        pinned_sections: set = set()
-        if rows:
-            users = {r["user_id"] for r in rows}
-            for user in users:
-                pinned_sections.update(
-                    r["section"]
-                    for r in self.conn.execute(
-                        "SELECT section FROM user_profile "
-                        "WHERE user_id = ? AND pinned = 1",
-                        (user,),
-                    ).fetchall()
-                )
-
         by_user: dict = {}
         for row in rows:
             by_user.setdefault(row["user_id"], []).append(row)
@@ -1562,8 +1546,6 @@ class Worker:
                 if float(row["reinforce_count"] or 0.0) > 0.0:
                     continue  # there is evidence of reuse
                 if (row["type"] or "semantic") in durable:
-                    continue
-                if (row["predicate"] or "") in pinned_sections:
                     continue
                 candidates.append(
                     (

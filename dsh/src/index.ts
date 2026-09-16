@@ -42,7 +42,7 @@ import { PythonBridge, defaultSpawn } from './bridge.ts'
 import { registerMemoryTools } from './tools.ts'
 import { registerMemoryContext } from './context.ts'
 import { registerCapture } from './capture.ts'
-import { buildLlmExtractor, type ExtractFn } from './llm-extractor.ts'
+import { buildLlmCompleter, buildLlmExtractor, type ExtractFn } from './llm-extractor.ts'
 import { checkPythonSide, type PreflightResult } from './preflight.ts'
 import {
   createRuntime, SETTINGS_NAMESPACE, type LiveRuntime, Runtime,
@@ -107,6 +107,9 @@ function buildStartParams(config: ConfigShape): Record<string, unknown> {
   }
   if (config.maxActiveFacts !== undefined) {
     params.max_active_facts = config.maxActiveFacts
+  }
+  if (config.maxProfileRows !== undefined) {
+    params.max_profile_rows = config.maxProfileRows
   }
   if (config.maxFactTokens !== undefined) {
     params.max_fact_tokens = config.maxFactTokens
@@ -234,12 +237,25 @@ export function apply(ctx: Context, config: ConfigShape): void {
     enabled: llmEnabled,
   })
 
+  // Profile synthesis ("生成画像") shares the extraction model — it is the same
+  // "turn memory into structured entries" job at a different granularity, and
+  // making the user configure a second model for it would be a second thing to
+  // get wrong. Unlike extraction this is user-triggered, so it is not gated on
+  // `llmExtractionEnabled` (which governs the automatic capture path): the
+  // master switch still applies.
+  const synthesizeProfile = buildLlmCompleter(ctx, {
+    maxTokens: config.extractionMaxTokens ?? 2048,
+    modelOverride: () => runtime.get().extractionModel,
+    enabled: () => runtime.isEnabled(),
+    label: 'profile synthesis',
+  })
+
   // The panel's data operations (features 3-5) are served to the browser over
   // the Remote gateway; registration is reversible with the controller. The
   // gateway protocol is optional — if this deployment lacks it, features 3-5
   // are simply unavailable in the browser and the plugin degrades gracefully.
   try {
-    new AtomMemoryController(ctx, bridge, runtime, () => state.error)
+    new AtomMemoryController(ctx, bridge, runtime, () => state.error, synthesizeProfile)
   } catch (err) {
     ctx.logger(`[atom-memory] remote controller unavailable (${(err as Error)?.message ?? err})`)
   }

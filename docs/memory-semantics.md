@@ -262,24 +262,44 @@ mistaken for an empty one.
 
 ---
 
-## 7. The profile is a projection, refreshed when it is read
+## 7. The profile is a table the user owns
 
-**Rule.** `user_profile` is derived from the active facts: any read of the
-profile (`list_profile`, `user_md`) re-derives it first. Explicit rows the user
-created are preserved, pinned rows resist the projection, and both keep their own
-`source`.
+**Rule.** `user_profile` is an independent, persistent table. Rows enter it only
+when the user accepts a generated suggestion or types one, and leave it only
+when the user deletes one. Facts are never a writer: reading the profile does
+not rebuild it, and learning a fact does not add, update or remove a row.
+Entries whose source fact is later retracted stay until the user removes them.
 
-**Why.** A projection that is only refreshed on writes leaves a window in which
-the profile describes facts the store no longer holds — and restore/import is a
-write path that never went through the projection at all. Refreshing at read time
-removes the window without adding write amplification, and it is the only
-placement that survives every path into the data.
+Generation is user-triggered and never writes: the aggregation in
+`profile_candidates` offers the slots the active facts imply, the LLM (on the
+dsh side) curates them into proposals, and `write_profile` is what actually
+stores the ones the user approved. The table is capped
+(`MemConfig.max_profile_rows`, default 50) and the render is capped separately
+(`user_md_token_limit`); a saturated table refuses *new* keys but keeps
+accepting edits to existing rows, and the render says how many rows it could not
+fit.
 
-**Owner.** `atom_memory/api.py` — `list_profile`, `user_md`,
-`derive_profile_from_facts`.
+**Why.** The profile used to be a projection rebuilt on every read, which made
+the panel's controls partly fictional in two directions at once: deleting a row
+came back on the next read (the source fact was still active, so it was
+re-derived), and a row whose fact had been retracted was never removed (the
+projection only ever upserted). Both follow from the table being a *cache* — the
+user's edits were addressed to the cache, not to the memory. Making it a table
+the user owns is what makes an edit mean what the user expects. It also bounds
+the cost honestly: the profile is rendered into the session system prompt, so
+every row is paid for on every request, and a cap plus a render budget is what
+keeps that from growing on its own.
 
-**Tests.** `tests/test_lifecycle.py::test_profile_is_refreshed_on_read`,
-`tests/test_ui_api.py::test_pinned_profile_row_survives_the_facts_projection`.
+**Owner.** `atom_memory/profile.py` — `write_profile_rows`,
+`delete_profile_row`, `suggestible_profile_entries`, `profile_md`;
+`atom_memory/api.py` — `list_profile`, `profile_candidates`, `write_profile`,
+`upsert_profile`, `delete_profile`, `user_md`; `dsh/src/profile-synthesis.ts` —
+the curation prompt.
+
+**Tests.** `tests/test_ui_api.py::test_learning_a_fact_does_not_create_a_profile_row`,
+`test_profile_rows_are_capped`, `test_write_profile_batch_is_all_or_nothing`;
+`tests/test_lifecycle.py::test_learning_facts_does_not_touch_the_profile`;
+`tests/test_retriever.py::test_suggestible_entries_mirror_the_old_projection_rule`.
 
 ---
 

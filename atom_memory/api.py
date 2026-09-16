@@ -24,7 +24,17 @@ from .backup import export_memory, import_memory, validate_backup
 from .config import MemConfig
 from .db import index_orphans, now_ms, open_db, record_event
 from .embedder import Embedder
-from .profile import derive_profile_from_facts, profile_md
+from .profile import (
+    SOURCE_USER,
+    ProfileLimitExceeded,
+    delete_profile_row,
+    known_profile_keys,
+    list_profile_rows,
+    profile_md,
+    profile_row_count,
+    suggestible_profile_entries,
+    write_profile_rows,
+)
 from .reinforce import (
     KIND_USER_CONFIRMED,
     ReinforceCurve,
@@ -550,7 +560,9 @@ class AtomMem:
     async def user_md(self, user_id: str, max_tokens: int = 800) -> str:
         """Render the user's profile as markdown.
 
-        The profile is (re)derived from active facts before rendering.
+        A plain render of the profile table — it is *not* re-derived from the
+        facts first (it used to be, which is what silently undid the panel's
+        deletions). Entries reach the table only through the user.
 
         Args:
             user_id: The user whose profile is rendered.
@@ -561,7 +573,6 @@ class AtomMem:
         """
         if self.db is None:
             raise RuntimeError("AtomMem is not started; call start() first")
-        derive_profile_from_facts(self.db, user_id)
         return profile_md(self.db, user_id, max_tokens)
 
     # -- mutation surface -----------------------------------------------------------
@@ -968,29 +979,22 @@ class AtomMem:
     def list_profile(self, user_id: str) -> dict:
         """List a user's profile rows for the settings UI.
 
-        The profile is a *projection* over the active facts, and this read
-        refreshes it first: a derived view that is only rebuilt when someone
-        happens to call ``user_md`` goes stale, and a stale profile row is
-        indistinguishable from a fact that was never learned. The refresh is
-        idempotent and respects pins and source priority, so reading cannot
-        downgrade anything.
+        A plain read. The profile is an independent table now, not a projection
+        over the facts, so reading it must not rebuild it — reading used to be a
+        write, which is exactly what made the panel's deletes come back.
 
         Args:
             user_id: Owner of the profile.
 
         Returns:
-            ``{"profile": [...]}`` rows with ``section`` / ``key`` / ``value`` /
-            ``source`` / ``privacy`` / ``pinned`` (whether the row is fixed
-            against automatic memory updates).
+            ``{"profile": [...], "count": n, "limit": n}``. Each row carries
+            ``section`` / ``key`` / ``value`` / ``source`` / ``privacy``, where
+            ``source`` is ``user`` (typed by the user) or ``generated``
+            (accepted from a suggestion).
         """
         if self.db is None:
             raise RuntimeError("AtomMem is not started; call start() first")
-        derive_profile_from_facts(self.db, user_id)
-        rows = self.db.execute(
-            "SELECT section, key, value, source, privacy, pinned FROM user_profile "
-            "WHERE user_id = ? ORDER BY section, key",
-            (user_id,),
-        ).fetchall()
+        rows = list_profile_rows(self.db, user_id)
         return {
             "profile": [
                 {
@@ -999,10 +1003,82 @@ class AtomMem:
                     "value": r["value"],
                     "source": r["source"],
                     "privacy": r["privacy"],
-                    "pinned": bool(r["pinned"]),
                 }
                 for r in rows
-            ]
+            ],
+            "count": len(rows),
+            "limit": int(self.config.max_profile_rows or 0),
+        }
+
+    def profile_candidates(self, user_id: str) -> dict:
+        """Return the profile entries the active facts imply, as raw material.
+
+        Nothing is written: these are the candidate entries the dsh-side LLM
+        synthesis turns into suggestions for the user to approve. Entries whose
+        ``(section, key)`` is already in the profile are excluded here, so a
+        generation run cannot offer back what the user already has.
+
+        Args:
+            user_id: Owner of the profile.
+
+        Returns:
+            ``{"candidates", "existing_keys", "existing", "limit", "remaining"}``.
+            ``existing_keys`` carries the profile's own ``[section, key]`` pairs
+            so the caller can filter suggestions without a second round trip
+            (and without racing a concurrent edit between the two reads).
+        """
+        if self.db is None:
+            raise RuntimeError("AtomMem is not started; call start() first")
+        known = known_profile_keys(self.db, user_id)
+        candidates = [
+            c
+            for c in suggestible_profile_entries(self.db, user_id)
+            if (c["section"], c["key"]) not in known
+        ]
+        limit = int(self.config.max_profile_rows or 0)
+        used = profile_row_count(self.db, user_id)
+        return {
+            "candidates": candidates,
+            "existing_keys": sorted([section, key] for section, key in known),
+            "existing": used,
+            "limit": limit,
+            # How many more rows the table can take; 0 means "full" (or
+            # uncapped, which `limit == 0` distinguishes).
+            "remaining": max(0, limit - used) if limit > 0 else 0,
+        }
+
+    def write_profile(self, user_id: str, rows: List[dict]) -> dict:
+        """Apply a batch of profile edits (upserts + deletions) in one pass.
+
+        This is the settings panel's "save all". The row cap is enforced on the
+        whole batch before anything is written, so a rejected batch changes
+        nothing.
+
+        Args:
+            user_id: Owner of the profile.
+            rows: Each ``{"section", "key", "value", "deleted"?}``.
+
+        Returns:
+            ``{"ok": True, "written": n, "deleted": n, "count": n, "limit": n}``.
+
+        Raises:
+            ValueError: A row is missing its section or key.
+            ProfileLimitExceeded: The batch would exceed ``max_profile_rows``.
+        """
+        if self.db is None:
+            raise RuntimeError("AtomMem is not started; call start() first")
+        result = write_profile_rows(
+            self.db,
+            user_id,
+            rows,
+            limit=int(self.config.max_profile_rows or 0),
+        )
+        return {
+            "ok": True,
+            "written": result["written"],
+            "deleted": result["deleted"],
+            "count": profile_row_count(self.db, user_id),
+            "limit": int(self.config.max_profile_rows or 0),
         }
 
     def upsert_profile(
@@ -1011,29 +1087,24 @@ class AtomMem:
         section: str,
         key: str,
         value: str,
-        pinned: Optional[bool] = None,
     ) -> dict:
-        """Add or update one user-profile row (user-invoked UI edit).
+        """Add or update one user-profile row (a user edit from the panel).
 
-        Rows written here are tagged with the most-authoritative ``user_explicit``
-        source so they are never silently downgraded by later derived writes.
-
-        This is the one write path that may touch a **pinned** row: the pin's
-        owner is the human in the panel, so editing a value here — or flipping
-        the pin itself — has to work, or a pinned row could never be corrected
-        or released. Every automatic path goes through
-        :func:`atom_memory.profile.upsert_profile`, which refuses pinned rows.
+        Refused when it would add a row past ``max_profile_rows``; updating an
+        existing row is always allowed, so a full profile can still be edited.
 
         Args:
             user_id: Owner of the profile.
-            section: Profile section (predicate).
+            section: Profile section (a label like ``职业`` or ``偏好``).
             key: Key within the section (use ``"value"`` for simple rows).
             value: The stored value.
-            pinned: New pin state; ``None`` keeps the row's current state (and
-                means unpinned for a new row).
 
         Returns:
-            ``{"ok": True, "pinned": bool}``.
+            ``{"ok": True, "source": "user", "count": n, "limit": n}``.
+
+        Raises:
+            ValueError: Section or key is blank.
+            ProfileLimitExceeded: The write would exceed the row cap.
         """
         if self.db is None:
             raise RuntimeError("AtomMem is not started; call start() first")
@@ -1045,39 +1116,35 @@ class AtomMem:
         value = value_clean.text
         if not section or not key:
             raise ValueError("profile section and key are required")
-        pinned_flag = None if pinned is None else (1 if pinned else 0)
-        conn = self.db
-        conn.execute(
-            "INSERT INTO user_profile(user_id, section, key, value, source, "
-            "confidence, privacy, pinned, updated_at) VALUES (?, ?, ?, ?, "
-            "'user_explicit', 0.9, 'private', COALESCE(?, 0), ?) "
-            "ON CONFLICT(user_id, section, key) DO UPDATE SET "
-            "value = excluded.value, source = 'user_explicit', "
-            "confidence = 0.9, pinned = COALESCE(?, pinned), "
-            "updated_at = excluded.updated_at",
-            (user_id, section, key, value, pinned_flag, now_ms(), pinned_flag),
+
+        # Enforce the cap through the same path the batch editor uses, so the
+        # two write surfaces can never disagree about what "full" means.
+        result = write_profile_rows(
+            self.db,
+            user_id,
+            [{"section": section, "key": key, "value": value}],
+            limit=int(self.config.max_profile_rows or 0),
         )
-        conn.commit()
-        row = conn.execute(
-            "SELECT pinned FROM user_profile "
-            "WHERE user_id = ? AND section = ? AND key = ?",
-            (user_id, section, key),
-        ).fetchone()
-        result = {"ok": True, "pinned": bool(row["pinned"]) if row else False}
+        out = {
+            "ok": True,
+            "source": SOURCE_USER,
+            "written": result["written"],
+            "count": profile_row_count(self.db, user_id),
+            "limit": int(self.config.max_profile_rows or 0),
+        }
         shortened = truncation_records(
             (section_clean.record("section"), key_clean.record("key"), value_clean.record("value"))
         )
         if shortened:
-            result["truncated"] = shortened
-        return result
+            out["truncated"] = shortened
+        return out
 
     def delete_profile(self, user_id: str, section: str, key: str) -> dict:
         """Delete one user-profile row.
 
-        Deletion is an explicit act only: nothing in the memory pipeline deletes
-        profile rows, so a pinned row is deleted like any other when the user
-        asks for it (the pin freezes automatic *updates*, not the user's own
-        editorial actions).
+        A permanent delete: nothing re-derives the profile, so the row does not
+        come back (see :meth:`list_profile`). The facts that may have suggested
+        the row are untouched.
 
         Args:
             user_id: Owner of the profile.
@@ -1085,16 +1152,17 @@ class AtomMem:
             key: Key within the section.
 
         Returns:
-            ``{"ok": True, "deleted": n}``.
+            ``{"ok": True, "deleted": n, "count": n, "limit": n}``.
         """
         if self.db is None:
             raise RuntimeError("AtomMem is not started; call start() first")
-        cur = self.db.execute(
-            "DELETE FROM user_profile WHERE user_id = ? AND section = ? AND key = ?",
-            (user_id, section, key),
-        )
-        self.db.commit()
-        return {"ok": True, "deleted": cur.rowcount}
+        removed = delete_profile_row(self.db, user_id, section, key)
+        return {
+            "ok": True,
+            "deleted": 1 if removed else 0,
+            "count": profile_row_count(self.db, user_id),
+            "limit": int(self.config.max_profile_rows or 0),
+        }
 
     def backup(self, user_id: str) -> dict:
         """Export the user's memory as a portable JSON snapshot.

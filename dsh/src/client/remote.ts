@@ -93,6 +93,8 @@ export const ATOM_MEMORY_REMOTE: TypertRemoteContribution = {
     jsonArgsMethod('listProfile', true),
     jsonArgsMethod('upsertProfile', true),
     jsonArgsMethod('deleteProfile', true),
+    jsonArgsMethod('writeProfile', true),
+    jsonArgsMethod('generateProfile', true),
     jsonArgsMethod('backup', true),
     jsonArgsMethod('restore', true),
     jsonArgsMethod('getRuntime', false),

@@ -565,7 +565,7 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
 
   disposers.push(ctx.tools.register(defineTool({
     name: 'memory_user_md',
-    description: '渲染当前用户的画像卡片 markdown（画像由活跃事实即时投影而来）。',
+    description: '渲染当前用户的画像卡片 markdown（画像由用户手动维护的独立表渲染，不从活跃事实自动生成）。',
     parameters: {
       user: { type: 'string', description: '可选：归属用户 id（默认当前用户，跨会话共享）' },
     },
