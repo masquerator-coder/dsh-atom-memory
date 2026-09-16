@@ -37,9 +37,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import List, Mapping, Optional, Sequence, Tuple
 
+from .config import MemConfig
+from .context import GLOBAL_SCOPE_ID
 from .db import now_ms, recency_credit
 from .models import (
     NEUTRAL_SCORE,
@@ -49,6 +51,7 @@ from .models import (
 )
 from .retriever import CHARS_PER_TOKEN, estimate_tokens, token_cost
 from .reinforce import adjust, effective_importance
+from .scope import ScopeStore, resolution_for
 from .validator import MULTI_VALUED_PREDICATES
 
 # Maximum characters of a rendered *content line* in the compact digest.
@@ -147,12 +150,61 @@ _EMPTY_NOTICE = "_暂无持久化的原子记忆。_ (No active atomic facts yet
 # one token per label, which is exactly the kind of leak the hard cap forbids.
 _COMPACT_LABEL_MARKER = "# "
 
+# -- scope blocks (design §6.7) -----------------------------------------------
+#
+# With a scope context the compact digest is rendered as independent blocks —
+# the current scope, its ancestors, its phases, the global rules and the
+# condition-matching rules from elsewhere. Each block has its own budget, so a
+# large project memory cannot crowd the global rules out of the prompt, and the
+# headings tell the model *which* level a rule belongs to (which is what makes
+# "the project overrides the company rule" readable instead of contradictory).
+#
+# Blocks are ordered most-specific-first, and the global block's minimum is
+# reserved before anything else is allocated: "全局规则始终包含，但可压缩" is only
+# true if a big current-scope block cannot spend the reserve first.
+_BLOCK_SHARE_CURRENT = 0.5
+_BLOCK_SHARE_ANCESTOR = 0.25
+_BLOCK_SHARE_GLOBAL = 0.3
+_BLOCK_SHARE_PHASE = 0.25
+_BLOCK_SHARE_CONDITION = 0.25
+
+#: Floor for a rendered block: enough for its heading and at least one line. A
+#: block that gets less than this is skipped rather than rendered as a bare
+#: heading, which would cost tokens and say nothing.
+_BLOCK_MIN_TOKENS = 24
+
+#: Budget below which a squeezed block is dropped outright instead of being
+#: re-rendered: a block that cannot hold even one line is a heading.
+_BLOCK_DROP_TOKENS = 10
+
+#: How many times the overflow is taken back from the blocks before the footer
+#: and whole blocks are given up. Each pass at least halves one block's budget,
+#: so this reaches the fixpoint of any realistic layout; the cap exists so a
+#: pathological budget cannot make rendering loop.
+_BLOCK_SHRINK_PASSES = 8
+
+#: Short Chinese label per scope type, used in block headings.
+_SCOPE_LABELS = {
+    "global": "全局",
+    "user": "用户",
+    "org": "组织",
+    "team": "团队",
+    "client": "客户",
+    "project": "项目",
+    "series": "系列",
+    "phase": "阶段",
+    "document": "文档",
+    "thread": "线程",
+}
+
 
 def generate_summary(
     conn: sqlite3.Connection,
     user_id: str,
     max_tokens: int = 1500,
     detail: bool = True,
+    scope_context: Optional[Mapping] = None,
+    config: Optional[MemConfig] = None,
 ) -> str:
     """Build the ``summary`` text for a user.
 
@@ -163,6 +215,13 @@ def generate_summary(
         detail: ``True`` renders the full fact list with ``fact_id`` references;
             ``False`` renders the compact, type-grouped digest injected into the
             session system prompt.
+        scope_context: The session context payload. When given (and scope
+            awareness is on), the compact depth is rendered as scope blocks —
+            current scope, ancestors, phases, global rules, condition-matching
+            rules — instead of one flat digest. Ignored by the detail depth,
+            which exists to locate and edit facts and therefore lists everything.
+        config: Configuration carrying the scope thresholds and the master
+            switch. ``None`` uses library defaults.
 
     Returns:
         The rendered markdown string. An empty (but non-blank) notice is returned
@@ -176,7 +235,313 @@ def generate_summary(
 
     if detail:
         return _render_detail(buckets, user_id, max_tokens)
+    cfg = config or MemConfig()
+    if scope_context is not None and cfg.scope_aware:
+        scoped = _render_scoped(conn, user_id, max_tokens, scope_context, cfg)
+        if scoped is not None:
+            return scoped
     return _render_compact(buckets, max_tokens)
+
+
+# -- scope-blocked rendering --------------------------------------------------
+
+
+@dataclass
+class _Block:
+    """One rendered block of the scoped digest."""
+
+    key: str
+    title: str
+    share: float
+    facts: List[dict] = field(default_factory=list)
+
+
+def _render_scoped(
+    conn: sqlite3.Connection,
+    user_id: str,
+    max_tokens: int,
+    scope_context: Mapping,
+    config: MemConfig,
+) -> Optional[str]:
+    """Render the compact digest as scope blocks.
+
+    Returns ``None`` when the context carries nothing scope-shaped after all (an
+    unknown project), in which case the caller falls back to the flat digest —
+    block headings naming a scope nobody resolved would be noise, not
+    information.
+
+    Args:
+        conn: Open connection.
+        user_id: Owner whose facts are rendered.
+        max_tokens: Budget for the whole artifact, headings and footer included.
+        scope_context: The context payload.
+        config: Configuration carrying the scope thresholds.
+
+    Returns:
+        The rendered artifact, or ``None`` to fall back to the flat digest.
+    """
+    ctx, resolution = resolution_for(
+        conn, config, scope_context, user_id=user_id, create=False
+    )
+    if ctx is None:
+        return None
+    store = ScopeStore(conn, config)
+    view = store.view(resolution, ctx.condition_map())
+
+    facts = _score_facts(conn, user_id)
+    if not facts:
+        return None
+    scope_map = store.fact_scopes([f["fact_id"] for f in facts])
+    cond_map = store.fact_conditions([f["fact_id"] for f in facts])
+
+    blocks = _partition_blocks(
+        facts, scope_map, cond_map, view, resolution, store
+    )
+    if not blocks:
+        return None
+    return _compose_blocks(blocks, max_tokens)
+
+
+def _partition_blocks(
+    facts: List[dict],
+    scope_map: Mapping[str, Sequence[int]],
+    cond_map: Mapping[str, Sequence[Tuple[str, str]]],
+    view,
+    resolution,
+    store: ScopeStore,
+) -> List[_Block]:
+    """Sort facts into the design's blocks, in render order.
+
+    Order is most-specific-first (current scope, then each ancestor nearest
+    first, then the project's phases, then the global rules, then rules from
+    other scopes that matched the current conditions). Facts bound to a scope
+    that is neither visible nor condition-matched go to no block at all: the
+    design's "其他项目参考默认不注入" — they stay reachable through ``memory_recall``
+    instead of being paid for on every request.
+
+    ``visible`` gates the phase branch as well as the condition branch. A *phase*
+    is only a phase *of this project*: without that check another project's
+    phase would render under a "阶段" heading inside this project's digest, which
+    is cross-project pollution wearing a helpful-looking label.
+    """
+    current_id = view.current_id
+    visible = set(view.visible_ids())
+    blocks: dict = {}
+
+    def _block(key: str, title: str, share: float) -> _Block:
+        if key not in blocks:
+            blocks[key] = _Block(key=key, title=title, share=share)
+        return blocks[key]
+
+    ancestors = dict(_ancestor_depths(store, current_id)) if current_id else {}
+    current_type = store.scope_type(current_id) if current_id else "global"
+
+    for fact in facts:
+        scope_ids = [store.resolve_id(int(s)) for s in scope_map.get(fact["fact_id"], ())]
+        conditions = cond_map.get(fact["fact_id"], ())
+
+        target: Optional[_Block] = None
+        for scope_id in scope_ids:
+            if scope_id == GLOBAL_SCOPE_ID:
+                continue
+            if current_id is not None and scope_id == current_id:
+                label = store.label(scope_id)
+                target = _block(
+                    "current",
+                    f"当前{_SCOPE_LABELS.get(current_type, '作用域')}: {label}",
+                    _BLOCK_SHARE_CURRENT,
+                )
+                break
+            if scope_id in ancestors:
+                label = store.label(scope_id)
+                kind = store.scope_type(scope_id)
+                target = _block(
+                    f"ancestor:{scope_id}",
+                    f"{_SCOPE_LABELS.get(kind, kind)}: {label}",
+                    _BLOCK_SHARE_ANCESTOR,
+                )
+                break
+            if store.scope_type(scope_id) == "phase" and scope_id in visible:
+                label = store.label(scope_id)
+                target = _block(
+                    f"phase:{scope_id}", f"阶段: {label}", _BLOCK_SHARE_PHASE
+                )
+                break
+        if target is None:
+            if not scope_ids or all(s == GLOBAL_SCOPE_ID for s in scope_ids):
+                target = _block("global", "全局规则", _BLOCK_SHARE_GLOBAL)
+            elif conditions and view.condition_weight(conditions) > 0.0:
+                target = _block(
+                    "condition",
+                    "条件规则: " + "、".join(
+                        f"{key}={value}" for key, value in list(conditions)[:2]
+                    ),
+                    _BLOCK_SHARE_CONDITION,
+                )
+        if target is not None:
+            target.facts.append(fact)
+
+    ordered = ["current"]
+    ordered.extend(
+        sorted(
+            (key for key in blocks if key.startswith("ancestor:")),
+            key=lambda key: ancestors.get(int(key.split(":", 1)[1]), 99),
+        )
+    )
+    ordered.extend(sorted(key for key in blocks if key.startswith("phase:")))
+    ordered.extend(["global", "condition"])
+    return [blocks[key] for key in ordered if key in blocks and blocks[key].facts]
+
+
+def _ancestor_depths(store: ScopeStore, scope_id: Optional[int]) -> List[Tuple[int, int]]:
+    """Return ``[(ancestor_id, distance), ...]`` for a scope, nearest first."""
+    if scope_id is None or scope_id == GLOBAL_SCOPE_ID:
+        return []
+    from .scope import ancestor_distances
+
+    distances = ancestor_distances(store.conn, scope_id)
+    return sorted(
+        ((sid, depth) for sid, depth in distances.items() if sid != GLOBAL_SCOPE_ID),
+        key=lambda item: item[1],
+    )
+
+
+def _compose_blocks(blocks: List[_Block], max_tokens: int) -> str:
+    """Render blocks under per-block budgets, most specific first.
+
+    Each block starts with a share of the budget (the current scope gets the
+    largest, the global rules a reserved share of their own), and the artifact is
+    then checked against the cap as a whole. If it overshoots, the overflow is
+    taken back from blocks in **reverse specificity order** — condition rules,
+    phases, distant ancestors, then the current scope, then the global rules
+    last. So the two properties the design asks for hold even at a budget too
+    small for everything: the current scope's material is what survives a squeeze,
+    and the global rules are the last thing given up.
+
+    The cap is unconditional. Once nothing is left to shrink, the aggregate footer
+    is dropped (it is the one line that carries no memory) and then whole blocks
+    from that same order.
+
+    Args:
+        blocks: The blocks to render, in order.
+        max_tokens: Total budget for the artifact.
+
+    Returns:
+        The rendered artifact, or ``""`` when nothing fits at all.
+    """
+    sections_by_block = {block.key: _titled_sections(block.facts) for block in blocks}
+    active = [block for block in blocks if sections_by_block[block.key]]
+    if not active:
+        return ""
+    budgets = {
+        block.key: max(_BLOCK_MIN_TOKENS, int(max_tokens * block.share))
+        for block in active
+    }
+    # Least specific first, global last: the order in which material is given up.
+    shrink_order = [block.key for block in reversed(active) if block.key != "global"]
+    if any(block.key == "global" for block in active):
+        shrink_order.append("global")
+
+    assembled = _assemble_blocks(active, sections_by_block, budgets, footer=False)
+    for _attempt in range(_BLOCK_SHRINK_PASSES):
+        if estimate_tokens(assembled) <= max_tokens:
+            break
+        victim = next(
+            (key for key in shrink_order if key in budgets and budgets[key] > 0), None
+        )
+        if victim is None:
+            break
+        # Halve rather than subtract the overflow: the overflow is measured on the
+        # whole artifact, so subtracting it from one block's budget would zero out
+        # a block far cheaper than the overflow and give up more memory than the
+        # cap requires. Halving converges in a few passes and gives up the least
+        # material that fits.
+        budgets[victim] //= 2
+        if budgets[victim] < _BLOCK_DROP_TOKENS:
+            budgets.pop(victim)
+            active = [block for block in active if block.key != victim]
+        assembled = _assemble_blocks(active, sections_by_block, budgets, footer=False)
+
+    # The blocks are the content; the footer is bookkeeping. So the footer is what
+    # goes when the two cannot both fit — shrinking further to make room for a
+    # count would trade a memory for a statistic.
+    body, footer = _assemble_blocks(active, sections_by_block, budgets, split=True)
+    if footer:
+        with_footer = f"{body}\n\n{footer}" if body else footer
+        if estimate_tokens(with_footer) <= max_tokens:
+            return with_footer
+    if body and estimate_tokens(body) <= max_tokens:
+        return body
+    if estimate_tokens(assembled) <= max_tokens:
+        return assembled
+
+    # Last resort: whole blocks, in the same order.
+    remaining_active = list(active)
+    for key in shrink_order:
+        if key not in budgets:
+            continue
+        budgets.pop(key)
+        remaining_active = [b for b in remaining_active if b.key in budgets]
+        candidate = _assemble_blocks(
+            remaining_active, sections_by_block, budgets, footer=False
+        )
+        if candidate and estimate_tokens(candidate) <= max_tokens:
+            return candidate
+    return ""
+
+
+def _assemble_blocks(
+    active: List[_Block],
+    sections_by_block: Mapping[str, dict],
+    budgets: Mapping[str, int],
+    split: bool = False,
+    footer: bool = True,
+) -> "str | Tuple[str, str]":
+    """Render every active block at its budget and join them with one footer.
+
+    Args:
+        active: Blocks to render, in order, with a budget each.
+        sections_by_block: ``{block key: sections}``.
+        budgets: ``{block key: token budget}``; a missing key is not rendered.
+        split: Return ``(body, footer)`` instead of the joined artifact, for the
+            caller that needs to try the footer on its own.
+        footer: Append the aggregate footer (ignored when ``split``).
+
+    Returns:
+        The assembled artifact, or ``(body, footer)`` when ``split``.
+    """
+    parts: List[str] = []
+    kept_totals: dict = {}
+    omitted_total = 0
+    hidden: List[str] = []
+    for block in active:
+        sections = sections_by_block.get(block.key)
+        budget = budgets.get(block.key)
+        if not sections or budget is None or budget <= 0:
+            continue
+        heading = f"[{block.title}] · {len(block.facts)} 条"
+        heading_cost = estimate_tokens(heading)
+        if budget <= heading_cost:
+            continue
+        kept = _select(sections, budget - heading_cost, footer=False)
+        body = _render_body(sections, kept)
+        if not body:
+            continue
+        parts.append(heading + "\n" + body)
+        for title, lines in sections.items():
+            count = len(kept.get(title) or ())
+            omitted_total += len(lines) - count
+            if count:
+                kept_totals[title] = kept_totals.get(title, 0) + count
+            elif title not in hidden:
+                hidden.append(title)
+    body = "\n\n".join(parts)
+    footer_text = _render_footer(omitted_total, hidden, kept_totals) if parts else ""
+    if split:
+        return body, footer_text
+    if not footer:
+        return body
+    return body + "\n\n" + footer_text if body and footer_text else (body or footer_text)
 
 
 # -- loading ------------------------------------------------------------------
@@ -306,14 +671,37 @@ def _collect(conn: sqlite3.Connection, user_id: str) -> dict:
         An ordered mapping ``section -> [fact, ...]``. Empty when the user has
         no active facts.
     """
-    facts = _load_active_facts(conn, user_id)
+    facts = _score_facts(conn, user_id)
     if not facts:
         return {}
+    return _sections_of(facts)
 
+
+def _score_facts(conn: sqlite3.Connection, user_id: str) -> List[dict]:
+    """Load a user's active facts and attach their blended rank and score.
+
+    Split out from :func:`_collect` because the scoped renderer partitions facts
+    into blocks *before* grouping them into sections: it needs the scored fact
+    list, not the finished buckets.
+
+    Returns:
+        Facts carrying ``rank`` and ``score``. Empty when nothing is active.
+    """
+    facts = _load_active_facts(conn, user_id)
+    if not facts:
+        return []
     newest = max(int(fact["created_at"]) for fact in facts)
     for fact in facts:
         fact["score"] = _blend(fact["rank"], _recency_score(fact["created_at"], newest))
+    return facts
 
+
+def _sections_of(facts: List[dict]) -> dict:
+    """Group scored facts into ordered, score-sorted sections.
+
+    Sections are ordered by the blended score of their best fact (see
+    :func:`_collect`); facts keep score order within a section.
+    """
     grouped: dict = {}
     for fact in facts:
         grouped.setdefault(_section_of(fact), []).append(fact)
@@ -328,6 +716,25 @@ def _collect(conn: sqlite3.Connection, user_id: str) -> dict:
         ),
     )
     return dict(ranked)
+
+
+def _titled_sections(facts: List[dict]) -> dict:
+    """Group facts into ``section title -> [(line, score), ...]``.
+
+    The shape :func:`_select` and :func:`_render_body` consume, so both the flat
+    digest and each scope block go through exactly the same grouping, clipping
+    and folding. A second hand-written copy of this would be the place where the
+    two renderings silently diverge (one clipping to 80 characters, the other
+    not).
+    """
+    out: dict = {}
+    for section, group in _sections_of(facts).items():
+        if not group:
+            continue
+        rendered = _render_section_lines(section, group)
+        if rendered:
+            out[_SECTION_TITLES[section]] = rendered
+    return out
 
 
 def _section_of(fact: dict) -> str:
@@ -348,7 +755,7 @@ def _section_of(fact: dict) -> str:
 # -- rendering ----------------------------------------------------------------
 
 
-def _render_compact(buckets: dict, max_tokens: int) -> str:
+def _render_compact(buckets: dict, max_tokens: int, footer: bool = True) -> str:
     """Render the type-grouped digest injected into the system prompt.
 
     Section labels carry a single ``# `` and the footer a ``-- `` marker, so the
@@ -371,6 +778,16 @@ def _render_compact(buckets: dict, max_tokens: int) -> str:
     "omitted" notice (~18 tokens): then that notice is returned as the shortest
     honest answer, because returning empty text would be indistinguishable from
     a failed read at the injection site.
+
+    Args:
+        buckets: ``section -> [fact, ...]``, already score-sorted.
+        max_tokens: Budget for the artifact.
+        footer: Whether to append the ``-- `` footer. ``False`` is used by the
+            scope-blocked renderer, which emits one aggregate footer for the
+            whole artifact instead of one per block.
+
+    Returns:
+        The rendered digest, or ``""`` when nothing fits.
     """
     sections: dict = {}  # section title -> [(line, score), ...] in render order
     for section, facts in buckets.items():
@@ -381,7 +798,7 @@ def _render_compact(buckets: dict, max_tokens: int) -> str:
             continue
         sections[_SECTION_TITLES[section]] = rendered
 
-    rendered = _compose(sections, _select(sections, max_tokens))
+    rendered = _compose(sections, _select(sections, max_tokens, footer=footer), footer=footer)
     if estimate_tokens(rendered) <= max_tokens:
         return rendered
     # The budget cannot hold even the empty digest and its footer. There is no
@@ -540,7 +957,7 @@ def _clip(text: str, limit: int) -> str:
     return text[:limit - 1] + "…"
 
 
-def _select(sections: dict, max_tokens: int) -> dict:
+def _select(sections: dict, max_tokens: int, footer: bool = True) -> dict:
     """Choose the lines a token budget can hold, globally best-scoring first.
 
     Nothing is dropped while the render fits — the dense preference/attribute
@@ -573,6 +990,9 @@ def _select(sections: dict, max_tokens: int) -> dict:
     Args:
         sections: ``section title -> [(line, score), ...]`` in render order.
         max_tokens: The budget for the complete rendered artifact.
+        footer: Whether the artifact this selection is measured against includes
+            the footer. ``False`` when the caller renders its own aggregate
+            footer, so the fit check measures exactly what that caller emits.
 
     Returns:
         ``section title -> surviving line indices`` (ascending). Sections that
@@ -637,7 +1057,11 @@ def _select(sections: dict, max_tokens: int) -> dict:
             totals["other"] -= 1 if totals["parts"] > 0 else 0
 
     def _artifact_totals() -> tuple:
-        """The ``(cjk, other)`` totals of body + footer for the current state."""
+        """The ``(cjk, other)`` totals of body (and footer) for the current state."""
+        if not footer:
+            if totals["parts"] == 0:
+                return (0, 0)
+            return (totals["cjk"], totals["other"])
         counts = {title: len(indices) for title, indices in kept.items() if indices}
         hidden = [title for title in sections if not kept.get(title)]
         omitted = totals["lines"] - sum(counts.values())
@@ -696,19 +1120,22 @@ def _render_body(sections: dict, kept: dict) -> str:
     return "\n".join(parts)
 
 
-def _compose(sections: dict, kept: dict) -> str:
+def _compose(sections: dict, kept: dict, footer: bool = True) -> str:
     """Render the complete artifact (body + footer) for a candidate selection.
 
     The footer is derived from the same selection, so what the fit check measures
     is exactly what the caller receives — including the "what was left out" line,
-    whose length depends on how much was dropped.
+    whose length depends on how much was dropped. ``footer=False`` returns the
+    body alone, for a caller that emits its own aggregate footer.
     """
+    body = _render_body(sections, kept)
+    if not footer:
+        return body
     counts = {title: len(indices) for title, indices in kept.items() if indices}
     hidden = [title for title in sections if not kept.get(title)]
     omitted = sum(len(lines) for lines in sections.values()) - sum(counts.values())
-    body = _render_body(sections, kept)
-    footer = _render_footer(omitted, hidden, counts)
-    return body + "\n\n" + footer if body else footer
+    foot = _render_footer(omitted, hidden, counts)
+    return body + "\n\n" + foot if body else foot
 
 
 def _render_detail(buckets: dict, user_id: str, max_tokens: int) -> str:

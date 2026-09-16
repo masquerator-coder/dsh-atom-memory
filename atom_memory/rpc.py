@@ -97,6 +97,21 @@ _METHODS: Dict[str, str] = {
     "candidate_outcome": "candidate_outcome",
     "recent_outcomes": "recent_outcomes",
     "outcomes": "recent_outcomes",
+    # Scope surface: the hierarchy, its resolution, and the operator actions that
+    # repair it (merge / split / reparent / confirm / alias).
+    "scope_list": "scope_list",
+    "scope_resolve": "scope_resolve",
+    "scope_create": "scope_create",
+    "scope_alias_add": "scope_alias_add",
+    "scope_confirm": "scope_confirm",
+    "scope_merge": "scope_merge",
+    "scope_split": "scope_split",
+    "scope_reparent": "scope_reparent",
+    "scope_unresolved": "scope_unresolved",
+    "scope_promote": "scope_promote",
+    "fact_scope_bind": "fact_scope_bind",
+    "fact_condition_set": "fact_condition_set",
+    "fact_scope_get": "fact_scope_get",
 }
 
 
@@ -338,12 +353,16 @@ class RpcServer:
         whether the store holds *anything* before spending prompt tokens on a
         snapshot, and asking in the same round trip is what keeps freezing a
         single call.
+
+        ``scope_context`` selects the scope-blocked rendering (current scope,
+        ancestors, phases, global rules, condition rules) for the compact depth.
         """
         user_id = params["user_id"]
         text = await self.mem.summary(
             user_id,
             max_tokens=int(params.get("max_tokens", 1500)),
             detail=bool(params.get("detail", False)),
+            scope_context=params.get("scope_context"),
         )
         if not params.get("include_meta"):
             return text
@@ -362,8 +381,9 @@ class RpcServer:
 
         Args:
             params: ``user_id``, ``candidates``, optional ``session_id`` /
-                ``turn_id`` / ``wait_ms``. When ``wait_ms`` is set the reply
-                carries the write outcome instead of only the enqueue receipt.
+                ``turn_id`` / ``scope_context`` / ``wait_ms``. When ``wait_ms`` is
+                set the reply carries the write outcome instead of only the
+                enqueue receipt.
         """
         user_id = params.get("user_id")
         candidates = params.get("candidates")
@@ -376,6 +396,15 @@ class RpcServer:
         wait_ms = params.get("wait_ms")
         candidate_id = str(uuid.uuid4())
         created_at = now_ms()
+        payload = {
+            "candidate_id": candidate_id,
+            "user_id": user_id,
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "candidates": candidates,
+        }
+        if params.get("scope_context"):
+            payload["scope_context"] = params["scope_context"]
         with self.mem.db:
             self.mem.db.execute(
                 "INSERT INTO fact_candidates(candidate_id, user_id, session_id, "
@@ -389,15 +418,7 @@ class RpcServer:
                 "VALUES (?, 'persist_pre', ?, 'pending', 5, 0, ?, ?)",
                 (
                     str(uuid.uuid4()),
-                    json.dumps(
-                        {
-                            "candidate_id": candidate_id,
-                            "user_id": user_id,
-                            "session_id": session_id,
-                            "turn_id": turn_id,
-                            "candidates": candidates,
-                        }
-                    ),
+                    json.dumps(payload),
                     self.mem.config.max_retries,
                     created_at,
                 ),

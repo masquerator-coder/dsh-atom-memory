@@ -12,8 +12,9 @@ receive the live connection so they can query stored facts.
 from __future__ import annotations
 
 import sqlite3
-from typing import Optional
+from typing import List, Optional, Sequence, Tuple
 
+from .context import GLOBAL_SCOPE_ID
 from .models import ALL_KNOWLEDGE, FactCandidate, ValidationResult
 from .sanitize import (
     DEFAULT_MAX_CONTENT_CHARS,
@@ -83,6 +84,7 @@ def validate(
     privacy_filter: str = _DEFAULT_PRIVACY,
     max_field_chars: int = DEFAULT_MAX_FIELD_CHARS,
     max_content_chars: int = DEFAULT_MAX_CONTENT_CHARS,
+    scope_ids: Optional[Sequence[int]] = None,
 ) -> ValidationResult:
     """Run the full validation chain on a candidate.
 
@@ -102,6 +104,11 @@ def validate(
             not match it, the ``privacy`` check fails.
         max_field_chars: Ingest cap for one SPO field.
         max_content_chars: Ingest cap for a knowledge body.
+        scope_ids: Scopes the candidate is being written into (the resolved
+            scope plus its ancestors, or ``None`` for a scope-blind write). When
+            given, the conflict check only considers stored facts visible from
+            those scopes, so a project's statement is not judged contradictory
+            against another project's — the design's "跨作用域只建链接或标参考".
 
     Returns:
         A :class:`ValidationResult` describing the outcome.
@@ -112,7 +119,7 @@ def validate(
     truncated = normalize_candidate_meta(
         candidate, max_field_chars=max_field_chars, max_content_chars=max_content_chars
     )
-    result = _validate_checks(candidate, conn, privacy_filter)
+    result = _validate_checks(candidate, conn, privacy_filter, scope_ids)
     result.truncated_fields = truncated
     return result
 
@@ -121,6 +128,7 @@ def _validate_checks(
     candidate: FactCandidate,
     conn: Optional[sqlite3.Connection],
     privacy_filter: str,
+    scope_ids: Optional[Sequence[int]] = None,
 ) -> ValidationResult:
     """Run the check chain on a candidate that has already been normalised.
 
@@ -128,6 +136,7 @@ def _validate_checks(
         candidate: The normalised candidate.
         conn: Optional connection for the idempotency/conflict lookups.
         privacy_filter: Configured privacy tag.
+        scope_ids: Scopes the write targets (see :func:`validate`).
 
     Returns:
         The first failing result, or a passing one.
@@ -153,7 +162,7 @@ def _validate_checks(
         return idem
 
     # 5. Conflict
-    conflict = _check_conflict(candidate, conn)
+    conflict = _check_conflict(candidate, conn, scope_ids)
     if not conflict.ok:
         return conflict
 
@@ -413,8 +422,98 @@ def is_multi_valued(predicate: str, memory_type: str) -> bool:
     return False
 
 
+def _scope_clause(
+    scope_ids: Optional[Sequence[int]], alias: str = "facts"
+) -> Tuple[str, list]:
+    """Build the SQL fragment restricting a fact query to a scope set.
+
+    An unbound fact counts as global (the compatibility rule migration 011
+    establishes), so it is visible whenever the root is in ``scope_ids`` — which
+    it always is, because resolution returns a scope path that ends at
+    ``/global``.
+
+    Args:
+        scope_ids: The scopes a write targets, or ``None`` for no restriction.
+        alias: Table alias the fragment must reference.
+
+    Returns:
+        ``(sql, params)`` where ``sql`` is either empty or an ``AND (...)``
+        fragment, so callers can append it unconditionally.
+    """
+    if scope_ids is None:
+        return "", []
+    ids = sorted({int(s) for s in scope_ids})
+    if not ids:
+        return "", []
+    placeholders = ",".join("?" for _ in ids)
+    unbound = ""
+    if GLOBAL_SCOPE_ID in ids:
+        unbound = (
+            f" OR NOT EXISTS (SELECT 1 FROM fact_scope fsu "
+            f"WHERE fsu.fact_id = {alias}.fact_id)"
+        )
+    sql = (
+        f"AND (EXISTS (SELECT 1 FROM fact_scope fs WHERE fs.fact_id = {alias}.fact_id "
+        f"AND fs.scope_id IN ({placeholders})){unbound}) "
+    )
+    return sql, ids
+
+
+def cross_scope_neighbours(
+    candidate: FactCandidate,
+    conn: Optional[sqlite3.Connection],
+    scope_ids: Optional[Sequence[int]],
+) -> List[dict]:
+    """Return active facts under the same key that live in *other* scopes.
+
+    The design does not let a cross-scope collision be judged a contradiction: a
+    project that overrides a global rule is not evidence that the rule is wrong,
+    and picking a winner silently loses either the rule or its exception. So the
+    write path keeps both and records a relation instead — which needs to know
+    which facts are neighbours but out of scope.
+
+    Args:
+        candidate: The candidate being written.
+        conn: Open connection, or ``None``.
+        scope_ids: The scope the write targets. ``None`` (a scope-blind write)
+            returns nothing: without a scope there is no "other" scope.
+
+    Returns:
+        Rows (with ``fact_id``, ``object``, ``qualifiers``, ``confidence``,
+        ``importance``, ``created_at``) under the same user + subject +
+        predicate that hold a binding outside ``scope_ids``, plus unbound facts
+        whenever the root is not in ``scope_ids`` — an unbound fact is a global
+        fact by the compatibility rule, so a project-scoped write must still see
+        it as a neighbour from another scope.
+    """
+    if conn is None or scope_ids is None or not candidate.subject or not candidate.predicate:
+        return []
+    ids = sorted({int(s) for s in scope_ids})
+    if not ids:
+        return []
+    placeholders = ",".join("?" for _ in ids)
+    unbound = ""
+    if GLOBAL_SCOPE_ID not in ids:
+        unbound = (
+            " OR NOT EXISTS (SELECT 1 FROM fact_scope fsu WHERE fsu.fact_id = f.fact_id)"
+        )
+    rows = conn.execute(
+        f"SELECT f.fact_id, f.object, f.qualifiers, f.confidence, f.importance, "
+        f"f.created_at FROM facts f "
+        f"WHERE f.user_id = ? AND f.subject = ? AND f.predicate = ? "
+        f"AND f.status = 'active' "
+        f"AND (EXISTS (SELECT 1 FROM fact_scope fs WHERE fs.fact_id = f.fact_id "
+        f"AND fs.scope_id NOT IN ({placeholders})){unbound}) "
+        f"ORDER BY f.created_at DESC",
+        [candidate.user_id, candidate.subject, candidate.predicate, *ids],
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def _check_conflict(
-    candidate: FactCandidate, conn: Optional[sqlite3.Connection]
+    candidate: FactCandidate,
+    conn: Optional[sqlite3.Connection],
+    scope_ids: Optional[Sequence[int]] = None,
 ) -> ValidationResult:
     """Detect a contradiction against an existing active fact.
 
@@ -435,6 +534,12 @@ def _check_conflict(
 
     Inactive (e.g. ``superseded`` / ``retracted`` / ``archived``) facts are
     ignored throughout.
+
+    When ``scope_ids`` is given, only facts *visible from those scopes* take
+    part: the candidate's own scope, its ancestors and the root. A claim stored
+    under a sibling project is therefore not a contradiction — it is a
+    cross-scope neighbour, which :func:`cross_scope_neighbours` reports
+    separately so the write path can link the two instead of retiring one.
     """
     if conn is None or not candidate.subject or not candidate.predicate:
         return ValidationResult.pass_(candidate.candidate_id)
@@ -446,13 +551,16 @@ def _check_conflict(
     # lesson is a new item, not a contradiction of the first.
     multi_valued = is_multi_valued(candidate.predicate, cand_type)
 
+    scope_sql, scope_args = _scope_clause(scope_ids, alias="f")
     rows = conn.execute(
-        "SELECT fact_id, object, qualifiers, confidence, importance, created_at "
-        "FROM facts "
-        "WHERE user_id = ? AND subject = ? AND predicate = ? "
-        "AND status = 'active' "
-        "ORDER BY created_at DESC, rowid DESC",
-        (candidate.user_id, candidate.subject, candidate.predicate),
+        "SELECT f.fact_id, f.object, f.qualifiers, f.confidence, f.importance, "
+        "f.created_at "
+        "FROM facts f "
+        "WHERE f.user_id = ? AND f.subject = ? AND f.predicate = ? "
+        "AND f.status = 'active' "
+        + scope_sql
+        + "ORDER BY f.created_at DESC, f.rowid DESC",
+        [candidate.user_id, candidate.subject, candidate.predicate, *scope_args],
     ).fetchall()
 
     # -- Pass 1: the claim itself ---------------------------------------------

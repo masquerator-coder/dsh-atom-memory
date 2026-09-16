@@ -22,6 +22,7 @@ from typing import Optional
 
 from .backup import export_memory, import_memory, validate_backup
 from .config import MemConfig
+from .context import GLOBAL_SCOPE_ID, make_signal
 from .db import index_orphans, now_ms, open_db, record_event
 from .embedder import Embedder
 from .profile import (
@@ -44,6 +45,7 @@ from .reinforce import (
 )
 from .retriever import Retriever, estimate_tokens, segment_text, truncate_to_tokens
 from .sanitize import clean_body, clean_body_meta, clean_field, clean_field_meta, truncation_records
+from .scope import ScopeStore, resolution_for
 from .summary import generate_summary
 from .validator import is_multi_valued
 from .worker import Worker
@@ -148,6 +150,7 @@ class AtomMem:
         text: str,
         turn_id: int = 0,
         wait_ms: Optional[int] = None,
+        scope_context: Optional[dict] = None,
     ) -> dict:
         """Enqueue a user utterance to be extracted into atomic facts.
 
@@ -172,6 +175,9 @@ class AtomMem:
             turn_id: Optional zero-based turn number.
             wait_ms: How long to wait for the write outcome. ``None`` uses the
                 configured default (``0`` = do not wait).
+            scope_context: The session context payload. It travels with the
+                queued task so the *worker* resolves the scope at write time
+                (where the rules are created), rather than the caller guessing.
 
         Returns:
             A dict ``{"candidate_id", "status", "trace_id"}``, plus
@@ -188,6 +194,16 @@ class AtomMem:
         text = cleaned.text
         truncated = truncation_records([cleaned.record("content")])
 
+        payload = {
+            "candidate_id": candidate_id,
+            "user_id": user_id,
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "raw_text": text,
+        }
+        if scope_context:
+            payload["scope_context"] = scope_context
+
         with self.db:
             self.db.execute(
                 "INSERT INTO fact_candidates(candidate_id, user_id, session_id, "
@@ -201,15 +217,7 @@ class AtomMem:
                 "VALUES (?, 'extract', ?, 'pending', 5, 0, ?, ?)",
                 (
                     str(uuid.uuid4()),
-                    json.dumps(
-                        {
-                            "candidate_id": candidate_id,
-                            "user_id": user_id,
-                            "session_id": session_id,
-                            "turn_id": turn_id,
-                            "raw_text": text,
-                        }
-                    ),
+                    json.dumps(payload),
                     self.config.max_retries,
                     created_at,
                 ),
@@ -351,6 +359,8 @@ class AtomMem:
         query: str,
         token_budget: int = 2000,
         top_k: int = 10,
+        scope_context: Optional[dict] = None,
+        conditions: Optional[dict] = None,
     ) -> dict:
         """Retrieve the user's most relevant active facts for a query.
 
@@ -364,15 +374,26 @@ class AtomMem:
             query: The natural-language query.
             token_budget: Upper bound on the estimated tokens returned.
             top_k: Maximum number of facts to consider before trimming.
+            scope_context: The session context payload. With it, recall considers
+                the scope's own path, its phases and condition-matching facts from
+                elsewhere, and re-ranks by scope distance; without it, retrieval
+                is the pre-scope one global pool.
+            conditions: The current context's conditions, when the caller knows
+                them without a full payload (``{"doc_type": "proposal"}``).
 
         Returns:
             A dict with keys ``facts``, ``pending``, ``conflicts``,
-            ``token_count`` and ``trace_id``.
+            ``token_count``, ``scope``, ``degraded`` and ``trace_id``. Each fact
+            carries its ``scopes`` / ``scope_labels`` / ``conditions`` when
+            scope-aware retrieval ran.
         """
         if self.db is None or self.retriever is None:
             raise RuntimeError("AtomMem is not started; call start() first")
 
-        ranked = await self.retriever.search(user_id, query, top_k=top_k)
+        ranked = await self.retriever.search(
+            user_id, query, top_k=top_k,
+            scope_context=scope_context, conditions=conditions,
+        )
         facts: list = []
         used = 0
         ceiling = int(self.config.max_fact_tokens or 0)
@@ -418,6 +439,15 @@ class AtomMem:
                     "last_used_at": fact.get("last_used_at"),
                     "final_score": fact["final_score"],
                     "status": fact["status"],
+                    # Present only when scope-aware retrieval ran, so a caller can
+                    # tell "this rule is the project's own" from "this is the
+                    # company rule" — which is the whole point of the dimension.
+                    "scopes": list(fact.get("scopes") or []),
+                    "scope_labels": list(fact.get("scope_labels") or []),
+                    "conditions": list(fact.get("conditions") or []),
+                    "scope_weight": fact.get("scope_weight"),
+                    "condition_match": fact.get("condition_match"),
+                    "phase_match": fact.get("phase_match"),
                 }
             )
             used += t
@@ -426,6 +456,7 @@ class AtomMem:
             "facts": facts,
             "conflicts": self._load_conflicts(user_id),
             "degraded": list(getattr(self.retriever, "last_degraded", []) or []),
+            "scope": getattr(self.retriever, "last_scope", None),
             "token_count": used,
             "trace_id": str(uuid.uuid4()),
         }
@@ -442,11 +473,17 @@ class AtomMem:
         blocks them; surfacing them here lets the model/user see that memory
         holds two values where it should hold one.
 
+        The grouping includes the fact's **scope set**: two projects that state
+        different values under one single-valued key are not contradicting each
+        other, they are each stating their own (the design's "跨作用域 + 矛盾 → 不判
+        矛盾，标 scope_priority"). Reporting them as a conflict would ask a user to
+        resolve a disagreement that does not exist.
+
         Returns:
             A list of ``{"left": fact_id, "right": fact_id, "subject",
-            "predicate", "object_left", "object_right"}`` — one entry per
-            conflicting *pair*, each fact_id appearing on the left or the right
-            (never both directions). Empty when memory holds no such pair.
+            "predicate", "object_left", "object_right", "scopes"}`` — one entry
+            per conflicting *pair*, each fact_id appearing on the left or the
+            right (never both directions). Empty when memory holds no such pair.
         """
         if self.db is None:
             return []
@@ -455,16 +492,24 @@ class AtomMem:
             "WHERE user_id = ? AND status = 'active' ORDER BY created_at ASC",
             (user_id,),
         ).fetchall()
-        # Group active facts by their single-valued (subject, predicate) key.
+        store = self._scope_store()
+        scope_map = store.fact_scopes([r["fact_id"] for r in rows])
+        # Group active facts by their single-valued (subject, predicate) key
+        # *within one scope set*. An unbound fact is a global fact (the
+        # compatibility rule), so it is grouped with the explicit root rather
+        # than in a category of its own — otherwise the legacy row and the new
+        # global row would never be compared at all.
         groups: dict = {}
         for r in rows:
             memory_type = r["type"] or "semantic"
             if is_multi_valued(str(r["predicate"]), memory_type):
                 continue
-            groups.setdefault((r["subject"], r["predicate"]), []).append(r)
+            bound = scope_map.get(r["fact_id"], ())
+            scope_key = tuple(bound) if bound else (GLOBAL_SCOPE_ID,)
+            groups.setdefault((r["subject"], r["predicate"], scope_key), []).append(r)
 
         conflicts: list = []
-        for (subject, predicate), members in groups.items():
+        for (subject, predicate, scope_key), members in groups.items():
             # Distinct objects within one single-valued key -> contradiction.
             distinct: dict = {}
             for r in members:
@@ -483,6 +528,7 @@ class AtomMem:
                             "predicate": predicate,
                             "object_left": list(distinct.keys())[i],
                             "object_right": list(distinct.keys())[j],
+                            "scopes": [store.label(sid) for sid in scope_key],
                         }
                     )
         return conflicts
@@ -515,6 +561,8 @@ class AtomMem:
         ).fetchone()
         if row is None:
             raise ValueError(f"no fact {fact_id} for user {user_id}")
+        store = self._scope_store()
+        scope_ids = list(store.fact_scopes([fact_id]).get(fact_id) or ())
         return {
             "fact_id": row["fact_id"],
             "subject": row["subject"],
@@ -529,6 +577,12 @@ class AtomMem:
             "reinforce_count": float(row["reinforce_count"] or 0.0),
             "last_used_at": row["last_used_at"],
             "superseded_by": row["superseded_by"],
+            "scopes": [scope.to_dict() for scope in
+                       (store.get(sid) for sid in scope_ids) if scope is not None],
+            "conditions": [
+                {"key": key, "value": value}
+                for key, value in store.fact_conditions([fact_id]).get(fact_id, ())
+            ],
         }
 
     async def summary(
@@ -536,6 +590,7 @@ class AtomMem:
         user_id: str,
         max_tokens: int = 1500,
         detail: bool = True,
+        scope_context: Optional[dict] = None,
     ) -> str:
         """Render the user's ``summary`` derived view.
 
@@ -549,13 +604,22 @@ class AtomMem:
                 ``fact_id`` (the UUIDs cost more tokens than they carry
                 information for the model) and priority-ordered rather than
                 recency-ordered.
+            scope_context: The session context payload. With it, the compact
+                depth is rendered as scope blocks (current scope, its ancestors,
+                its phases, the global rules, the condition-matching rules) so
+                the model can tell a project's rule from the company-wide one.
+                The detail depth ignores it: that view exists to locate and edit
+                facts, so it lists everything.
 
         Returns:
             A markdown string.
         """
         if self.db is None:
             raise RuntimeError("AtomMem is not started; call start() first")
-        return generate_summary(self.db, user_id, max_tokens, detail)
+        return generate_summary(
+            self.db, user_id, max_tokens, detail,
+            scope_context=scope_context, config=self.config,
+        )
 
     async def user_md(self, user_id: str, max_tokens: int = 800) -> str:
         """Render the user's profile as markdown.
@@ -575,6 +639,257 @@ class AtomMem:
             raise RuntimeError("AtomMem is not started; call start() first")
         return profile_md(self.db, user_id, max_tokens)
 
+    # -- scope surface -------------------------------------------------------------
+
+    def _scope_store(self) -> ScopeStore:
+        """Return a scope store over the live connection.
+
+        Rebuilt per call, like the worker's: the store caches scope labels, and a
+        long-lived instance would keep serving a label for a scope another process
+        has since merged or renamed. ``MemConfig.scope_aware`` is *not* consulted
+        here — the management surface exists even when automatic scope-awareness
+        is switched off, because that is how an operator inspects or repairs the
+        tree.
+        """
+        if self.db is None:
+            raise RuntimeError("AtomMem is not started; call start() first")
+        return ScopeStore(self.db, self.config)
+
+    def scope_list(
+        self, parent_id: Optional[int] = None, status: str = "active"
+    ) -> list:
+        """List scopes, optionally under one parent.
+
+        Args:
+            parent_id: Restrict to a parent's children; ``None`` lists every scope
+                with the given status.
+            status: ``active`` / ``merged`` / ``archived``.
+
+        Returns:
+            A list of scope dicts (``scope_id``, ``scope_type``, ``name``,
+            ``display_name``, ``parent_id``, ``path``, ``status``,
+            ``confidence``).
+        """
+        store = self._scope_store()
+        return [row.to_dict() for row in store.list_scopes(parent_id, status)]
+
+    def scope_resolve(
+        self,
+        user_id: str,
+        scope_context: Optional[dict] = None,
+        conditions: Optional[dict] = None,
+        session_id: str = "",
+        create: bool = False,
+    ) -> dict:
+        """Resolve a context payload to a scope, and say how confident it is.
+
+        Args:
+            user_id: Owner the context belongs to (candidate bookkeeping).
+            scope_context: The context payload.
+            conditions: Extra conditions to fold into the resolution.
+            session_id: Session the context came from.
+            create: Allow the resolution to create a scope. ``False`` (the
+                default) is read-only, which is what a diagnostic call wants;
+                the write path passes ``True``.
+
+        Returns:
+            The resolution as a dict, including the candidate queue entries and
+            the reason for the decision.
+        """
+        store = self._scope_store()
+        payload = dict(scope_context or {})
+        if conditions:
+            payload.setdefault("conditions", conditions)
+        _, resolution = resolution_for(
+            self.db, self.config, payload,
+            user_id=user_id, session_id=session_id, create=create,
+        )
+        return resolution.to_dict(store)
+
+    def scope_create(
+        self,
+        scope_type: str,
+        name: str,
+        parent_id: Optional[int] = None,
+        signals: Optional[dict] = None,
+        confidence: float = 0.5,
+        display_name: str = "",
+    ) -> dict:
+        """Create a scope explicitly (user action).
+
+        Args:
+            scope_type: One of the scope types (``client`` / ``project`` /
+                ``phase`` / ...).
+            name: The canonical name.
+            parent_id: Parent scope; ``None`` places it under the root.
+            signals: ``{signal_type: value}`` identities to register with it.
+            confidence: Evidence behind it; an explicit creation is normally
+                ``1.0``.
+            display_name: Optional short label.
+
+        Returns:
+            The created (or existing) scope as a dict.
+
+        Raises:
+            ValueError: On an invalid type/name, a parent that is not more
+                general, or a signal that already identifies another scope.
+        """
+        store = self._scope_store()
+        parsed = []
+        for signal_type, value in (signals or {}).items():
+            signal = make_signal(str(signal_type), str(value))
+            if signal is not None:
+                parsed.append(signal)
+        scope_id = store.create(
+            scope_type=scope_type,
+            name=name,
+            parent_id=parent_id,
+            signals=parsed,
+            confidence=confidence,
+            display_name=display_name,
+        )
+        row = store.get(scope_id)
+        assert row is not None  # just created
+        return row.to_dict()
+
+    def scope_alias_add(
+        self,
+        scope_id: int,
+        alias: str,
+        alias_type: str = "name",
+        confidence: float = 0.5,
+    ) -> dict:
+        """Register an alternative name for a scope.
+
+        Returns:
+            ``{"scope_id", "alias", "alias_type", "added"}``. ``added`` is
+            ``False`` when the alias already belongs to a *different* scope — an
+            alias is one identity and cannot point at two.
+        """
+        store = self._scope_store()
+        added = store.add_alias(int(scope_id), alias, alias_type, confidence)
+        return {
+            "scope_id": int(scope_id),
+            "alias": alias,
+            "alias_type": alias_type,
+            "added": added,
+        }
+
+    def scope_confirm(self, scope_id: int, confidence: float = 1.0) -> dict:
+        """Confirm a scope (raises its standing so it resolves without doubt)."""
+        store = self._scope_store()
+        return {
+            "scope_id": int(scope_id),
+            "confirmed": store.confirm(int(scope_id), confidence),
+        }
+
+    def scope_merge(self, from_id: int, to_id: int) -> dict:
+        """Merge two scopes that turned out to be the same thing."""
+        return self._scope_store().merge(int(from_id), int(to_id))
+
+    def scope_split(
+        self, from_id: int, name: str, scope_type: str, fact_ids: list
+    ) -> dict:
+        """Split facts out of a scope into a new child scope."""
+        new_id = self._scope_store().split(
+            int(from_id), name, scope_type, [str(f) for f in (fact_ids or [])]
+        )
+        return {"from": int(from_id), "scope_id": new_id}
+
+    def scope_reparent(self, scope_id: int, parent_id: int) -> dict:
+        """Move a scope under a different parent (operator correction)."""
+        return self._scope_store().reparent(int(scope_id), int(parent_id)).to_dict()
+
+    def scope_unresolved(self, user_id: str, limit: int = 50) -> list:
+        """List the scope candidates waiting for more evidence or a user's word."""
+        return self._scope_store().unresolved(user_id, limit)
+
+    async def scope_promote(self, user_id: Optional[str] = None) -> list:
+        """Run the cross-scope abstraction pass now.
+
+        The same pass the idle maintenance runs; exposed so an operator (or the
+        settings panel) can trigger it without waiting for the maintenance
+        interval.
+        """
+        if self._worker is None:
+            raise RuntimeError("AtomMem is not started; call start() first")
+        return await self._worker.promote_abstractions(user_id)
+
+    def fact_scope_bind(
+        self, user_id: str, fact_id: str, scope_ids: list, priority: int = 0
+    ) -> dict:
+        """Bind a fact to one or more scopes.
+
+        Args:
+            user_id: Owner of the fact (isolation check).
+            fact_id: The fact to bind.
+            scope_ids: Scopes it belongs to.
+            priority: Tie-break when a fact carries several bindings.
+
+        Returns:
+            ``{"fact_id", "scope_ids"}`` for the bindings actually stored.
+
+        Raises:
+            ValueError: When the fact is not an active fact of that user.
+        """
+        store = self._scope_store()
+        self._require_fact(user_id, fact_id)
+        return {
+            "fact_id": fact_id,
+            "scope_ids": store.bind_fact(
+                fact_id, [int(s) for s in (scope_ids or [])], priority
+            ),
+        }
+
+    def fact_condition_set(self, user_id: str, fact_id: str, conditions: list) -> dict:
+        """Replace a fact's conditions.
+
+        Args:
+            user_id: Owner of the fact (isolation check).
+            fact_id: The fact to update.
+            conditions: ``[{"key", "value"}]`` (or ``{key: value}``) conditions.
+
+        Returns:
+            ``{"fact_id", "conditions"}`` for the conditions actually stored.
+        """
+        store = self._scope_store()
+        self._require_fact(user_id, fact_id)
+        if isinstance(conditions, dict):
+            conditions = [{"key": k, "value": v} for k, v in conditions.items()]
+        pairs = store.set_conditions(fact_id, conditions or [])
+        return {
+            "fact_id": fact_id,
+            "conditions": [{"key": k, "value": v} for k, v in pairs],
+        }
+
+    def fact_scope_get(self, user_id: str, fact_id: str) -> dict:
+        """Return a fact's scope bindings, conditions, origin and evolution links."""
+        store = self._scope_store()
+        self._require_fact(user_id, fact_id)
+        scope_ids = list(store.fact_scopes([fact_id]).get(fact_id) or ())
+        return {
+            "fact_id": fact_id,
+            "scopes": [store.get(sid).to_dict() for sid in scope_ids if store.get(sid)],
+            "conditions": [
+                {"key": key, "value": value}
+                for key, value in store.fact_conditions([fact_id]).get(fact_id, ())
+            ],
+            "origins": store.origins_of(fact_id),
+            "evolution": store.evolution_of(fact_id),
+        }
+
+    def _require_fact(self, user_id: str, fact_id: str) -> None:
+        """Raise ``ValueError`` unless the fact is the user's and not retracted."""
+        if self.db is None:
+            raise RuntimeError("AtomMem is not started; call start() first")
+        row = self.db.execute(
+            "SELECT fact_id FROM facts WHERE user_id = ? AND fact_id = ? "
+            "AND status NOT IN ('retracted')",
+            (user_id, fact_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"no fact {fact_id} for user {user_id}")
+
     # -- mutation surface -----------------------------------------------------------
 
     async def replace(
@@ -583,6 +898,7 @@ class AtomMem:
         fact_id: str,
         new_text: str,
         wait_ms: Optional[int] = None,
+        scope_context: Optional[dict] = None,
     ) -> dict:
         """Replace an active fact with a new statement.
 
@@ -593,11 +909,17 @@ class AtomMem:
         that is the difference between ``replace`` and re-asserting a value
         through :meth:`add`.
 
+        The replacement inherits the replaced fact's scopes (the worker reads
+        them), so a correction does not move a project's memory into whatever
+        project the caller happens to be in. ``scope_context`` is still passed
+        through for the case where the replaced fact has no binding at all.
+
         Args:
             user_id: The user who owns the fact.
             fact_id: The active fact to replace.
             new_text: The replacement utterance to extract into facts.
             wait_ms: How long to wait for the write outcome (see :meth:`add`).
+            scope_context: The session context payload.
 
         Returns:
             A dict ``{"candidate_id", "status", "trace_id"}``, plus
@@ -621,6 +943,16 @@ class AtomMem:
         cleaned = clean_body_meta(new_text, self.config.max_content_chars)
         text = cleaned.text
         truncated = truncation_records([cleaned.record("content")])
+        payload = {
+            "candidate_id": candidate_id,
+            "user_id": user_id,
+            "old_fact_id": fact_id,
+            "new_text": text,
+            "session_id": old["session_id"],
+            "turn_id": 0,
+        }
+        if scope_context:
+            payload["scope_context"] = scope_context
         with self.db:
             self.db.execute(
                 "INSERT INTO fact_candidates(candidate_id, user_id, session_id, "
@@ -634,16 +966,7 @@ class AtomMem:
                 "VALUES (?, 'replace', ?, 'pending', 5, 0, ?, ?)",
                 (
                     str(uuid.uuid4()),
-                    json.dumps(
-                        {
-                            "candidate_id": candidate_id,
-                            "user_id": user_id,
-                            "old_fact_id": fact_id,
-                            "new_text": text,
-                            "session_id": old["session_id"],
-                            "turn_id": 0,
-                        }
-                    ),
+                    json.dumps(payload),
                     self.config.max_retries,
                     created_at,
                 ),
@@ -762,6 +1085,14 @@ class AtomMem:
             f"ORDER BY created_at DESC LIMIT ? OFFSET ?",
             (user_id, limit, offset),
         ).fetchall()
+        store = self._scope_store()
+        scope_map = store.fact_scopes([r["fact_id"] for r in rows])
+        cond_map = store.fact_conditions([r["fact_id"] for r in rows])
+        label_of = {
+            sid: store.label(sid)
+            for values in scope_map.values()
+            for sid in values
+        }
         facts = [
             {
                 "fact_id": r["fact_id"],
@@ -795,6 +1126,15 @@ class AtomMem:
                 "last_used_at": r["last_used_at"],
                 "status": r["status"],
                 "created_at": r["created_at"],
+                "scopes": list(scope_map.get(r["fact_id"], ())),
+                "scope_labels": [
+                    label_of.get(sid, "global")
+                    for sid in scope_map.get(r["fact_id"], ())
+                ],
+                "conditions": [
+                    {"key": key, "value": value}
+                    for key, value in cond_map.get(r["fact_id"], ())
+                ],
             }
             for r in rows
         ]

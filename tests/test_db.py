@@ -285,8 +285,20 @@ def test_v1_database_upgrades_to_v2_with_type_default(tmp_path):
     conn = open_db(MemConfig(db_path=path))
     try:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        # v11 clears the legacy facts (scope binding cannot be back-filled; see
+        # the migration header), so the retro-fitted columns are exercised on a
+        # row written *after* the upgrade — which is what the default really
+        # has to serve.
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM facts"
+        ).fetchone()["n"] == 0
+        conn.execute(
+            "INSERT INTO facts(fact_id, user_id, session_id, subject, predicate, "
+            "object, observed_at, created_at) VALUES ('f2','u1','s1','用户',"
+            "'偏好','黑咖啡',1000,1000)"
+        )
         row = conn.execute(
-            "SELECT type FROM facts WHERE fact_id = ?", ("f1",)
+            "SELECT type FROM facts WHERE fact_id = ?", ("f2",)
         ).fetchone()
         assert row is not None
         assert row["type"] == "semantic"
@@ -296,8 +308,9 @@ def test_v1_database_upgrades_to_v2_with_type_default(tmp_path):
         assert conn.execute(
             "SELECT COUNT(*) AS n FROM user_profile"
         ).fetchone()["n"] == 0
+        # The scope dimension exists from this version on, with its root.
         assert conn.execute(
-            "SELECT COUNT(*) AS n FROM facts"
+            "SELECT COUNT(*) AS n FROM scope WHERE id = 1 AND path = '/global'"
         ).fetchone()["n"] == 1
     finally:
         conn.close()
@@ -378,8 +391,19 @@ def test_v2_database_upgrades_to_v3_with_null_content(tmp_path):
     conn = open_db(MemConfig(db_path=path))
     try:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        # v11 clears the legacy facts (see its migration header), so the
+        # retro-fitted `type` / `content` columns are checked on a row written
+        # after the upgrade.
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM facts"
+        ).fetchone()["n"] == 0
+        conn.execute(
+            "INSERT INTO facts(fact_id, user_id, session_id, subject, predicate, "
+            "object, observed_at, created_at) VALUES ('f2','u1','s1','用户',"
+            "'偏好','黑咖啡',1000,1000)"
+        )
         row = conn.execute(
-            "SELECT type, content FROM facts WHERE fact_id = ?", ("f1",)
+            "SELECT type, content FROM facts WHERE fact_id = ?", ("f2",)
         ).fetchone()
         # pre-existing rows get type default and NULL content
         assert row["type"] == "semantic"
@@ -392,11 +416,11 @@ def test_v2_database_upgrades_to_v3_with_null_content(tmp_path):
         # column accepts a structured body
         conn.execute(
             "UPDATE facts SET content = ? WHERE fact_id = ?",
-            ('{"steps":["a","b"]}', "f1"),
+            ('{"steps":["a","b"]}', "f2"),
         )
         conn.commit()
         assert conn.execute(
-            "SELECT content FROM facts WHERE fact_id = ?", ("f1",)
+            "SELECT content FROM facts WHERE fact_id = ?", ("f2",)
         ).fetchone()["content"] == '{"steps":["a","b"]}'
     finally:
         conn.close()
@@ -477,7 +501,9 @@ def test_v3_database_upgrades_through_the_profile_ownership_migration(tmp_path):
     try:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         # v10 leaves no `pinned` column behind, and clears the projection
-        # output. The facts — the actual memory — survive untouched.
+        # output. v11 then clears the facts themselves — scope binding cannot be
+        # back-filled (see the migration header), so the memory store starts
+        # empty rather than with rows filed under a scope nobody chose.
         cols = {r[1] for r in conn.execute("PRAGMA table_info(user_profile)").fetchall()}
         assert "pinned" not in cols
         assert conn.execute(
@@ -485,6 +511,17 @@ def test_v3_database_upgrades_through_the_profile_ownership_migration(tmp_path):
         ).fetchone()["n"] == 0
         assert conn.execute(
             "SELECT COUNT(*) AS n FROM facts"
+        ).fetchone()["n"] == 0
+        # The scope tree is in place and indexed, and the index tables accept
+        # writes (they were re-created by v11).
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM scope"
+        ).fetchone()["n"] == 1
+        conn.execute(
+            "INSERT INTO facts_fts(fact_id, text) VALUES ('x', 'text')"
+        )
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM facts_fts"
         ).fetchone()["n"] == 1
     finally:
         conn.close()
@@ -496,6 +533,11 @@ def test_v4_database_upgrades_to_v5_with_zero_reinforcement(tmp_path):
     Migration 005 must retro-fit existing facts as *un-reinforced*: their
     effective importance stays exactly the importance written at extraction
     time, so upgrading never silently re-ranks an existing memory.
+
+    Migration 011 then clears those facts (see its header: scope binding cannot
+    be back-filled), so the retro-fitted defaults are asserted on a row written
+    after the upgrade — which is the row the defaults actually have to serve from
+    this version on.
     """
     import sqlite3
 
@@ -559,9 +601,14 @@ def test_v4_database_upgrades_to_v5_with_zero_reinforcement(tmp_path):
     conn = open_db(MemConfig(db_path=path))
     try:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        conn.execute(
+            "INSERT INTO facts(fact_id, user_id, session_id, subject, predicate, "
+            "object, importance, observed_at, created_at) "
+            "VALUES ('f2','u1','s1','用户','偏好','黑咖啡',0.75,1000,1000)"
+        )
         row = conn.execute(
             "SELECT importance, reinforce_count, last_used_at, last_seen_at "
-            "FROM facts WHERE fact_id = 'f1'"
+            "FROM facts WHERE fact_id = 'f2'"
         ).fetchone()
         assert row["importance"] == pytest.approx(0.75)
         assert row["reinforce_count"] == 0.0

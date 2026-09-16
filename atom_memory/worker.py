@@ -50,6 +50,7 @@ from .conflict import (
     resolve_conflict,
 )
 from .config import MemConfig
+from .context import GLOBAL_SCOPE_ID, MAX_CONDITIONS, normalize_conditions
 from .db import index_orphans, now_ms, record_event
 from .fingerprint import BODY_IDENTIFIED_TYPES, content_fingerprint
 from .models import (
@@ -65,7 +66,18 @@ from .reinforce import (
     record_reinforcement,
 )
 from .retriever import segment_text
-from .validator import has_negation, is_multi_valued, validate
+from .scope import (
+    STATUS_GLOBAL,
+    ScopeResolution,
+    ScopeStore,
+    resolution_for,
+)
+from .validator import (
+    cross_scope_neighbours,
+    has_negation,
+    is_multi_valued,
+    validate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +142,11 @@ def _candidate_from_rpc_dict(
     confidence = d.get("confidence")
     if confidence is None:
         confidence = DEFAULT_CONFIDENCE
+    conditions = d.get("conditions")
+    if isinstance(conditions, dict):
+        # The host may send `{"language": "typescript"}` as readily as the
+        # list form the extraction prompt asks for; both mean the same thing.
+        conditions = [{"key": k, "value": v} for k, v in conditions.items()]
     return FactCandidate(
         candidate_id=str(uuid.uuid4()),
         user_id=d.get("user_id") or user_id,
@@ -146,6 +163,8 @@ def _candidate_from_rpc_dict(
         idempotency_key=d.get("idempotency_key"),
         type=memory_type,
         content=d.get("content"),
+        conditions=conditions if isinstance(conditions, list) else None,
+        scope_hint=d.get("scope_hint"),
     )
 
 
@@ -157,8 +176,11 @@ def empty_outcome() -> dict:
     what was refused and why, and what had to be shortened.
 
     Returns:
-        ``{"written", "superseded", "rejected", "reinforced", "truncated"}`` —
-        all lists.
+        ``{"written", "superseded", "rejected", "reinforced", "truncated",
+        "cross_scope"}`` — all lists. ``cross_scope`` carries the relations
+        recorded against same-key facts in *other* scopes; it is a list (not a
+        scope dict) so the shape stays uniform, and the resolved scope itself is
+        added by the write gate as a ``scope`` key.
     """
     return {
         "written": [],
@@ -166,6 +188,7 @@ def empty_outcome() -> dict:
         "rejected": [],
         "reinforced": [],
         "truncated": [],
+        "cross_scope": [],
     }
 
 
@@ -504,13 +527,14 @@ class Worker:
 
         Args:
             payload: The task payload (candidate_id, user_id, session_id,
-                turn_id, raw_text).
+                turn_id, raw_text, optional scope_context).
         """
         candidate_id = payload["candidate_id"]
         user_id = payload["user_id"]
         session_id = payload["session_id"]
         turn_id = int(payload.get("turn_id", 0))
         text = payload.get("raw_text", "")
+        scope_context = payload.get("scope_context")
 
         candidates = self.extractor.extract(text, user_id, session_id, turn_id)
 
@@ -518,7 +542,9 @@ class Worker:
             self._finish_candidate(candidate_id, CAND_STATUS_SKIPPED)
             return
 
-        outcome = await self._apply_candidates(candidates, user_id, session_id)
+        outcome = await self._apply_candidates(
+            candidates, user_id, session_id, scope_context=scope_context
+        )
         self._finish_candidate(
             candidate_id, CAND_STATUS_APPLIED, outcome=outcome
         )
@@ -555,6 +581,8 @@ class Worker:
         user_id: str,
         session_id: str,
         force_supersede: Optional[List[str]] = None,
+        scope_context: Optional[dict] = None,
+        force_scope_ids: Optional[List[int]] = None,
     ) -> dict:
         """Validate and persist a batch of candidates under one outcome.
 
@@ -571,6 +599,10 @@ class Worker:
         evidence (ties go to the first, and the losers are reported as
         ``batch_duplicate`` rather than silently absorbed).
 
+        Scope is resolved **once per batch**, before any candidate is validated:
+        one utterance comes from one place, and a per-candidate resolution would
+        let two facts from the same sentence land in different projects.
+
         Args:
             candidates: Candidates to persist.
             user_id: Owner of the facts.
@@ -579,14 +611,29 @@ class Worker:
                 replace (``replace`` requests). Those are superseded by the new
                 fact even when the evidence comparison would have kept them —
                 the caller named them.
+            scope_context: The session context payload (see
+                :func:`~atom_memory.scope.resolution_for`), or ``None`` for a
+                scope-blind write.
+            force_scope_ids: Scopes the new facts must bind to, whatever the
+                context says. Used by ``replace`` so a replacement stays in the
+                scope of the fact it replaces rather than jumping to wherever the
+                caller happens to be now.
 
         Returns:
-            The accumulated :func:`empty_outcome` mapping.
+            The accumulated :func:`empty_outcome` mapping, plus a ``scope`` key
+            describing where the batch was filed.
         """
         forced = {str(fid) for fid in (force_supersede or [])}
         outcome = empty_outcome()
         winners = self._dedupe_batch(candidates, outcome)
         new_ids: List[str] = []
+
+        store = self.scope_store()
+        resolution = self._resolve_write_scope(
+            user_id, session_id, scope_context, force_scope_ids
+        )
+        visible_ids = self._write_scope_ids(resolution)
+        outcome["scope"] = resolution.to_dict(store)
 
         for candidate in winners:
             result = validate(
@@ -595,6 +642,7 @@ class Worker:
                 privacy_filter=self.privacy_filter,
                 max_field_chars=self.config.max_field_chars,
                 max_content_chars=self.config.max_content_chars,
+                scope_ids=visible_ids,
             )
             if not result.ok:
                 if result.kind == "idempotent" and result.suppressed:
@@ -619,7 +667,7 @@ class Worker:
                     continue
                 if result.kind == "conflict" and result.conflict_rows:
                     await self._resolve_and_write(
-                        candidate, result, outcome, forced
+                        candidate, result, outcome, forced, resolution, visible_ids
                     )
                     continue
                 self._reject(
@@ -630,7 +678,13 @@ class Worker:
                 )
                 continue
 
-            persisted = await self._persist_fact(candidate, trace_id=None)
+            persisted = await self._persist_fact(
+                candidate,
+                trace_id=None,
+                scope_ids=visible_ids,
+                bind_scope_id=resolution.scope_id,
+                conditions=self._conditions_for(candidate, resolution),
+            )
             if not persisted.written:
                 # The claim (or the body) is already stored: this is a repeat, and
                 # the only correct effect is the reinforcement `_fold_into` just
@@ -650,6 +704,9 @@ class Worker:
                 outcome["truncated"].extend(result.truncated_fields)
             new_ids.append(persisted.fact_id)
             outcome["written"].append(persisted.fact_id)
+            self._link_cross_scope(
+                candidate, persisted.fact_id, resolution.scope_id, visible_ids, outcome
+            )
 
         # A `replace` whose new text no longer collides with anything still has
         # to retire the fact the caller named.
@@ -730,6 +787,8 @@ class Worker:
         result,
         outcome: dict,
         forced: set,
+        scope_resolution: ScopeResolution,
+        visible_ids: List[int],
     ) -> None:
         """Apply the conflict policy to one contradicting candidate.
 
@@ -738,6 +797,8 @@ class Worker:
             result: The validator's result, carrying ``conflict_rows``.
             outcome: The outcome accumulator.
             forced: Fact ids the caller explicitly asked to replace.
+            scope_resolution: The scope the batch is being written into.
+            visible_ids: The scopes visible from it (dedup/conflict window).
         """
         rows = list(result.conflict_rows or [])
         resolution = resolve_conflict(
@@ -779,7 +840,13 @@ class Worker:
         supersede_ids = [
             str(r["fact_id"]) for r in rows if str(r["fact_id"]) in forced
         ] or list(resolution.supersede_ids)
-        persisted = await self._persist_fact(candidate, trace_id=None)
+        persisted = await self._persist_fact(
+            candidate,
+            trace_id=None,
+            scope_ids=visible_ids,
+            bind_scope_id=scope_resolution.scope_id,
+            conditions=self._conditions_for(candidate, scope_resolution),
+        )
         if not persisted.written:
             # The new value turned out to be the one already stored (a reworded
             # repeat of an active claim). Retiring anything now would remove the
@@ -798,6 +865,9 @@ class Worker:
         for old_id in supersede_ids:
             self._supersede(old_id, new_id)
         outcome["written"].append(new_id)
+        self._link_cross_scope(
+            candidate, new_id, scope_resolution.scope_id, visible_ids, outcome
+        )
         outcome["superseded"].append(
             {
                 "old_fact_id": supersede_ids[0] if supersede_ids else None,
@@ -883,13 +953,15 @@ class Worker:
         Args:
             payload: keys ``candidate_id``, ``user_id``, ``session_id``,
                 ``turn_id``, ``candidates`` (list of dicts with subject /
-                predicate / object / type / content / qualifiers ...).
+                predicate / object / type / content / qualifiers / conditions /
+                scope_hint ...), optional ``scope_context``.
         """
         candidate_id = payload.get("candidate_id") or str(uuid.uuid4())
         user_id = payload["user_id"]
         session_id = payload.get("session_id", "s_default")
         turn_id = int(payload.get("turn_id", 0))
         candidates = payload.get("candidates") or []
+        scope_context = payload.get("scope_context")
 
         if not candidates:
             self._finish_candidate(candidate_id, CAND_STATUS_SKIPPED)
@@ -899,7 +971,9 @@ class Worker:
             _candidate_from_rpc_dict(d, user_id, session_id, turn_id)
             for d in candidates
         ]
-        outcome = await self._apply_candidates(parsed, user_id, session_id)
+        outcome = await self._apply_candidates(
+            parsed, user_id, session_id, scope_context=scope_context
+        )
         self._finish_candidate(candidate_id, CAND_STATUS_APPLIED, outcome=outcome)
 
     def _finish_candidate(
@@ -950,7 +1024,12 @@ class Worker:
         self.conn.commit()
 
     async def _persist_fact(
-        self, candidate: FactCandidate, trace_id: Optional[str]
+        self,
+        candidate: FactCandidate,
+        trace_id: Optional[str],
+        scope_ids: Optional[List[int]] = None,
+        bind_scope_id: Optional[int] = None,
+        conditions: Tuple[Tuple[str, str], ...] = (),
     ) -> PersistResult:
         """Persist a validated candidate, or fold it into a memory already held.
 
@@ -971,15 +1050,27 @@ class Worker:
            false merge removes a distinct memory from the working set, while a
            missed merge only costs a row.
 
-        The three index writes go in **one transaction**, and the embedding is
-        computed before it opens. They are one logical fact: an interruption
-        between them used to leave a row that full-text search could find and
-        semantic search could not, which no caller could distinguish from "the
-        fact is fine".
+        Both tests are **restricted to the write's own scope window**
+        (``scope_ids``). That is the design's rule, and it is what makes a claim
+        repeated in a second project a *second fact* (linked through
+        ``fact_origin``) rather than a silent merge: an independent restatement is
+        the evidence :meth:`~atom_memory.scope.ScopeStore.abstraction_candidates`
+        promotes into a global rule, and folding it away destroys exactly that.
+
+        The fact row, its FTS entry, its vector, its scope binding and its
+        conditions go in **one transaction**, and the embedding is computed before
+        it opens. They are one logical fact: an interruption between them used to
+        leave a row that full-text search could find and semantic search could
+        not, which no caller could distinguish from "the fact is fine".
 
         Args:
             candidate: The validated candidate.
             trace_id: Optional trace id recorded with the fact.
+            scope_ids: The scopes visible from the write's scope; ``None``
+                disables the scope filter (scope-blind writes).
+            bind_scope_id: The scope the new fact is filed under. ``None`` leaves
+                the fact unbound, which every read path reads as global.
+            conditions: Normalised conditions to store with the fact.
 
         Returns:
             What happened: the new fact id, or the fact this candidate was
@@ -987,10 +1078,27 @@ class Worker:
         """
         fingerprint = self._fingerprint(candidate)
 
+        scope_sql = ""
+        scope_args: list = []
+        if scope_ids is not None:
+            placeholders = ",".join("?" for _ in scope_ids)
+            unbound = ""
+            if GLOBAL_SCOPE_ID in scope_ids:
+                unbound = (
+                    " OR NOT EXISTS (SELECT 1 FROM fact_scope fsu "
+                    "WHERE fsu.fact_id = facts.fact_id)"
+                )
+            scope_sql = (
+                f"AND (EXISTS (SELECT 1 FROM fact_scope fs "
+                f"WHERE fs.fact_id = facts.fact_id "
+                f"AND fs.scope_id IN ({placeholders})){unbound}) "
+            )
+            scope_args = list(scope_ids)
+
         existing = self.conn.execute(
             "SELECT fact_id FROM facts WHERE user_id = ? AND content_fingerprint = ? "
-            "AND status = 'active' ORDER BY created_at ASC LIMIT 1",
-            (candidate.user_id, fingerprint),
+            "AND status = 'active' " + scope_sql + "ORDER BY created_at ASC LIMIT 1",
+            [candidate.user_id, fingerprint, *scope_args],
         ).fetchone()
         if existing is not None:
             return self._fold_into(str(existing["fact_id"]), candidate, "fingerprint")
@@ -1005,7 +1113,7 @@ class Worker:
         # responsive during model inference.
         blob = await asyncio.to_thread(self.embed_func, searchable)
 
-        near = self._near_duplicate(candidate, blob)
+        near = self._near_duplicate(candidate, blob, scope_ids)
         if near is not None:
             return self._fold_into(near, candidate, "embedding")
 
@@ -1051,6 +1159,21 @@ class Worker:
                 "INSERT INTO facts_vec(fact_id, embedding) VALUES (?, ?)",
                 (fact_id, blob),
             )
+            # The scope binding and the conditions belong to the same
+            # transaction as the row: a fact that exists but is unbound would be
+            # read as a global fact (the compatibility rule), which is the one
+            # wrong answer that looks normal.
+            if bind_scope_id is not None:
+                self.conn.execute(
+                    "INSERT INTO fact_scope(fact_id, scope_id, priority) "
+                    "VALUES (?, ?, 0) ON CONFLICT(fact_id, scope_id) DO NOTHING",
+                    (fact_id, int(bind_scope_id)),
+                )
+            for key, value in conditions:
+                self.conn.execute(
+                    "INSERT INTO fact_condition(fact_id, key, value) VALUES (?, ?, ?)",
+                    (fact_id, key, value),
+                )
         return PersistResult(fact_id)
 
     def _fingerprint(self, candidate: FactCandidate) -> str:
@@ -1102,18 +1225,26 @@ class Worker:
         )
         return PersistResult(None, on, fact_id)
 
-    def _near_duplicate(self, candidate: FactCandidate, blob: bytes) -> Optional[str]:
+    def _near_duplicate(
+        self,
+        candidate: FactCandidate,
+        blob: bytes,
+        scope_ids: Optional[List[int]] = None,
+    ) -> Optional[str]:
         """Find an active fact whose body is the same memory, reworded.
 
         Narrow on purpose, because the failure modes are asymmetric: merging two
         genuinely different procedures loses one of them from every recall, while
         a missed merge costs one redundant row. The comparison therefore requires
-        the same owner, type, subject **and** predicate, and a distance inside a
-        tight gate, and it only runs for bodies long enough to be a document.
+        the same owner, type, subject **and** predicate, a distance inside a tight
+        gate, and — when the write is scoped — membership of the same scope
+        window, and it only runs for bodies long enough to be a document.
 
         Args:
             candidate: The candidate being written.
             blob: Its serialised embedding (already computed for the write).
+            scope_ids: The write's scope window, or ``None`` to compare across
+                every scope.
 
         Returns:
             The fact id to fold into, or ``None``.
@@ -1133,6 +1264,7 @@ class Worker:
         except sqlite3.Error:
             logger.exception("Near-duplicate probe failed; storing as a new fact")
             return None
+        window = set(int(s) for s in scope_ids) if scope_ids is not None else None
         for neighbour in neighbours:
             distance = neighbour["distance"]
             if distance is None or float(distance) > threshold:
@@ -1150,8 +1282,208 @@ class Worker:
                 continue
             if (fact["predicate"] or "") != (candidate.predicate or ""):
                 continue
+            if window is not None and not self._fact_in_window(
+                str(fact["fact_id"]), window
+            ):
+                continue
             return str(fact["fact_id"])
         return None
+
+    def _fact_in_window(self, fact_id: str, window: set) -> bool:
+        """Whether a fact is visible from a scope window.
+
+        An unbound fact counts as global, so it is inside every window that
+        contains the root — which every resolution does.
+        """
+        rows = self.conn.execute(
+            "SELECT scope_id FROM fact_scope WHERE fact_id = ?", (fact_id,)
+        ).fetchall()
+        if not rows:
+            return GLOBAL_SCOPE_ID in window
+        return any(int(r["scope_id"]) in window for r in rows)
+
+    # -- scope plumbing ------------------------------------------------------
+
+    def scope_store(self) -> ScopeStore:
+        """Return the scope store bound to this worker's connection.
+
+        Rebuilt per call rather than cached: the store holds a label cache, and a
+        long-lived worker that cached it would keep serving labels for scopes
+        renamed or merged in another process.
+        """
+        return ScopeStore(self.conn, self.config)
+
+    def _resolve_write_scope(
+        self,
+        user_id: str,
+        session_id: str,
+        scope_context: Optional[dict],
+        force_scope_ids: Optional[List[int]] = None,
+    ) -> ScopeResolution:
+        """Decide where a batch of writes belongs.
+
+        Args:
+            user_id: Owner of the write.
+            session_id: Session the context came from.
+            scope_context: The host's context payload, or ``None``.
+            force_scope_ids: Scopes the write must use (a ``replace`` inherits
+                the replaced fact's scopes). When given, no resolution runs at
+                all: the caller has already decided, and re-resolving could file
+                the replacement in a different project from the fact it replaces.
+
+        Returns:
+            The resolution to file the batch under. Always a real scope id: with
+            scope awareness disabled, or with no usable context, that is the root,
+            which is exactly the pre-scope behaviour.
+        """
+        store = self.scope_store()
+        if force_scope_ids:
+            target = int(force_scope_ids[0])
+            return ScopeResolution(
+                scope_id=target,
+                confidence=1.0,
+                status=STATUS_GLOBAL if target == GLOBAL_SCOPE_ID else "bound",
+                detail="scope inherited from the replaced fact",
+            )
+        if not self.config.scope_aware:
+            return ScopeResolution(
+                scope_id=GLOBAL_SCOPE_ID,
+                confidence=1.0,
+                status=STATUS_GLOBAL,
+                detail="scope awareness disabled",
+            )
+        _, resolution = resolution_for(
+            self.conn,
+            self.config,
+            scope_context,
+            user_id=user_id,
+            session_id=session_id,
+            create=True,
+        )
+        # A plain global resolution is the default for a caller that sends no
+        # context, and an audit line per write saying "nothing to resolve" would
+        # bury the resolutions that are actually interesting.
+        if resolution.status != STATUS_GLOBAL:
+            record_event(
+                self.conn,
+                "scope_resolved",
+                {
+                    "status": resolution.status,
+                    "scope_id": resolution.scope_id,
+                    "confidence": round(float(resolution.confidence), 4),
+                    "matched": list(resolution.matched),
+                    "candidates": [c.to_dict() for c in resolution.candidates],
+                },
+                user_id=user_id,
+            )
+        return resolution
+
+    def _write_scope_ids(self, resolution: ScopeResolution) -> Optional[List[int]]:
+        """Return the scopes a write's dedup/conflict window covers.
+
+        **Exactly the write's own scope** — one id — and not its ancestors. That
+        is the design's rule for a collision across scopes: "具体覆盖一般 → 保留双
+        方，具体作用域优先级更高" (§5.4). If the window included ancestors, a
+        project that states its own value under a single-valued key would
+        *supersede* the global rule rather than coexist with it, and the general
+        rule — the one every other project still needs — would be gone. Recall
+        expands ancestors instead (§6.2), so the project's statement and the
+        global rule are both returned, the specific one ranked higher.
+
+        A fact with no binding counts as global (the compatibility rule), which is
+        why the window is expressed as a scope id rather than as a set of facts.
+
+        Returns ``None`` when scope awareness is off, which switches every
+        scope-aware query back to its pre-scope form.
+        """
+        if not self.config.scope_aware:
+            return None
+        return [int(resolution.scope_id)]
+
+    def _conditions_for(
+        self, candidate: FactCandidate, resolution: ScopeResolution
+    ) -> Tuple[Tuple[str, str], ...]:
+        """Return the conditions to store with a fact.
+
+        The context's conditions (``doc_type=proposal`` for a session that is
+        writing a proposal) and the extractor's own conditions are merged: both
+        describe when the claim holds, and dropping either would make the fact
+        look unconditional. Capped and normalised by
+        :func:`~atom_memory.context.normalize_conditions`.
+        """
+        merged: List[Tuple[str, str]] = list(resolution.conditions or ())
+        merged.extend(normalize_conditions(candidate.conditions or ()))
+        if not merged:
+            return ()
+        return tuple(sorted(set(merged)))[:MAX_CONDITIONS]
+
+    def _link_cross_scope(
+        self,
+        candidate: FactCandidate,
+        fact_id: str,
+        scope_id: int,
+        visible_ids: Optional[List[int]],
+        outcome: dict,
+    ) -> None:
+        """Record relations between a new fact and same-key facts elsewhere.
+
+        Called for every fact that was actually written. The design forbids
+        judging a contradiction across scopes — "a project overrides the global
+        rule" is not evidence the rule is wrong — so the two statements are kept
+        and the relation between them is recorded instead
+        (:meth:`~atom_memory.scope.ScopeStore.relate_cross_scope`). The resulting
+        links are what the abstraction pass later reads to promote a pattern that
+        several projects arrived at independently.
+
+        Best-effort: a missing relation costs an explanation, never a fact.
+        """
+        if visible_ids is None or not candidate.subject or not candidate.predicate:
+            return
+        try:
+            neighbours = cross_scope_neighbours(candidate, self.conn, visible_ids)
+        except sqlite3.Error:  # pragma: no cover - defensive
+            logger.exception("Cross-scope neighbour lookup failed")
+            return
+        if not neighbours:
+            return
+        store = self.scope_store()
+        candidate_neg = has_negation(candidate.qualifiers)
+        cand_obj = (candidate.object or "").strip()
+        relations: List[dict] = []
+        for neighbour in neighbours:
+            other_id = str(neighbour["fact_id"])
+            if other_id == fact_id:
+                continue
+            same_object = (
+                (neighbour["object"] or "").strip() == cand_obj
+                and has_negation(neighbour["qualifiers"]) == candidate_neg
+            )
+            other_scopes = store.fact_scopes([other_id]).get(other_id) or ()
+            if not other_scopes:
+                continue
+            relation = store.relate_cross_scope(
+                fact_id,
+                scope_id,
+                other_id,
+                int(other_scopes[0]),
+                same_object,
+            )
+            relations.append(
+                {"other_fact_id": other_id, "relation": relation,
+                 "same_object": same_object}
+            )
+        if relations:
+            outcome.setdefault("cross_scope", []).extend(relations)
+            record_event(
+                self.conn,
+                "fact_cross_scope",
+                {
+                    "fact_id": fact_id,
+                    "scope_id": scope_id,
+                    "relations": relations,
+                },
+                user_id=candidate.user_id,
+            )
 
     # -- mutation bookkeeping -----------------------------------------------------
 
@@ -1233,7 +1565,7 @@ class Worker:
 
         Args:
             payload: keys candidate_id, user_id, old_fact_id, new_text,
-                session_id, turn_id.
+                session_id, turn_id, optional scope_context.
         """
         candidate_id = payload["candidate_id"]
         user_id = payload["user_id"]
@@ -1252,12 +1584,24 @@ class Worker:
             self._finish_candidate(candidate_id, CAND_STATUS_SKIPPED)
             return
 
+        # A replacement belongs where the fact it replaces belongs. Resolving
+        # from the *current* context instead would silently move a fact from the
+        # project it documents into whatever project the caller is in now.
+        inherited = list(
+            self.scope_store().fact_scopes([old_fact_id]).get(old_fact_id) or ()
+        )
+
         candidates = self.extractor.extract(text, user_id, session_id, turn_id)
         if not candidates:
             self._finish_candidate(candidate_id, CAND_STATUS_SKIPPED)
             return
         outcome = await self._apply_candidates(
-            candidates, user_id, session_id, force_supersede=[old_fact_id]
+            candidates,
+            user_id,
+            session_id,
+            force_supersede=[old_fact_id],
+            scope_context=payload.get("scope_context"),
+            force_scope_ids=inherited or None,
         )
         self._finish_candidate(candidate_id, CAND_STATUS_APPLIED, outcome=outcome)
 
@@ -1339,16 +1683,16 @@ class Worker:
         return now_ms() - self._last_maintenance >= interval * 1000.0
 
     async def maintenance(self, user_id: Optional[str] = None) -> dict:
-        """Run the retention, repair and capacity passes.
+        """Run the retention, repair, capacity and promotion passes.
 
         Everything here is *policy about what the store keeps*: bookkeeping
         rows past their retention are collected, facts whose index entries went
-        missing are re-derived, and — only when a capacity cap is configured —
-        the least valuable unprotected facts move to the archive tier.
+        missing are re-derived, the least valuable unprotected facts move to the
+        archive tier when a capacity cap is configured, and a claim that several
+        scopes arrived at independently is promoted to a global rule.
 
         Args:
-            user_id: Restrict the capacity pass to one user; ``None`` checks
-                every user.
+            user_id: Restrict the passes to one user; ``None`` covers every user.
 
         Returns:
             A summary dict of what changed.
@@ -1360,6 +1704,7 @@ class Worker:
             "pruned_events": 0,
             "repaired": {},
             "archived": [],
+            "promoted": [],
         }
         try:
             result["pruned_candidates"] = self._prune_table(
@@ -1382,10 +1727,157 @@ class Worker:
             )
             result["repaired"] = await self.repair_index()
             result["archived"] = self.enforce_capacity(user_id)
+            result["promoted"] = await self.promote_abstractions(user_id)
         except Exception:  # pragma: no cover - maintenance must not kill the loop
             logger.exception("Maintenance pass failed")
         self.last_maintenance_result = result
         return result
+
+    async def promote_abstractions(self, user_id: Optional[str] = None) -> List[dict]:
+        """Promote claims that several scopes hold independently into global rules.
+
+        The design's cross-project reuse rule: a pattern three different projects
+        arrived at is not a project detail, it is how the work is done — and
+        leaving it inside those three projects means the fourth re-learns it. The
+        concrete facts stay: they are the evidence behind the rule (linked through
+        ``fact_origin``) and the place a project-specific nuance remains visible.
+
+        Runs from the maintenance pass rather than from the write path because it
+        is a *store-wide* judgement (it needs three independent scopes, which no
+        single write can see) and because the promoted row needs an embedding like
+        any other fact.
+
+        Args:
+            user_id: Restrict to one user; ``None`` covers every user.
+
+        Returns:
+            One entry per promoted rule: ``{"fact_id", "fingerprint",
+            "source_fact_ids", "scope_ids"}``.
+        """
+        if not self.config.scope_aware:
+            return []
+        store = self.scope_store()
+        owners = (
+            [user_id]
+            if user_id
+            else [
+                str(r["user_id"])
+                for r in self.conn.execute(
+                    "SELECT DISTINCT user_id FROM facts WHERE status = 'active'"
+                ).fetchall()
+            ]
+        )
+        promoted: List[dict] = []
+        for owner in owners:
+            for candidate in store.abstraction_candidates(owner):
+                source = self.conn.execute(
+                    "SELECT fact_id, user_id, session_id, subject, predicate, object, "
+                    "qualifiers, confidence, importance, privacy, type, content, "
+                    "content_fingerprint FROM facts WHERE fact_id = ? AND status = 'active'",
+                    (candidate["representative"],),
+                ).fetchone()
+                if source is None:
+                    continue
+                row = dict(source)
+                # The rule inherits the strongest evidence among its sources: a
+                # rule derived from a strongly-held claim must not be diluted by
+                # the promotion itself.
+                strongest = self.conn.execute(
+                    "SELECT MAX(importance) AS imp, MAX(confidence) AS conf FROM facts "
+                    "WHERE fact_id IN (" + ",".join("?" for _ in candidate["fact_ids"])
+                    + ")",
+                    candidate["fact_ids"],
+                ).fetchone()
+                if strongest is not None:
+                    row["importance"] = max(
+                        float(row.get("importance") or 0.0),
+                        float(strongest["imp"] or 0.0),
+                    )
+                    row["confidence"] = max(
+                        float(row.get("confidence") or 0.0),
+                        float(strongest["conf"] or 0.0),
+                    )
+                fact_id = await self._write_abstracted_fact(row)
+                if fact_id is None:
+                    continue
+                for source_id in candidate["fact_ids"]:
+                    store.link_origin(fact_id, source_id, "abstraction")
+                record_event(
+                    self.conn,
+                    "scope_abstraction_promoted",
+                    {
+                        "fact_id": fact_id,
+                        "source_fact_ids": candidate["fact_ids"],
+                        "scope_ids": candidate["scope_ids"],
+                    },
+                    user_id=owner,
+                )
+                promoted.append(
+                    {
+                        "fact_id": fact_id,
+                        "fingerprint": candidate["fingerprint"],
+                        "source_fact_ids": candidate["fact_ids"],
+                        "scope_ids": candidate["scope_ids"],
+                    }
+                )
+        if promoted:
+            logger.info("Promoted %d cross-scope claim(s) to global rules", len(promoted))
+        return promoted
+
+    async def _write_abstracted_fact(self, source: dict) -> Optional[str]:
+        """Write a promoted global rule, indexes and all.
+
+        The rule is stored as ``system_inferred_high`` rather than
+        ``user_explicit``: nobody stated it *as a global rule* — three projects
+        stating it is what makes it one, and the trust term in the re-rank should
+        reflect that provenance.
+        """
+        fact_id = str(uuid.uuid4())
+        text = f"{source['subject']} {source['predicate']} {source['object']}"
+        content = source.get("content") or ""
+        searchable = (text + " " + content).strip()
+        created_at = now_ms()
+        blob = await asyncio.to_thread(self.embed_func, searchable or " ")
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO facts(fact_id, user_id, session_id, subject, predicate, "
+                "object, qualifiers, confidence, importance, privacy, source_type, "
+                "status, superseded_by, observed_at, created_at, trace_id, version, "
+                "type, content, content_fingerprint) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'system_inferred_high', "
+                "'active', NULL, ?, ?, NULL, 1, ?, ?, ?)",
+                (
+                    fact_id,
+                    source["user_id"],
+                    source.get("session_id") or "s_default",
+                    source["subject"],
+                    source["predicate"],
+                    source["object"],
+                    source.get("qualifiers"),
+                    float(source.get("confidence") or 0.5),
+                    float(source.get("importance") or 0.5),
+                    str(source.get("privacy") or "private"),
+                    created_at,
+                    created_at,
+                    source.get("type") or "semantic",
+                    content or None,
+                    source.get("content_fingerprint"),
+                ),
+            )
+            self.conn.execute(
+                "INSERT INTO facts_fts(fact_id, text) VALUES (?, ?)",
+                (fact_id, " ".join(segment_text(searchable))),
+            )
+            self.conn.execute(
+                "INSERT INTO facts_vec(fact_id, embedding) VALUES (?, ?)",
+                (fact_id, blob),
+            )
+            self.conn.execute(
+                "INSERT INTO fact_scope(fact_id, scope_id, priority) VALUES (?, ?, 0) "
+                "ON CONFLICT(fact_id, scope_id) DO NOTHING",
+                (fact_id, GLOBAL_SCOPE_ID),
+            )
+        return fact_id
 
     def _prune_table(
         self,

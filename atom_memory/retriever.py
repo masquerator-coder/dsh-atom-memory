@@ -52,11 +52,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .config import MemConfig
 from .db import MS_PER_DAY, age_offset, now_ms, recency_credit
 from .reinforce import adjust, effective_importance
+from .scope import ScopeStore, ScopeView, resolution_for
 
 logger = logging.getLogger(__name__)
 
@@ -194,8 +195,19 @@ class Retriever:
         # Indexes that failed during the last search. Surfaced through recall so
         # a caller can tell "nothing matched" from "the index is broken".
         self.last_degraded: List[str] = []
+        # Where the last search was resolved to, as a plain dict. Surfaced so a
+        # caller can see *why* a result set is narrow (a project scope with no
+        # facts looks exactly like an empty store otherwise).
+        self.last_scope: Optional[dict] = None
 
-    async def search(self, user_id: str, query: str, top_k: Optional[int] = None) -> List[dict]:
+    async def search(
+        self,
+        user_id: str,
+        query: str,
+        top_k: Optional[int] = None,
+        scope_context: Optional[Mapping] = None,
+        conditions: Optional[Mapping] = None,
+    ) -> List[dict]:
         """Run the full retrieval pipeline and return ranked facts.
 
         Args:
@@ -203,27 +215,48 @@ class Retriever:
             query: The natural-language query.
             top_k: Maximum number of facts to return (defaults to
                 ``self.top_k_default``).
+            scope_context: The session context payload (see
+                :func:`~atom_memory.context.context_from_payload`). When given
+                *and* scope awareness is on, the candidate set is the scope's own
+                path plus its phases plus condition-matching facts from anywhere,
+                and the re-rank adds the scope / condition / phase terms. When
+                absent, retrieval is exactly the pre-scope pipeline: one global
+                pool, four ranking terms.
+            conditions: Conditions of the current context, when the caller knows
+                them without a full context payload (``{"doc_type": "proposal"}``
+                or ``{key: [values]}``). Folded in with the context's own.
 
         Returns:
             A list of fact dicts ordered by descending ``final_score``, each
             with keys ``fact_id``, ``subject``, ``predicate``, ``object``,
             ``confidence``, ``importance``, ``source_type``, ``status``,
-            ``created_at``, ``relevance`` and ``final_score``. Candidates below
-            ``min_relevance`` are dropped — "nothing relevant" is a valid
+            ``created_at``, ``relevance`` and ``final_score`` — plus, in
+            scope-aware mode, ``scopes`` / ``scope_labels`` / ``conditions`` /
+            ``scope_weight`` / ``condition_match`` / ``phase_match``. Candidates
+            below ``min_relevance`` are dropped — "nothing relevant" is a valid
             answer.
         """
         k = top_k or self.top_k_default
         query = (query or "").strip()
         self.last_degraded = []
+        self.last_scope = None
         if not query:
             return []
 
+        view, scope_sql, scope_args = self._scope_view(
+            user_id, scope_context, conditions
+        )
         blob = await asyncio.to_thread(self.embed_one, query)
 
         vec_ids = self._vector_knn(
-            user_id, blob, k, max_distance=self.config.max_vector_distance
+            user_id,
+            blob,
+            k,
+            max_distance=self.config.max_vector_distance,
+            scope_sql=scope_sql,
+            scope_args=scope_args,
         )
-        fts_ids = self._fts_search(user_id, query, k)
+        fts_ids = self._fts_search(user_id, query, k, scope_sql, scope_args)
 
         fused = rrf_merge(fts_ids, vec_ids, k=self.config.rrf_k)
         if not fused:
@@ -234,11 +267,106 @@ class Retriever:
 
         # RRF scores in the same order as fused.
         rrf_scores = dict(fused)
-        ranked = self._rerank(facts, rrf_scores)
+        ranked = self._rerank(facts, rrf_scores, view)
         floor = float(self.config.min_relevance or 0.0)
         if floor > 0.0:
             ranked = [f for f in ranked if f["relevance"] >= floor]
         return ranked[:k]
+
+    # -- scope awareness ------------------------------------------------------
+
+    def _scope_view(
+        self,
+        user_id: str,
+        scope_context: Optional[Mapping],
+        conditions: Optional[Mapping],
+    ) -> Tuple[Optional[ScopeView], str, list]:
+        """Resolve the query's scope and build its candidate filter.
+
+        Args:
+            user_id: The owner the query is scoped to. The context payload has no
+                say in this: isolation is the query's business, and a payload
+                that named a different user must not be able to widen it.
+            scope_context: The context payload, or ``None``.
+            conditions: Extra conditions supplied by the caller.
+
+        Returns:
+            ``(view, sql, args)``. ``view`` is ``None`` — and ``sql`` empty —
+            when there is nothing to be scope-aware *about*: scope awareness
+            disabled, or a caller that sent no context. That is the switch that
+            keeps a scope-blind caller on exactly the pre-scope pipeline.
+        """
+        if not self.config.scope_aware or scope_context is None:
+            return None, "", []
+        store = ScopeStore(self.conn, self.config)
+        ctx, resolution = resolution_for(
+            self.conn,
+            self.config,
+            scope_context,
+            user_id=user_id,
+            session_id=str(scope_context.get("session_id") or ""),
+            # A query must never create scopes or extend the candidate queue.
+            create=False,
+        )
+        if ctx is None:
+            return None, "", []
+        condition_map = ctx.condition_map()
+        for key, value in (conditions or {}).items():
+            values = value if isinstance(value, (list, tuple, set)) else [value]
+            for item in values:
+                text = str(item).strip().casefold()
+                if text:
+                    condition_map.setdefault(str(key).strip().casefold(), []).append(text)
+        view = store.view(resolution, condition_map)
+        self.last_scope = resolution.to_dict(store)
+        sql, args = self._scope_predicate(view, condition_map)
+        return view, sql, args
+
+    def _scope_predicate(
+        self, view: ScopeView, conditions: Mapping[str, Sequence[str]]
+    ) -> Tuple[str, list]:
+        """Build the SQL predicate that narrows candidates to the query's scope.
+
+        Three disjoint ways in:
+
+        1. the fact is bound to the query scope's path or one of its phases;
+        2. the fact is bound somewhere else but its conditions match the current
+           context — the design's "条件匹配的其他 scope（降权）", which the re-rank
+           then scores at ``W_OTHER``/``W_SIBLING``;
+        3. the fact is unbound, i.e. a global fact by the compatibility rule.
+
+        Anything else is *not* a candidate: leaving it in and down-weighting it
+        would let an unrelated project's fact win whenever the semantic match was
+        strong enough, which is the pollution this whole dimension exists to
+        prevent.
+
+        Returns:
+            ``(sql, args)`` where ``sql`` is an ``AND (...)`` fragment over the
+            alias ``f``.
+        """
+        visible = view.visible_ids()
+        placeholders = ",".join("?" for _ in visible)
+        args: list = list(visible)
+        sql = (
+            "AND (NOT EXISTS (SELECT 1 FROM fact_scope fs0 WHERE fs0.fact_id = f.fact_id) "
+            f"OR EXISTS (SELECT 1 FROM fact_scope fs WHERE fs.fact_id = f.fact_id "
+            f"AND fs.scope_id IN ({placeholders}))"
+        )
+        pairs = [
+            (key, value)
+            for key, values in (conditions or {}).items()
+            for value in values
+        ]
+        if pairs:
+            ors = " OR ".join("(fc.key = ? AND fc.value = ?)" for _ in pairs)
+            sql += (
+                " OR EXISTS (SELECT 1 FROM fact_condition fc "
+                f"WHERE fc.fact_id = f.fact_id AND ({ors}))"
+            )
+            for key, value in pairs:
+                args.extend([key, value])
+        sql += ") "
+        return sql, args
 
     # -- retrieval primitives -------------------------------------------------
 
@@ -248,6 +376,8 @@ class Retriever:
         blob: bytes,
         k: int,
         max_distance: Optional[float] = None,
+        scope_sql: str = "",
+        scope_args: Optional[list] = None,
     ) -> List[str]:
         """Return fact_ids from semantic KNN, best first.
 
@@ -261,26 +391,29 @@ class Retriever:
             max_distance: Optional cosine-distance ceiling. Rows farther away
                 than this are dropped, which is the only way to say "none of
                 these are close" — a rank cannot.
+            scope_sql: Optional scope/condition predicate over the alias ``f``.
+            scope_args: Its bound parameters.
 
         Returns:
             Fact ids, nearest first.
         """
+        scope_args = list(scope_args or [])
+        inner = (
+            "SELECT f.fact_id FROM facts f WHERE f.user_id = ? "
+            "AND f.status = 'active' " + scope_sql
+        )
         try:
             if max_distance is None:
                 rows = self.conn.execute(
-                    "SELECT fact_id FROM facts_vec WHERE embedding MATCH ? "
-                    "AND fact_id IN (SELECT fact_id FROM facts "
-                    "WHERE user_id = ? AND status = 'active') "
-                    "ORDER BY distance LIMIT ?",
-                    (blob, user_id, k),
+                    f"SELECT fact_id FROM facts_vec WHERE embedding MATCH ? "
+                    f"AND fact_id IN ({inner}) ORDER BY distance LIMIT ?",
+                    (blob, user_id, *scope_args, k),
                 ).fetchall()
             else:
                 rows = self.conn.execute(
-                    "SELECT fact_id, distance FROM facts_vec WHERE embedding MATCH ? "
-                    "AND fact_id IN (SELECT fact_id FROM facts "
-                    "WHERE user_id = ? AND status = 'active') "
-                    "ORDER BY distance LIMIT ?",
-                    (blob, user_id, k),
+                    f"SELECT fact_id, distance FROM facts_vec WHERE embedding MATCH ? "
+                    f"AND fact_id IN ({inner}) ORDER BY distance LIMIT ?",
+                    (blob, user_id, *scope_args, k),
                 ).fetchall()
                 rows = [r for r in rows if float(r["distance"]) <= max_distance]
             return [r["fact_id"] for r in rows]
@@ -289,7 +422,14 @@ class Retriever:
             self.last_degraded.append("vector")
             return []
 
-    def _fts_search(self, user_id: str, query: str, k: int) -> List[str]:
+    def _fts_search(
+        self,
+        user_id: str,
+        query: str,
+        k: int,
+        scope_sql: str = "",
+        scope_args: Optional[list] = None,
+    ) -> List[str]:
         """Return fact_ids matching a jieba-segmented FTS query, best first.
 
         FTS is best-effort: malformed queries or empty token streams are
@@ -306,9 +446,10 @@ class Retriever:
                 "SELECT f.fact_id FROM facts_fts fts "
                 "JOIN facts f ON f.fact_id = fts.fact_id "
                 "WHERE f.user_id = ? AND f.status = 'active' "
-                "AND facts_fts MATCH ? "
+                + scope_sql
+                + "AND facts_fts MATCH ? "
                 "ORDER BY rank LIMIT ?",
-                (user_id, match, k),
+                (user_id, *list(scope_args or []), match, k),
             ).fetchall()
             return [r["fact_id"] for r in rows]
         except sqlite3.Error as exc:
@@ -337,9 +478,21 @@ class Retriever:
     # -- ranking --------------------------------------------------------------
 
     def _rerank(
-        self, facts: List[dict], rrf_scores: Dict[str, float]
+        self,
+        facts: List[dict],
+        rrf_scores: Dict[str, float],
+        view: Optional[ScopeView] = None,
     ) -> List[dict]:
-        """Apply the spec 8.3 weighting formula and sort by final_score."""
+        """Apply the spec 8.3 weighting formula and sort by final_score.
+
+        With a scope view, the design's three extra terms are added
+        (``0.20·scope_distance + 0.15·condition_match + 0.05·phase_match``)
+        *on top of* the four base terms rather than re-normalising the four: a
+        scope-aware query and a scope-blind one then agree on the base terms, and
+        a stored weight set keeps meaning the same thing in both modes. Without a
+        view the result is byte-identical to the pre-scope library, which is what
+        lets an unscoped caller keep its existing ranking.
+        """
         if not facts:
             return []
 
@@ -404,6 +557,23 @@ class Retriever:
         w_imp = float(self.config.w_importance)
         w_rec = float(self.config.w_recency)
         w_trust = float(self.config.w_trust)
+        w_scope = float(self.config.w_scope)
+        w_condition = float(self.config.w_condition)
+        w_phase = float(self.config.w_phase)
+
+        # Scope is looked up in two batch queries rather than per fact: the
+        # bindings and the conditions are the same shape of lookup for every
+        # candidate, and doing them one fact at a time is an N+1 on the hot path.
+        scopes: Dict[str, Tuple[int, ...]] = {}
+        conditions: Dict[str, Tuple[Tuple[str, str], ...]] = {}
+        labels: Dict[int, str] = {}
+        if view is not None:
+            store = view.store
+            ids = [f["fact_id"] for f in facts]
+            scopes = store.fact_scopes(ids)
+            conditions = store.fact_conditions(ids)
+            for scope_id in {sid for values in scopes.values() for sid in values}:
+                labels[scope_id] = store.label(scope_id)
 
         ranked: List[dict] = []
         for i, fact in enumerate(facts):
@@ -425,6 +595,25 @@ class Retriever:
             # column is a snapshot from last_used_at and would disagree with it.
             item["strength"] = round(counts[i], 6)
             item["recency"] = round(recency_norm[i], 6)
+            if view is not None:
+                fact_scopes = scopes.get(fact["fact_id"], ())
+                fact_conditions = conditions.get(fact["fact_id"], ())
+                scope_w = view.weight_for(fact_scopes)
+                condition_w = view.condition_weight(fact_conditions)
+                phase_w = view.phase_weight(fact_scopes)
+                final += (
+                    w_scope * scope_w
+                    + w_condition * condition_w
+                    + w_phase * phase_w
+                )
+                item["scopes"] = list(fact_scopes)
+                item["scope_labels"] = [labels.get(sid, "global") for sid in fact_scopes]
+                item["conditions"] = [
+                    {"key": key, "value": value} for key, value in fact_conditions
+                ]
+                item["scope_weight"] = round(scope_w, 6)
+                item["condition_match"] = round(condition_w, 6)
+                item["phase_match"] = round(phase_w, 6)
             item["final_score"] = round(final, 4)
             ranked.append(item)
 

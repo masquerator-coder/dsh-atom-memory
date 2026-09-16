@@ -162,6 +162,45 @@ class MemConfig:
     # -- conflict resolution --------------------------------------------------
     conflict_confidence_margin: float = 0.05
 
+    # -- scope awareness (see docs/scopes.md) ---------------------------------
+    # Scope is a storage *dimension*, not a semantic property: a fact belongs to
+    # a node in a hierarchy (org / client / project / phase / document ...) and
+    # recall expands the node's ancestors and descendants instead of searching
+    # one global pool. Switched on by default because the pollution it prevents
+    # is silent (a project's rule applied to another project) while the cost of
+    # it being wrong is visible (fewer results, listed in `degraded`).
+    scope_aware: bool = True
+    # Ranking weights for the three scope terms. They are *added* to the base
+    # four terms only when the query carries a scope context, so a caller that
+    # sends none gets byte-identical ranking to the pre-scope library.
+    w_scope: float = 0.20
+    w_condition: float = 0.15
+    w_phase: float = 0.05
+    # Confidence thresholds, from the design's resolution table:
+    #   >= scope_bind_threshold      bind without asking
+    #   >= scope_pending_threshold   bind, but mark the scope unconfirmed
+    #   >= scope_degrade_threshold   no scope: global + conditions + queue entry
+    #   below                        global, no conditions, no queue entry
+    scope_bind_threshold: float = 0.9
+    scope_pending_threshold: float = 0.6
+    scope_degrade_threshold: float = 0.3
+    # Evidence a *new* scope needs. This is the design's 高 (high) band boundary:
+    # a git remote, a durable document id or an explicit user tag can bring a
+    # scope into existence, while a bare folder path, a package name or a
+    # content anchor cannot — creating one from weak evidence is how a store
+    # fills up with near-duplicate scopes that each hold half the facts.
+    scope_new_threshold: float = 0.8
+    # A sub-threshold candidate is queued instead of created, and promoted once
+    # it has been seen this many times with consistent evidence.
+    scope_promote_after: int = 3
+    # How many distinct scopes must independently hold the same claim before it
+    # is promoted to a global rule (see ScopeStore.promote_abstractions).
+    scope_abstraction_min_scopes: int = 3
+    # Whether recall also considers facts bound to *other phases* of the same
+    # project (the design's "默认召回所有阶段的 active 事实"). Off restricts
+    # recall to the current phase, which is rarely what a user wants.
+    scope_all_phases: bool = True
+
     # -- write acknowledgement ------------------------------------------------
     write_ack_timeout_ms: int = 0
 
@@ -191,11 +230,16 @@ class MemConfig:
         return str(Path(self.db_path).expanduser())
 
     def weights_sum(self) -> float:
-        """Return the sum of the four re-rank weights.
+        """Return the sum of the four base re-rank weights.
 
         Exposed so a deployer can check that a retuned weight set still
         normalises to 1.0 (the re-rank's output is only comparable across
         queries if the weights sum to a fixed total).
+
+        The three scope weights (``w_scope`` / ``w_condition`` / ``w_phase``) are
+        deliberately *not* included: they are added only for a query that carries
+        a scope context, so a scope-aware store and a scope-blind one still agree
+        on the base terms and the total stays comparable in both modes.
 
         Returns:
             ``w_rrf + w_importance + w_recency + w_trust``.

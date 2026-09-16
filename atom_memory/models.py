@@ -92,6 +92,15 @@ class FactCandidate:
         content: Optional rich body (SOP text, few-shot example, decision-rule
             JSON...). The SPO triple acts as a searchable title; ``content``
             holds the full structured form.
+        conditions: Optional ``[{"key", "value"}]`` conditions the fact applies
+            under (``doc_type``, ``language``, ``industry``, ...). A condition is
+            *not* a scope: it says when a claim holds, not which project it
+            belongs to, which is what lets "跨项目但有条件" experience be expressed
+            without binding it to one project.
+        scope_hint: Optional extractor hint about where the fact belongs. It is a
+            *hint*, never a decision: the resolver treats it as a low-reliability
+            content anchor (see :mod:`~atom_memory.context`) and only the store's
+            own signals can bind a scope.
     """
 
     candidate_id: str
@@ -109,6 +118,8 @@ class FactCandidate:
     idempotency_key: Optional[str] = None
     type: str = TYPE_SEMANTIC
     content: Optional[str] = None
+    conditions: Optional[list] = None
+    scope_hint: Optional[str] = None
 
     def is_complete(self) -> bool:
         """Return ``True`` when all three SPO fields are non-empty."""
@@ -117,7 +128,14 @@ class FactCandidate:
 
 @dataclass
 class AtomicFact:
-    """A persisted atomic fact row (mirrors the ``facts`` table)."""
+    """A persisted atomic fact row (mirrors the ``facts`` table).
+
+    ``scopes`` and ``conditions`` are projections of the ``fact_scope`` /
+    ``fact_condition`` tables, which are the authoritative stores: a fact row
+    itself carries neither, because both are many-to-many. An empty ``scopes``
+    means "global" — the compatibility rule every read path applies to rows
+    written before scope awareness existed.
+    """
 
     fact_id: str
     user_id: str
@@ -138,6 +156,8 @@ class AtomicFact:
     version: int = 1
     type: str = TYPE_SEMANTIC
     content: Optional[str] = None
+    scopes: List[int] = field(default_factory=list)
+    conditions: List[tuple] = field(default_factory=list)
 
 
 @dataclass
