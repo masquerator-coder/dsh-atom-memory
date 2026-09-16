@@ -61,6 +61,47 @@ interface Config {
   contextInjectionEnabled?: boolean;
   /** Per-RPC timeout in ms. */
   rpcTimeoutMs?: number;
+  /**
+   * How long a write tool waits for the store's verdict before returning the
+   * enqueue receipt.
+   *
+   * The write pipeline is asynchronous by design, but a *decision* is made
+   * synchronously inside it (does this contradict something stored? does the
+   * newer claim win?), and a tool that reported only "queued" would hide the
+   * decision that matters most. This is a bounded acknowledgement, not a
+   * synchronous pipeline: on timeout the caller gets the receipt as before.
+   * `0` disables the wait.
+   */
+  writeAckTimeoutMs?: number;
+  /**
+   * Cosine-distance ceiling for semantic recall.
+   *
+   * The only filter that can say "nothing here is close" — a rank-based score
+   * cannot, because the nearest of twenty bad matches still ranks first. Measured
+   * on `BAAI/bge-small-zh-v1.5`: related pairs sit at 0.33–0.54, cross-language
+   * related pairs around 0.65, clearly unrelated ones at 0.67–0.85, so the
+   * default is a coarse "different topic area" floor rather than a quality bar.
+   * Raise it for looser recall, lower it (≈0.60) for a single-language store.
+   */
+  maxVectorDistance?: number;
+  /**
+   * Fused-relevance floor (0..1). Candidates below it are not returned at all,
+   * so "no memory is relevant" is expressible.
+   *
+   * Only meaningful together with `maxVectorDistance`: on its own, every
+   * candidate that reached either top-k clears it, which is the trap a
+   * rank-based floor sets. `0` disables it.
+   */
+  minRelevance?: number;
+  /**
+   * Soft cap on one user's active facts. `0` (the default) is unlimited.
+   *
+   * When exceeded, the maintenance pass moves the least valuable *unprotected*
+   * facts to the archive tier — never deletes them, and never touches facts
+   * that are fresh, reinforced, durable knowledge, or backing a pinned profile
+   * row.
+   */
+  maxActiveFacts?: number;
 }
 declare const Config: z<Config>;
 //#endregion

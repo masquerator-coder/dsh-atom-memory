@@ -1422,7 +1422,9 @@ window.__ModuleLoader__.load({
 				jsonArgsMethod("deleteProfile", true),
 				jsonArgsMethod("backup", true),
 				jsonArgsMethod("restore", true),
-				jsonArgsMethod("getRuntime", false)
+				jsonArgsMethod("getRuntime", false),
+				jsonArgsMethod("health", false),
+				jsonArgsMethod("unarchive", true)
 			]
 		};
 		//#endregion

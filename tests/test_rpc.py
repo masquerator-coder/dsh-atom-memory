@@ -184,3 +184,75 @@ def test_persist_candidates_persists_type_and_content(proc, tmp_path):
     assert len(lessons) == 1
     assert lessons[0]["content"] == "升级任何生产依赖前先做完整备份"
 
+
+
+def test_lifecycle_and_write_receipts_over_the_wire(proc, tmp_path):
+    """The new surface end to end: health, summary meta, supersede, purge.
+
+    The write receipts are the point: the plugin's tools render what the store
+    *decided* (applied / superseded / rejected), so the receipt has to survive
+    the NDJSON hop intact — and `wait_ms` has to actually wait for the verdict
+    instead of returning the enqueue receipt.
+    """
+    _send(proc, 1, "start", {"db_path": str(tmp_path / "rpc-lifecycle.db"),
+                             "worker_poll_interval_sec": 0.05, "max_retries": 1})
+    assert _recv(proc)["ok"] is True
+
+    _send(proc, 2, "health", {})
+    health = _recv(proc)["result"]
+    assert health["started"] is True and health["ok"] is True
+    assert "queue" in health and "index" in health and "db_path" in health
+
+    # An empty store says so, in the same round trip that renders the digest:
+    # this is what lets the injection path skip a snapshot entirely.
+    _send(proc, 3, "summary", {
+        "user_id": "u1", "max_tokens": 800, "detail": False, "include_meta": True,
+    })
+    meta = _recv(proc)["result"]
+    assert meta["facts"] == 0 and isinstance(meta["text"], str)
+
+    # Without include_meta the payload is still the plain string the tools and
+    # the settings panel expect.
+    _send(proc, 4, "summary", {"user_id": "u1", "max_tokens": 800, "detail": False})
+    assert isinstance(_recv(proc)["result"], str)
+
+    # A first write lands.
+    _send(proc, 5, "add", {
+        "user_id": "u1", "session_id": "s1", "text": "我的常用颜色是蓝色",
+        "turn_id": 0, "wait_ms": 8000,
+    })
+    first = _recv(proc)["result"]
+    assert first["status"] == "applied", first
+    assert len(first["outcome"]["written"]) == 1
+    fact_id = first["outcome"]["written"][0]
+
+    # A newer assertion for the same single-valued attribute replaces it, and
+    # the receipt names both values so the model can correct itself.
+    _send(proc, 6, "add", {
+        "user_id": "u1", "session_id": "s1", "text": "我的常用颜色是绿色",
+        "turn_id": 0, "wait_ms": 8000,
+    })
+    second = _recv(proc)["result"]
+    assert second["status"] == "applied", second
+    assert len(second["outcome"]["superseded"]) == 1, second
+    swapped = second["outcome"]["superseded"][0]
+    assert swapped["old_object"] == "蓝色" and swapped["new_object"] == "绿色"
+
+    _send(proc, 7, "recall", {"user_id": "u1", "query": "常用颜色"})
+    facts = _recv(proc)["result"]["facts"]
+    assert [f["object"] for f in facts] == ["绿色"]
+
+    # Purge erases for real; the receipt distinguishes it from a soft forget.
+    # Both the live value and the value it replaced are erased: a purge has to
+    # take the row out of every index, not just out of the active set.
+    active_id = second["outcome"]["written"][0]
+    assert active_id != fact_id
+    for offset, fid in enumerate((active_id, fact_id), start=1):
+        _send(proc, 7 + offset, "forget", {
+            "user_id": "u1", "fact_id": fid, "purge": True, "wait_ms": 8000,
+        })
+        assert _recv(proc)["result"]["outcome"]["purged"] == [fid]
+
+    _send(proc, 20, "stats", {"user_id": "u1"})
+    stats = _recv(proc)["result"]
+    assert stats["facts"] == 0 and "archived" in stats and isinstance(stats["recent"], list)

@@ -81,6 +81,16 @@ _METHODS: Dict[str, str] = {
     "delete_profile": "delete_profile",
     "backup": "backup",
     "restore": "restore",
+    # Lifecycle: the archive tier, erasure, housekeeping, and the write outcomes
+    # a caller can pull instead of waiting for.
+    "unarchive": "unarchive",
+    "purge": "purge",
+    "vacuum": "vacuum",
+    "maintenance": "maintenance",
+    "index_health": "index_health",
+    "candidate_outcome": "candidate_outcome",
+    "recent_outcomes": "recent_outcomes",
+    "outcomes": "recent_outcomes",
 }
 
 
@@ -172,7 +182,9 @@ class RpcServer:
             self._stop_requested = True  # type: ignore[attr-defined]
             return {"stopped": True}
         if method == "health":
-            return {"started": self._started, "ok": True}
+            return self._health()
+        if method == "summary":
+            return await self._summary(params)
         if method == "forget_all":
             return await self._forget_all(params)
         if method == "persist_candidates":
@@ -193,6 +205,60 @@ class RpcServer:
             raise _RpcError(f"bad arguments for {method}: {e}") from e
 
     # -- lifecycle -----------------------------------------------------------
+
+    def _health(self) -> dict:
+        """Report whether the store is actually usable, not merely alive.
+
+        A health endpoint that always answers ``ok`` cannot be used to gate
+        anything — the bridge would keep talking to a process whose database is
+        unreachable or whose indexes have drifted. This one answers from the
+        store itself: the queue state, an index consistency check, and the last
+        maintenance result, so a caller can distinguish "no memory" from
+        "memory is broken".
+
+        Returns:
+            The health payload. ``ok`` is ``False`` when the store cannot answer
+            a trivial query or when a fact is missing an index entry.
+        """
+        payload: Dict[str, Any] = {
+            "started": self._started,
+            "ok": False,
+            "db_path": None,
+            "queue": {},
+            "index": {},
+            "last_maintenance": None,
+            "error": None,
+        }
+        if not self._started or self.mem is None or self.mem.db is None:
+            payload["error"] = "not started"
+            return payload
+        try:
+            payload["db_path"] = self.mem.config.resolved_db_path()
+            # A trivial read proves the file is reachable and readable.
+            self.mem.db.execute("SELECT 1").fetchone()
+            queue = self.mem.db.execute(
+                "SELECT status, COUNT(*) AS n FROM task_queue GROUP BY status"
+            ).fetchall()
+            payload["queue"] = {r["status"]: r["n"] for r in queue}
+            health = self.mem.index_health()
+            payload["index"] = {
+                "ok": health["ok"],
+                "counts": health["counts"],
+                "orphans": {
+                    key: len(value)
+                    for key, value in health["orphans"].items()
+                },
+            }
+            payload["last_maintenance"] = (
+                self.mem._worker.last_maintenance_result
+                if self.mem._worker is not None
+                else None
+            )
+            payload["ok"] = bool(health["ok"])
+        except Exception as exc:  # noqa: BLE001 - health must answer, not raise
+            payload["error"] = str(exc)
+            payload["ok"] = False
+        return payload
 
     async def _start(self, params: dict) -> dict:
         """Build and start AtomMem from the startup configuration."""
@@ -215,31 +281,74 @@ class RpcServer:
         return {"started": True, "db_path": config.resolved_db_path()}
 
     async def _forget_all(self, params: dict) -> dict:
-        """Bulk soft-retract (right to erasure) for one user.
+        """Bulk retract (or erase) one user's memory.
 
-        Uses only the public ``forget`` path: reads the user's active fact ids
-        (read-only) and enqueues a soft-retract task per fact. Facts are never
-        physically deleted — this honours the library's soft-delete invariant.
+        Soft-deletes by default — facts are never physically deleted, this
+        honours the library's soft-delete invariant, and it keeps the provenance
+        of what was removed. Pass ``purge=True`` for an actual erasure request:
+        the content, its index entries and its reinforcement log are deleted.
+
+        Args:
+            params: ``user_id`` and optional ``purge``.
+
+        Returns:
+            ``{"fact_ids", "queued", "purged": bool}``.
         """
         user_id = params.get("user_id")
         if not user_id:
             raise _RpcError("forget_all requires user_id")
         if not self._started or self.mem is None or self.mem.db is None:
             raise _RpcError("not started; call start first")
+        purge = bool(params.get("purge"))
         rows = self.mem.db.execute(
             "SELECT fact_id FROM facts WHERE user_id = ? AND status = 'active'",
             (user_id,),
         ).fetchall()
+        if purge:
+            result = self.mem.purge(user_id)
+            return {
+                "fact_ids": result["purged_ids"],
+                "queued": 0,
+                "purged": True,
+            }
         for r in rows:
             await self.mem.forget(user_id, fact_id=r["fact_id"])
-        return {"fact_ids": [r["fact_id"] for r in rows], "queued": len(rows)}
+        return {"fact_ids": [r["fact_id"] for r in rows], "queued": len(rows),
+                "purged": False}
+
+    async def _summary(self, params: dict) -> Any:
+        """Render the compact or detail digest, optionally with its metadata.
+
+        ``include_meta`` is for the injection path: the caller needs to know
+        whether the store holds *anything* before spending prompt tokens on a
+        snapshot, and asking in the same round trip is what keeps freezing a
+        single call.
+        """
+        user_id = params["user_id"]
+        text = await self.mem.summary(
+            user_id,
+            max_tokens=int(params.get("max_tokens", 1500)),
+            detail=bool(params.get("detail", False)),
+        )
+        if not params.get("include_meta"):
+            return text
+        row = self.mem.db.execute(
+            "SELECT COUNT(*) AS n FROM facts WHERE user_id = ? AND status = 'active'",
+            (user_id,),
+        ).fetchone()
+        return {"text": text, "facts": int(row["n"] if row is not None else 0)}
 
     async def _persist_candidates(self, params: dict) -> dict:
         """Persist pre-extracted candidates (from the dsh-side LLM extractor).
 
         Enqueues a ``persist_pre`` worker task so the candidates go through the
         same validation + persistence chain as rule-extracted text (gaining
-        conflict resolution and identical-SPO dedup for free).
+        ingest cleaning, conflict resolution and identical-SPO dedup for free).
+
+        Args:
+            params: ``user_id``, ``candidates``, optional ``session_id`` /
+                ``turn_id`` / ``wait_ms``. When ``wait_ms`` is set the reply
+                carries the write outcome instead of only the enqueue receipt.
         """
         user_id = params.get("user_id")
         candidates = params.get("candidates")
@@ -249,6 +358,7 @@ class RpcServer:
             raise _RpcError("not started; call start first")
         session_id = params.get("session_id", "s_default")
         turn_id = int(params.get("turn_id", 0))
+        wait_ms = params.get("wait_ms")
         candidate_id = str(uuid.uuid4())
         created_at = now_ms()
         with self.mem.db:
@@ -277,7 +387,10 @@ class RpcServer:
                     created_at,
                 ),
             )
-        return {"candidate_id": candidate_id, "queued": len(candidates)}
+        receipt = await self.mem._write_receipt(candidate_id, None, wait_ms)
+        receipt["queued"] = len(candidates)
+        receipt.pop("trace_id", None)
+        return receipt
 
     async def shutdown(self) -> None:
         """Stop the worker / close the DB so data is flushed before exit."""

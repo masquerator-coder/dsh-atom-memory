@@ -22,6 +22,11 @@
  * written back is reproducible from the session log — it never reads live,
  * non-replayable coordination state.
  *
+ * `captureEnabled` is consulted **at each hook invocation** rather than captured
+ * at registration: the settings switch is meant to stop capture immediately
+ * (that is the point of turning it off), and a hook that was wired at load time
+ * could not honour that.
+ *
  * Every dispatch is best-effort: a capture failure never throws into the loop.
  *
  * @module dsh-atom-memory/capture
@@ -48,7 +53,8 @@ export interface CaptureDeps {
 }
 
 export interface CaptureOptions {
-  captureEnabled: boolean
+  /** Whether capture runs at all, resolved at each hook invocation. */
+  captureEnabled: () => boolean
   preCompressionCapture: boolean
   nudgeEnabled: boolean
   /** Nudge sweep period in ms. */
@@ -78,6 +84,7 @@ export function registerCapture(deps: CaptureDeps, opts: CaptureOptions): (() =>
   const { ctx, capture } = deps
   const maxRecent = deps.maxRecent ?? 20
   const recent = new Map<string, MessageEntry[]>()
+  const enabled = () => opts.captureEnabled() !== false
 
   const push = (sessionId: string, entry: MessageEntry): void => {
     const list = recent.get(sessionId) ?? []
@@ -97,6 +104,7 @@ export function registerCapture(deps: CaptureDeps, opts: CaptureOptions): (() =>
    * text.
    */
   const sweep = async (sessionId: string): Promise<void> => {
+    if (!enabled()) return
     const list = recent.get(sessionId)
     if (!list) return
     for (const entry of list) {
@@ -107,34 +115,33 @@ export function registerCapture(deps: CaptureDeps, opts: CaptureOptions): (() =>
   }
 
   // -- per-message capture (durable) -----------------------------------------
-  if (opts.captureEnabled) {
-    disposers.push(ctx.on('session/event', (session: Session, event: SessionEvent) => {
-      if (event.type !== 'user/message') return
-      if (!isDirectUserMessage(event)) return
-      const text = userMessageText(event)
-      if (text.trim().length === 0) return
-      const seq = (event as { seq?: unknown }).seq as number | undefined ?? 0
-      // Capture every direct user message unconditionally. Whether it holds a
-      // fact worth remembering is decided downstream by the LLM extractor (or
-      // the rule fallback), not by a fixed keyword list. The entry is *not*
-      // marked captured up front: a failed immediate capture must be retriable
-      // by the nudge / pre-compression rescue, otherwise a bridge outage would
-      // silently lose the message forever. Only a successful capture (or a
-      // rescue retry) marks it captured; a failure marks it `failed` so
-      // `sweep` retries it.
-      const entry: MessageEntry = { seq, text, captured: false, failed: false }
-      push(session.id, entry)
-      void capture(text, session.id).then(
-        () => { entry.captured = true },
-        () => { entry.failed = true },
-      )
-    }))
-  }
+  disposers.push(ctx.on('session/event', (session: Session, event: SessionEvent) => {
+    if (!enabled()) return
+    if (event.type !== 'user/message') return
+    if (!isDirectUserMessage(event)) return
+    const text = userMessageText(event)
+    if (text.trim().length === 0) return
+    const seq = (event as { seq?: unknown }).seq as number | undefined ?? 0
+    // Capture every direct user message unconditionally. Whether it holds a
+    // fact worth remembering is decided downstream by the LLM extractor (or
+    // the rule fallback), not by a fixed keyword list. The entry is *not*
+    // marked captured up front: a failed immediate capture must be retriable
+    // by the nudge / pre-compression rescue, otherwise a bridge outage would
+    // silently lose the message forever. Only a successful capture (or a
+    // rescue retry) marks it captured; a failure marks it `failed` so
+    // `sweep` retries it.
+    const entry: MessageEntry = { seq, text, captured: false, failed: false }
+    push(session.id, entry)
+    void capture(text, session.id).then(
+      () => { entry.captured = true },
+      () => { entry.failed = true },
+    )
+  }))
 
   // -- pre-compression rescue (llm/stream waterfall) -------------------------
   if (opts.preCompressionCapture) {
     disposers.push(ctx.on('llm/stream', async function* (options: GenerateOptions, next) {
-      if (options.purpose === 'compaction' && options.sessionId) {
+      if (options.purpose === 'compaction' && options.sessionId && enabled()) {
         // Rescue not-yet-stored messages before the compaction request leaves.
         // Never blocks the request itself.
         try {
@@ -152,6 +159,7 @@ export function registerCapture(deps: CaptureDeps, opts: CaptureOptions): (() =>
     const timer = setInterval(() => {
       // Sweep every session we've seen so far; guards against the LLM being
       // too busy to trigger capture mid-turn. Off the loop's hot path.
+      if (!enabled()) return
       for (const sessionId of recent.keys()) {
         void sweep(sessionId).catch(() => { /* best-effort */ })
       }

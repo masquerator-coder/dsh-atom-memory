@@ -96,5 +96,7 @@ export const ATOM_MEMORY_REMOTE: TypertRemoteContribution = {
     jsonArgsMethod('backup', true),
     jsonArgsMethod('restore', true),
     jsonArgsMethod('getRuntime', false),
+    jsonArgsMethod('health', false),
+    jsonArgsMethod('unarchive', true),
   ],
 }

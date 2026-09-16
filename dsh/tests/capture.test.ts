@@ -36,7 +36,7 @@ describe('registerCapture', () => {
     const capture = vi.fn(async () => {})
     registerCapture(
       { ctx, capture },
-      { captureEnabled: true, preCompressionCapture: false, nudgeEnabled: false, nudgeIntervalMs: 60_000 },
+      { captureEnabled: () => true, preCompressionCapture: false, nudgeEnabled: false, nudgeIntervalMs: 60_000 },
     )
     expect(ctx.on).toHaveBeenCalledWith('session/event', expect.any(Function))
     // No strong-fact keyword present, but capture must still fire.
@@ -50,7 +50,7 @@ describe('registerCapture', () => {
     const capture = vi.fn(async () => {})
     registerCapture(
       { ctx, capture },
-      { captureEnabled: true, preCompressionCapture: false, nudgeEnabled: false, nudgeIntervalMs: 60_000 },
+      { captureEnabled: () => true, preCompressionCapture: false, nudgeEnabled: false, nudgeIntervalMs: 60_000 },
     )
     const handler = handlersOf('session/event')[0] as (s: unknown, e: FakeSessionEvent) => void
     handler({ id: 's1' }, {
@@ -67,7 +67,7 @@ describe('registerCapture', () => {
     const capture = vi.fn(async () => {})
     registerCapture(
       { ctx, capture },
-      { captureEnabled: true, preCompressionCapture: false, nudgeEnabled: false, nudgeIntervalMs: 60_000 },
+      { captureEnabled: () => true, preCompressionCapture: false, nudgeEnabled: false, nudgeIntervalMs: 60_000 },
     )
     const handler = handlersOf('session/event')[0] as (s: unknown, e: FakeSessionEvent) => void
     handler({ id: 's1' }, {
@@ -79,13 +79,26 @@ describe('registerCapture', () => {
     expect(capture).not.toHaveBeenCalled()
   })
 
-  it('does not register capture when disabled', () => {
-    const { ctx } = makeCtx()
+  it('registers the hooks and honours the switch live, in both directions', async () => {
+    const { ctx, handlersOf } = makeCtx()
+    const capture = vi.fn(async () => {})
+    let enabled = false
     registerCapture(
-      { ctx, capture: vi.fn(async () => {}) },
-      { captureEnabled: false, preCompressionCapture: false, nudgeEnabled: false, nudgeIntervalMs: 60_000 },
+      { ctx, capture },
+      { captureEnabled: () => enabled, preCompressionCapture: false, nudgeEnabled: false, nudgeIntervalMs: 60_000 },
     )
-    expect(ctx.on).not.toHaveBeenCalled()
+    // Always registered: the switch is read per event, so turning capture on
+    // later takes effect on the next message rather than at the next reload.
+    expect(ctx.on).toHaveBeenCalledWith('session/event', expect.any(Function))
+
+    send('s1', '用户偏好黑咖啡', handlersOf)
+    await new Promise(r => setTimeout(r, 10))
+    expect(capture).not.toHaveBeenCalled()
+
+    enabled = true
+    send('s2', '用户喜欢蓝山咖啡', handlersOf)
+    await new Promise(r => setTimeout(r, 10))
+    expect(capture).toHaveBeenCalledWith('用户喜欢蓝山咖啡', 's2')
   })
 
   it('rescues a message whose immediate capture failed via pre-compression', async () => {
@@ -98,7 +111,7 @@ describe('registerCapture', () => {
     })
     registerCapture(
       { ctx, capture },
-      { captureEnabled: true, preCompressionCapture: true, nudgeEnabled: false, nudgeIntervalMs: 60_000 },
+      { captureEnabled: () => true, preCompressionCapture: true, nudgeEnabled: false, nudgeIntervalMs: 60_000 },
     )
 
     send('s1', '用户偏好黑咖啡', handlersOf)

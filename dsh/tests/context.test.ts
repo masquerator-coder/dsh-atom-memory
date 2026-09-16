@@ -43,7 +43,7 @@ describe('registerMemoryContext', () => {
     const { ctx, sections } = makeCtx()
     registerMemoryContext({
       ctx, bridge: { call: vi.fn() } as any,
-      userScope: 'global', resolveMaxTokens: () => 1500, snapshotEnabled: false,
+      userScope: 'global', resolveMaxTokens: () => 1500, snapshotEnabled: () => false,
     })
     expect(sections.map(s => s.name)).toEqual(['atom-memory-awareness'])
   })
@@ -53,7 +53,7 @@ describe('registerMemoryContext', () => {
     const isEnabled = vi.fn(() => false)
     registerMemoryContext({
       ctx, bridge: { call: vi.fn() } as any,
-      userScope: 'global', resolveMaxTokens: () => 1500, snapshotEnabled: true,
+      userScope: 'global', resolveMaxTokens: () => 1500, snapshotEnabled: () => true,
       isEnabled,
     })
     const awareness = sections.find(s => s.name === 'atom-memory-awareness')!
@@ -66,7 +66,7 @@ describe('registerMemoryContext', () => {
     const { ctx, sections } = makeCtx()
     registerMemoryContext({
       ctx, bridge: { call: vi.fn() } as any,
-      userScope: 'global', resolveMaxTokens: () => 1500, snapshotEnabled: true,
+      userScope: 'global', resolveMaxTokens: () => 1500, snapshotEnabled: () => true,
       isEnabled: () => true,
     })
     const awareness = sections.find(s => s.name === 'atom-memory-awareness')!
@@ -79,7 +79,7 @@ describe('registerMemoryContext', () => {
     const { ctx, handlers } = makeCtx()
     registerMemoryContext({
       ctx, bridge: bridge as any,
-      userScope: 'global', resolveMaxTokens: () => 1500, snapshotEnabled: true,
+      userScope: 'global', resolveMaxTokens: () => 1500, snapshotEnabled: () => true,
       isEnabled: () => false,
     })
     const handler = assembleHandler(handlers)
@@ -95,7 +95,7 @@ describe('registerMemoryContext', () => {
     const { ctx, handlers } = makeCtx()
     registerMemoryContext({
       ctx, bridge: bridge as any,
-      userScope: 'global', resolveMaxTokens: () => 1500, snapshotEnabled: true,
+      userScope: 'global', resolveMaxTokens: () => 1500, snapshotEnabled: () => true,
     })
     const handler = assembleHandler(handlers)
 
@@ -123,7 +123,7 @@ describe('registerMemoryContext', () => {
     const { ctx, handlers } = makeCtx()
     registerMemoryContext({
       ctx, bridge: bridge as any,
-      userScope: 'global', resolveMaxTokens: () => 1500, snapshotEnabled: true,
+      userScope: 'global', resolveMaxTokens: () => 1500, snapshotEnabled: () => true,
     })
     const handler = assembleHandler(handlers)
     await handler(assembly(), agentCtx('s1'), next(assembly()))
@@ -142,7 +142,7 @@ describe('registerMemoryContext', () => {
     const { ctx, handlers } = makeCtx()
     registerMemoryContext({
       ctx, bridge: bridge as any,
-      userScope: 'global', resolveMaxTokens: () => 1500, snapshotEnabled: true,
+      userScope: 'global', resolveMaxTokens: () => 1500, snapshotEnabled: () => true,
     })
     const handler = assembleHandler(handlers)
 
@@ -163,7 +163,7 @@ describe('registerMemoryContext', () => {
     const { ctx, handlers } = makeCtx()
     registerMemoryContext({
       ctx, bridge: bridge as any,
-      userScope: 'global', resolveMaxTokens: () => 1500, snapshotEnabled: true,
+      userScope: 'global', resolveMaxTokens: () => 1500, snapshotEnabled: () => true,
     })
     const handler = assembleHandler(handlers)
     const result = await handler(assembly(), {} as any, next(assembly()))
@@ -171,13 +171,28 @@ describe('registerMemoryContext', () => {
     expect(result.sections).toHaveLength(1)
   })
 
-  it('registers no assemble listener when snapshot injection is disabled', () => {
+  it('honours the injection switch live, in both directions', async () => {
+    let enabled = false
+    const bridge = { call: vi.fn(async () => '# Memory\n- fact') }
     const { ctx, handlers } = makeCtx()
     registerMemoryContext({
-      ctx, bridge: { call: vi.fn() } as any,
-      userScope: 'global', resolveMaxTokens: () => 1500, snapshotEnabled: false,
+      ctx, bridge: bridge as any,
+      userScope: 'global', resolveMaxTokens: () => 1500, snapshotEnabled: () => enabled,
     })
-    expect(handlers).toHaveLength(0)
+    // A listener is always registered: the switch is read at each assembly, so
+    // turning injection off stops paying for it immediately and turning it back
+    // on must not require a reload.
+    expect(handlers.length).toBeGreaterThan(0)
+    const handler = assembleHandler(handlers)
+
+    const off = await handler(assembly(), agentCtx('s1'), next(assembly()))
+    expect(bridge.call).not.toHaveBeenCalled()
+    expect(off.sections).toHaveLength(1)
+
+    enabled = true
+    const on = await handler(assembly(), agentCtx('s1'), next(assembly()))
+    expect(bridge.call).toHaveBeenCalledTimes(1)
+    expect(on.sections).toHaveLength(2)
   })
 
   /**
@@ -195,7 +210,7 @@ describe('registerMemoryContext', () => {
     const { ctx, handlers } = makeCtx()
     registerMemoryContext({
       ctx, bridge: bridge as any,
-      userScope: 'global', resolveMaxTokens: () => budget, snapshotEnabled: true,
+      userScope: 'global', resolveMaxTokens: () => budget, snapshotEnabled: () => true,
     })
     const handler = assembleHandler(handlers)
 

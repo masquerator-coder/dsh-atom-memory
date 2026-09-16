@@ -45,6 +45,8 @@ describe('ATOM_MEMORY_REMOTE', () => {
       'backup',
       'restore',
       'getRuntime',
+      'health',
+      'unarchive',
     ])
     for (const descriptor of ATOM_MEMORY_REMOTE.descriptors) {
       expect(descriptor.namespace).toBe('atomMemory')
@@ -78,7 +80,7 @@ describe('ATOM_MEMORY_REMOTE', () => {
 
   it('gives every arg-carrying method a single named wire field for `args`', () => {
     for (const descriptor of ATOM_MEMORY_REMOTE.descriptors) {
-      if (descriptor.method === 'getRuntime') {
+      if (descriptor.method === 'getRuntime' || descriptor.method === 'health') {
         expect(descriptor.parameters).toHaveLength(0)
         continue
       }

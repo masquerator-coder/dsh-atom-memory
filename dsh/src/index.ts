@@ -3,17 +3,31 @@
  *
  * A Cordis plugin that:
  *  - spawns and manages the `atom_memory.rpc` Python child process,
- *  - exposes `memory_*` tools (add/recall/summary/summary_detail/forget/user_md/stats),
+ *  - exposes the `memory_*` tools (add/replace/recall/summary/snapshot/
+ *    summary_detail/forget/user_md/stats),
  *  - wires an LLM-first extractor that uses the dsh default model and ships
  *    typed candidates to Python for persistence (rules remain the fallback),
  *  - registers durable capture hooks (per-message, pre-compression rescue,
  *    periodic nudge) so conversation turns into memory automatically,
  *  - injects a system-prompt awareness section plus a per-session memory
- *    snapshot frozen at the session's first prompt assembly (so the prompt
- *    prefix never changes mid-session and KV cache stays valid).
+ *    snapshot frozen at the session's first prompt assembly, rendered through
+ *    the memory-data fence so stored content can never act as prompt structure.
  *
  * It never modifies dsh source and never imports the Python library — all
  * memory lives in the isolated child process, reached over the NDJSON bridge.
+ *
+ * Two operational properties this module is responsible for, because they are
+ * about *when* things happen rather than what they compute:
+ *
+ *  - **Every switch is read when it is used.** The live toggles (capture,
+ *    context injection, LLM extraction) reach their consumers as getters, so
+ *    flipping one in the settings panel takes effect on the next event instead
+ *    of on the next restart.
+ *  - **The Python side is probed before the bridge is trusted.** A child that
+ *    cannot import `atom_memory` exits immediately; without a preflight the
+ *    plugin would look healthy and fail every call. A permanent failure (wrong
+ *    interpreter, library not installed) is reported once with an actionable
+ *    message instead of being retried into silence.
  *
  * @module dsh-atom-memory/index
  */
@@ -29,6 +43,7 @@ import { registerMemoryTools } from './tools.ts'
 import { registerMemoryContext } from './context.ts'
 import { registerCapture } from './capture.ts'
 import { buildLlmExtractor, type ExtractFn } from './llm-extractor.ts'
+import { checkPythonSide, type PreflightResult } from './preflight.ts'
 import {
   createRuntime, SETTINGS_NAMESPACE, type LiveRuntime, Runtime,
 } from './runtime.ts'
@@ -48,13 +63,38 @@ export { Config }
 /** Fallback user/session scope for a single-user local harness. */
 const FALLBACK_SCOPE = 'global'
 
-/** Start params sent to the Python bridge (worker/embedding config). */
+/** Start attempts before the bridge is declared offline. */
+const MAX_START_ATTEMPTS = 3
+
+/**
+ * Start params sent to the Python bridge.
+ *
+ * These are `MemConfig` field names verbatim: the RPC `start` handler builds
+ * the config from them, so a typo becomes an "invalid start params" error rather
+ * than a silently ignored setting.
+ */
 function buildStartParams(config: ConfigShape): Record<string, unknown> {
-  return {
+  const params: Record<string, unknown> = {
     db_path: config.dbPath ?? '~/.dsh/atom-memory/memory.db',
     worker_poll_interval_sec: 0.5,
     max_retries: 3,
   }
+  // Ranking gates. The distance gate is the one filter that can say "nothing
+  // here is relevant" — a rank-based score cannot, which is why the ceiling and
+  // the floor travel together.
+  if (config.maxVectorDistance !== undefined) {
+    params.max_vector_distance = config.maxVectorDistance
+  }
+  if (config.minRelevance !== undefined) {
+    params.min_relevance = config.minRelevance
+  }
+  if (config.maxActiveFacts !== undefined) {
+    params.max_active_facts = config.maxActiveFacts
+  }
+  if (config.writeAckTimeoutMs !== undefined) {
+    params.write_ack_timeout_ms = config.writeAckTimeoutMs
+  }
+  return params
 }
 
 /**
@@ -77,6 +117,18 @@ export function apply(ctx: Context, config: ConfigShape): void {
 
   let startTimer: ReturnType<typeof setTimeout> | undefined
 
+  /**
+   * Bridge lifecycle state. `preflight` is memoised: the interpreter's ability
+   * to import the library does not change between two retries a second apart,
+   * and re-probing it would add a subprocess spawn to every retry.
+   */
+  const state = {
+    value: false,
+    error: undefined as string | undefined,
+    attempt: 0,
+    preflight: undefined as PreflightResult | undefined,
+  }
+
   const bridge = new PythonBridge({
     spawnProcess: () => defaultSpawn(config.pythonBin),
     timeoutMs: config.rpcTimeoutMs,
@@ -87,9 +139,9 @@ export function apply(ctx: Context, config: ConfigShape): void {
     // Runtime crash after a healthy start: try to bring memory back with a
     // fresh attempt budget (the budget is reset on every successful start).
     onExit: () => {
-      started.value = false
-      started.attempt = 0
-      if (config.autostart !== false && runtime.isEnabled()) tryStart()
+      state.value = false
+      state.attempt = 0
+      if (config.autostart !== false && runtime.isEnabled()) void tryStart()
     },
   })
 
@@ -99,53 +151,67 @@ export function apply(ctx: Context, config: ConfigShape): void {
   lifecycleDisposers.push(() => { if (startTimer !== undefined) { clearTimeout(startTimer); startTimer = undefined } })
   for (const d of lifecycleDisposers) ctx.effect(() => d)
 
-  const started = {
-    value: false,
-    error: undefined as Error | undefined,
-    attempt: 0,
-  }
-  const tryStart = (): void => {
-    if (started.value) return
-    if (started.attempt >= 3) {
+  const tryStart = async (): Promise<void> => {
+    if (state.value) return
+    if (state.attempt >= MAX_START_ATTEMPTS) {
       ctx.logger('[atom-memory] python bridge failed to (re)start; memory offline')
       return
     }
-    started.attempt += 1
-    void bridge.start(buildStartParams(config), undefined)
-      .then(() => {
-        started.value = true
-        // A healthy start resets the budget, so a later runtime crash gets a
-        // fresh 3-attempt budget instead of being permanently blocked.
-        started.attempt = 0
-        started.error = undefined
-        ctx.logger(`[atom-memory] bridge ready (${(config.dbPath ?? '').trim() || 'db'})`)
-      })
-      .catch((err: Error) => {
-        started.value = false
-        started.error = err
-        startTimer = setTimeout(tryStart, 1000)
-      })
+    if (state.preflight === undefined) {
+      state.preflight = await checkPythonSide(config.pythonBin)
+      if (!state.preflight.ok) {
+        state.error =
+          `python side unavailable (${state.preflight.bin}): ${state.preflight.detail}`
+        ctx.logger(`[atom-memory] ${state.error}`)
+        if (state.preflight.permanent) {
+          ctx.logger(
+            '[atom-memory] not retrying: install the library into that interpreter '
+            + '(`pip install -e .`) or point `pythonBin` at one that has it',
+          )
+          return
+        }
+      }
+    }
+    state.attempt += 1
+    try {
+      await bridge.start(buildStartParams(config), undefined)
+      state.value = true
+      // A healthy start resets the budget, so a later runtime crash gets a
+      // fresh set of attempts instead of being permanently blocked.
+      state.attempt = 0
+      state.error = undefined
+      const health = await bridge.healthDetail().catch(() => undefined)
+      const indexOk = (health?.index as { ok?: boolean } | undefined)?.ok
+      ctx.logger(
+        `[atom-memory] bridge ready (${(config.dbPath ?? '').trim() || 'db'}`
+        + `${indexOk === false ? ', indexes inconsistent → will self-repair' : ''})`,
+      )
+    } catch (err) {
+      state.value = false
+      state.error = (err as Error)?.message ?? String(err)
+      startTimer = setTimeout(() => { void tryStart() }, 1000)
+    }
   }
-  if (config.autostart !== false) tryStart()
+  if (config.autostart !== false) void tryStart()
 
   // LLM-first extraction (optional): prefers a manual extractionModel override,
-  // else follows the dsh default model. `enabled` gates the extractor so the
-  // master switch silences the LLM path without re-registering anything.
-  const extract: ExtractFn | undefined =
-    runtime.get().llmExtractionEnabled === false
-      ? undefined
-      : buildLlmExtractor(ctx, {
-          maxTokens: config.extractionMaxTokens ?? 2048,
-          modelOverride: () => runtime.get().extractionModel,
-          enabled: () => runtime.isEnabled(),
-        })
+  // else follows the dsh default model. Both the master switch and the
+  // extraction switch are read per call, so the panel's toggles apply
+  // immediately in either direction.
+  const llmEnabled = () =>
+    runtime.isEnabled() && runtime.get().llmExtractionEnabled !== false
+  const extract: ExtractFn | undefined = buildLlmExtractor(ctx, {
+    maxTokens: config.extractionMaxTokens ?? 2048,
+    modelOverride: () => runtime.get().extractionModel,
+    enabled: llmEnabled,
+  })
 
   // The panel's data operations (features 3-5) are served to the browser over
   // the Remote gateway; registration is reversible with the controller. The
   // gateway protocol is optional — if this deployment lacks it, features 3-5
   // are simply unavailable in the browser and the plugin degrades gracefully.
   try {
-    new AtomMemoryController(ctx, bridge, runtime)
+    new AtomMemoryController(ctx, bridge, runtime, () => state.error)
   } catch (err) {
     ctx.logger(`[atom-memory] remote controller unavailable (${(err as Error)?.message ?? err})`)
   }
@@ -154,7 +220,7 @@ export function apply(ctx: Context, config: ConfigShape): void {
   // -> rule-based add (everything stays isolated in the Python process).
   const capture = async (text: string, sessionId: string): Promise<void> => {
     if (!runtime.isEnabled()) return
-    if (started.value && extract !== undefined) {
+    if (state.value && extract !== undefined) {
       try {
         const candidates = await extract(text)
         if (candidates.length > 0) {
@@ -170,7 +236,7 @@ export function apply(ctx: Context, config: ConfigShape): void {
         /* fall through to rule extraction on LLM failure */
       }
     }
-    if (started.value) {
+    if (state.value) {
       await bridge.call('add', {
         user_id: FALLBACK_SCOPE,
         session_id: sessionId,
@@ -180,9 +246,41 @@ export function apply(ctx: Context, config: ConfigShape): void {
     }
   }
 
+  // System-prompt awareness + the session-start-frozen memory snapshot.
+  //
+  // Registered *before* the tools so the tool set can be handed the snapshot
+  // handle: "what the model is currently being told" has to be the same cache
+  // the prompt is served from, or the audit view is a re-render that can drift.
+  //
+  // `isEnabled` is the master switch: when off, the awareness section resolves
+  // to empty (so no "You have persistent long-term memory…" text reaches the
+  // system prompt) and snapshot injection stops entirely.
+  //
+  // The injected snapshot uses its own (smaller) budget and the compact render
+  // depth: it is paid for on every request and is the view that must stay short
+  // and priority-ordered, unlike the full list the `memory_summary_detail` tool
+  // and the settings modal return.
+  //
+  // The budget is passed as a *getter*, not a value: the settings panel owns it
+  // at runtime, and resolving it at each freeze is what lets a change apply to
+  // sessions that have not frozen yet while leaving already-frozen sessions
+  // (and their KV cache) untouched.
+  const snapshot = registerMemoryContext({
+    ctx,
+    bridge,
+    userScope: FALLBACK_SCOPE,
+    resolveMaxTokens: () => clampInjectedSummaryTokens(runtime.get().injectedSummaryTokens),
+    // Read per assembly: turning injection off must stop paying for it now, and
+    // turning it back on must work without a restart.
+    snapshotEnabled: () => runtime.get().contextInjectionEnabled,
+    isEnabled: () => runtime.isEnabled(),
+  })
+
   // Explicit memory tools. `extract` is shared with the capture path so the
   // model-driven `memory_add` uses the same LLM-first extraction (with the
-  // rule path as fallback) instead of the rules-only bridge `add` call.
+  // rule path as fallback) instead of the rules-only bridge `add` call. The
+  // write tools wait briefly for the store's verdict — `wait_ms` is a bounded
+  // acknowledgement, not a synchronous pipeline.
   const disposers = registerMemoryTools({
     ctx,
     bridge,
@@ -191,6 +289,10 @@ export function apply(ctx: Context, config: ConfigShape): void {
     summaryTokens: config.summaryTokens ?? 1500,
     extract,
     isEnabled: () => runtime.isEnabled(),
+    resolveSummaryBudget: () =>
+      clampInjectedSummaryTokens(runtime.get().injectedSummaryTokens),
+    writeAckTimeoutMs: config.writeAckTimeoutMs ?? 0,
+    snapshot,
   })
   for (const d of disposers) ctx.effect(() => d)
 
@@ -198,35 +300,14 @@ export function apply(ctx: Context, config: ConfigShape): void {
   registerCapture(
     { ctx, capture, maxRecent: 20 },
     {
-      captureEnabled: runtime.get().captureEnabled,
+      // A getter: the panel's switch stops capture immediately rather than at
+      // the next reload.
+      captureEnabled: () => runtime.get().captureEnabled,
       preCompressionCapture: config.preCompressionCapture !== false,
       nudgeEnabled: config.nudgeEnabled !== false,
       nudgeIntervalMs: (config.nudgeIntervalMinutes ?? 30) * 60_000,
     },
   ).forEach((d) => ctx.effect(() => d))
-
-  // System-prompt awareness + the session-start-frozen memory snapshot.
-  // `isEnabled` is the master switch: when off, the awareness section resolves
-  // to empty (so no "You have persistent long-term memory…" text reaches the
-  // system prompt) and snapshot injection stops entirely.
-  //
-  // The injected snapshot uses its own (smaller) budget and the compact render
-  // depth: it is paid for on every request and is the view that must stay short
-  // and priority-ordered, unlike the full list the `memory_summary_detail` tool and
-  // the settings modal return.
-  //
-  // The budget is passed as a *getter*, not a value: the settings panel owns it
-  // at runtime, and resolving it at each freeze is what lets a change apply to
-  // sessions that have not frozen yet while leaving already-frozen sessions
-  // (and their KV cache) untouched.
-  registerMemoryContext({
-    ctx,
-    bridge,
-    userScope: FALLBACK_SCOPE,
-    resolveMaxTokens: () => clampInjectedSummaryTokens(runtime.get().injectedSummaryTokens),
-    snapshotEnabled: runtime.get().contextInjectionEnabled,
-    isEnabled: () => runtime.isEnabled(),
-  })
 
   // Settings namespace: the composition entry seeds the runtime; a settings
   // write replaces it live. This powers the memory master switch (feature 1)
@@ -260,6 +341,18 @@ export function apply(ctx: Context, config: ConfigShape): void {
     ctx.logger(`[dsh-atom-memory] settings section "${SETTINGS_NAMESPACE}" registered`)
   })
 
+  // One audit line per live change: when a session behaves differently from the
+  // last one, "which switch moved" is the first question, and this answers it
+  // without a debugger.
+  runtime.subscribe(() => {
+    const live = runtime.get()
+    ctx.logger(
+      `[atom-memory] live switches: enabled=${live.enabled} capture=${live.captureEnabled} `
+      + `llm=${live.llmExtractionEnabled} inject=${live.contextInjectionEnabled} `
+      + `budget=${live.injectedSummaryTokens}`,
+    )
+  })
+
   ctx.logger('[dsh-atom-memory] loaded')
 }
 
@@ -281,5 +374,3 @@ const LiveSettingsSchema: z<LiveRuntime> = z.object({
     apiKey: z.string().default(''),
   }).default({ provider: '', model: '', baseURL: '', protocol: 'openai', apiKey: '' }),
 })
-
-

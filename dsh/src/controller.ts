@@ -14,6 +14,7 @@
 import { Context } from '@deepseek-ai/cordis'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import type { PythonBridge } from './bridge.ts'
+import { clampInjectedSummaryTokens } from './injection-budget.ts'
 import type { LiveRuntime, Runtime } from './runtime.ts'
 
 /** One active fact as the panel edits it. */
@@ -52,14 +53,51 @@ declare module '@deepseek-ai/cordis' {
  * Python side.
  */
 export class AtomMemoryController extends TypertRemoteService {
-  constructor(ctx: Context, private readonly bridge: PythonBridge, private readonly runtime: Runtime) {
+  constructor(
+    ctx: Context,
+    private readonly bridge: PythonBridge,
+    private readonly runtime: Runtime,
+    /**
+     * Why the bridge is not running, when the plugin knows (preflight failure,
+     * spawn error). Reported verbatim to the panel: "memory bridge is not
+     * running" without the reason is the least actionable message a diagnostic
+     * surface can produce.
+     */
+    private readonly startupError: () => string | undefined = () => undefined,
+  ) {
     super(ctx, 'atomMemoryController', { namespace: 'atomMemory' })
   }
 
   /** Whether the bridge is alive and the plugin master switch is on. */
   private assertReady(): void {
     if (!this.runtime.isEnabled()) throw new Error('memory is disabled')
-    if (!this.bridge.alive) throw new Error('memory bridge is not running')
+    if (!this.bridge.alive) {
+      const reason = this.startupError()
+      throw new Error(
+        reason !== undefined
+          ? `memory bridge is not running: ${reason}`
+          : 'memory bridge is not running',
+      )
+    }
+  }
+
+  /**
+   * Diagnostics for the panel: is the store actually usable?
+   *
+   * Deliberately does not call {@link assertReady}: this is the call the panel
+   * makes *because* something is wrong, so it has to answer while the bridge is
+   * down instead of throwing the same generic error.
+   */
+  @Remote
+  async health(): Promise<Record<string, unknown>> {
+    const startupError = this.startupError()
+    const payload = await this.bridge.healthDetail()
+    return {
+      enabled: this.runtime.isEnabled(),
+      bridgeAlive: this.bridge.alive,
+      startupError: startupError ?? null,
+      startup: payload ?? null,
+    }
   }
 
   /** Paginate the user's active facts. */
@@ -117,12 +155,31 @@ export class AtomMemoryController extends TypertRemoteService {
     this.assertReady()
     const result = await this.bridge.call<{ text?: string }>('summary', {
       user_id: args.user,
-      max_tokens: args.maxTokens ?? 1500,
+      // Same budget the session prompt freezes at, so the modal shows the text
+      // the model would actually receive. A session that already froze keeps its
+      // frozen copy — `memory_snapshot` is the tool-side view of that.
+      max_tokens: args.maxTokens ?? clampInjectedSummaryTokens(this.runtime.get().injectedSummaryTokens),
       detail: false,
     })
     // `AtomMem.summary` returns the markdown string directly; tolerate a
     // wrapped shape in case the Python side ever changes the contract.
     return typeof result === 'string' ? result : (result?.text ?? '')
+  }
+
+  /**
+   * Restore an archived fact to the active set.
+   *
+   * The archive tier is how capacity control stays non-destructive: nothing is
+   * deleted when the store is over its cap, so there has to be a way back.
+   */
+  @Remote
+  async unarchive(args: { user: string; fact_id: string }): Promise<Record<string, unknown>> {
+    this.assertReady()
+    if (!args.fact_id) throw new Error('unarchive requires fact_id')
+    return this.bridge.call('unarchive', {
+      user_id: args.user,
+      fact_id: args.fact_id,
+    }) as Promise<Record<string, unknown>>
   }
 
   /** List the user's profile rows. */

@@ -42,10 +42,13 @@ describe('AtomMemoryController.summary', () => {
     expect(params).toMatchObject({ user_id: 'global', detail: false })
   })
 
-  it('defaults the token budget to the summary budget (1500)', async () => {
+  it('defaults the token budget to the injected-snapshot budget, not the tool budget', async () => {
+    // The modal claims to show the text the model sees, so its default budget
+    // has to be the injection budget (800 by default) rather than the larger
+    // tool budget — otherwise the two views disagree by construction.
     const { controller, call } = makeController()
     await controller.summary({ user: 'global' })
-    expect(call.mock.calls[0]![1]).toMatchObject({ max_tokens: 1500 })
+    expect(call.mock.calls[0]![1]).toMatchObject({ max_tokens: 800 })
   })
 
   it('forwards a caller-supplied budget', async () => {

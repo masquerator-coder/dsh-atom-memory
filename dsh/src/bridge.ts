@@ -208,15 +208,30 @@ export class PythonBridge {
     this.rejectAll(new Error('bridge reset'))
   }
 
+  /**
+   * Read the store's health payload.
+   *
+   * Unlike the boolean form this distinguishes "the store answered and is fine"
+   * from "the store answered and its indexes have drifted" from "the bridge is
+   * not there", which is what a diagnostics surface (and a restart decision)
+   * actually needs.
+   *
+   * @param timeoutMs - Bound on the probe.
+   * @returns The payload, or `undefined` when the bridge is down or unresponsive.
+   */
+  async healthDetail(timeoutMs = 5_000): Promise<Record<string, unknown> | undefined> {
+    if (this.proc === undefined) return undefined
+    try {
+      return await this.call<Record<string, unknown>>('health', {}, timeoutMs)
+    } catch {
+      return undefined
+    }
+  }
+
   /** Send the Python `start`/config had already been acked lazily. */
   async health(): Promise<boolean> {
-    if (this.proc === undefined) return false
-    try {
-      const r = await this.call<{ ok: boolean }>('health', {}, 5_000)
-      return r.ok === true
-    } catch {
-      return false
-    }
+    const payload = await this.healthDetail()
+    return payload?.ok === true
   }
 
   /**
