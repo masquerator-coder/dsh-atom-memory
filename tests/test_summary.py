@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import re
 
+import pytest
+
 from atom_memory.db import connect_for_tests
 from atom_memory.models import NEUTRAL_SCORE
 from atom_memory.summary import (
@@ -612,3 +614,107 @@ def test_compact_is_meaningfully_smaller_than_detail():
         assert estimate_tokens(compact) < estimate_tokens(detail)
     finally:
         conn.close()
+
+
+# ---- budget selection: fast path must equal the reference exactly ------------
+
+def _reference_select(sections: dict, max_tokens: int) -> dict:
+    """The original selection: recompose and re-measure after every removal.
+
+    Kept here as the oracle for the incremental implementation. It is O(n²), so
+    it is only ever run on the small inputs of this test.
+    """
+    from atom_memory.summary import _compose
+
+    titles = list(sections)
+    kept = {title: list(range(len(lines))) for title, lines in sections.items()}
+    give_up = [
+        (score, order_index, line_index)
+        for order_index, lines in enumerate(sections.values())
+        for line_index, (_line, score) in enumerate(lines)
+    ]
+    give_up.sort(key=lambda item: (item[0], -item[1], -item[2]))
+    for _score, order_index, line_index in give_up:
+        if estimate_tokens(_compose(sections, kept)) <= max_tokens:
+            break
+        title = titles[order_index]
+        if line_index in kept[title]:
+            kept[title] = [index for index in kept[title] if index != line_index]
+    return {title: indices for title, indices in kept.items() if indices}
+
+
+def _random_sections(seed: int, sections: int, per_section: int):
+    import random
+
+    from atom_memory.summary import _SECTION_TITLES
+
+    rng = random.Random(seed)
+    titles = list(_SECTION_TITLES.values())[:sections]
+    out = {}
+    for title in titles:
+        lines = []
+        for index in range(per_section):
+            width = rng.choice([1, 3, 8, 30, 80])
+            alphabet = rng.choice(["字", "ab", "字a", " "])
+            text = "- " + "".join(
+                rng.choice(alphabet) for _ in range(width)
+            ) + str(index)
+            lines.append((text, round(rng.random(), 4)))
+        out[title] = sorted(lines, key=lambda item: -item[1])
+    return out
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_incremental_selection_matches_the_reference_exactly(seed):
+    """The O(n log n) selection must pick the *same* lines as the O(n²) oracle.
+
+    This is the contract that makes the speed-up safe: the budget decides which
+    memories the model sees, so "faster but slightly different" would silently
+    change what is remembered.
+    """
+    from atom_memory.summary import _compose, _select
+
+    sections = _random_sections(seed, sections=4, per_section=12)
+    for budget in (5, 20, 40, 80, 120, 200, 400, 1200):
+        fast = _select(sections, budget)
+        slow = _reference_select(sections, budget)
+        assert fast == slow, f"seed={seed} budget={budget}"
+
+        rendered = _compose(sections, fast)
+        assert estimate_tokens(rendered) <= budget or not fast
+
+
+def test_selection_does_not_re_render_the_artifact(monkeypatch):
+    """The cost fix, asserted structurally rather than by wall-clock.
+
+    The old loop called ``_compose`` (a full re-render plus a full re-measure)
+    once per dropped line, which is what made freezing a snapshot quadratic.
+    """
+    import atom_memory.summary as summary_mod
+
+    calls = {"compose": 0, "real": summary_mod._compose}
+
+    def _counting_compose(sections, kept):
+        calls["compose"] += 1
+        return calls["real"](sections, kept)
+
+    monkeypatch.setattr(summary_mod, "_compose", _counting_compose)
+    sections = _random_sections(7, sections=3, per_section=40)
+    summary_mod._select(sections, 150)
+    assert calls["compose"] == 0, "selection must not re-render the artifact"
+
+
+def test_selecting_a_large_render_is_not_quadratic():
+    """A store with thousands of facts must not stall prompt assembly."""
+    import time
+
+    from atom_memory.summary import _select
+
+    sections = _random_sections(11, sections=6, per_section=300)  # 1800 lines
+    start = time.perf_counter()
+    kept = _select(sections, 800)
+    elapsed = time.perf_counter() - start
+    assert kept, "a large store still renders something"
+    # The measured O(n²) implementation took ~2 s at 1500 lines and ~8 s at
+    # 3000; this bound is far above the fast path and far below the old one.
+    assert elapsed < 1.0, f"selection took {elapsed:.2f}s"

@@ -47,7 +47,7 @@ from .models import (
     TYPE_SEMANTIC,
     default_importance,
 )
-from .retriever import estimate_tokens
+from .retriever import estimate_tokens, token_cost
 from .reinforce import adjust, effective_importance
 from .validator import MULTI_VALUED_PREDICATES
 
@@ -535,13 +535,19 @@ def _select(sections: dict, max_tokens: int) -> dict:
       thrown away purely because it lived in the section that sorts last.
     * The budget is measured on the **assembled artifact** — the body plus the
       footer that this very selection produces — never on an estimate of its
-      parts. ``estimate_tokens`` counts non-CJK characters in blocks of five per
-      call, so a joined text costs *more* than the sum of its lines' costs:
-      budgeting the body against a pre-subtracted footer reserve silently
-      overshoots and collapses the whole render to the "omitted" notice.
+      parts, so the token budget is a hard cap on what is actually returned.
 
     A section that loses *every* line loses its label too (labels are part of the
     artifact being measured), so no bare ``流程`` stub is rendered.
+
+    Cost is linear-ish rather than quadratic: the candidate order is fixed once,
+    and each removal updates the artifact's *character totals* instead of
+    re-rendering it. ``estimate_tokens`` is a pure function of those totals
+    (``cjk + max(other // 5, 1)``), so the incremental measurement is exactly
+    what a full re-render would report — which the differential test in
+    ``tests/test_summary.py`` pins. Re-measuring the whole artifact per dropped
+    line cost O(n²): 3000 facts took 8.2 s *inside* prompt assembly, blocking
+    every other request on the same event loop.
 
     Args:
         sections: ``section title -> [(line, score), ...]`` in render order.
@@ -565,14 +571,81 @@ def _select(sections: dict, max_tokens: int) -> dict:
     ]
     give_up.sort(key=lambda item: (item[0], -item[1], -item[2]))
 
+    # -- exact, incremental measurement ---------------------------------------
+    #
+    # The artifact's token count is a pure function of its two character totals
+    # (``cjk + max(other // 5, 1)``), and character decomposition is additive, so
+    # the totals of the assembled text can be maintained as parts are removed
+    # instead of re-rendering the text. The newline separators count as "other"
+    # characters and are accounted for explicitly:
+    #
+    #   body   = "\n".join(parts)        -> sum(parts) + (parts - 1) newlines
+    #   result = body + "\n\n" + footer  -> + 2 more when the body is non-empty
+    line_cost: dict = {}
+    title_cost: dict = {}
+    totals = {"cjk": 0, "other": 0, "parts": 0, "lines": 0}
+    for title, lines in sections.items():
+        cost = token_cost(title)
+        title_cost[title] = (cost[1], cost[2])
+        totals["cjk"] += cost[1]
+        totals["other"] += cost[2]
+        totals["parts"] += 1
+        for index, (text, _score) in enumerate(lines):
+            cost = token_cost(text)
+            line_cost[(title, index)] = (cost[1], cost[2])
+            totals["cjk"] += cost[1]
+            totals["other"] += cost[2]
+            totals["parts"] += 1
+            totals["lines"] += 1
+    # The newlines joining the parts.
+    totals["other"] += max(0, totals["parts"] - 1)
+
+    def _drop(title: str, line_index: int) -> None:
+        """Remove one kept line and update the totals it contributed."""
+        kept[title] = [index for index in kept[title] if index != line_index]
+        cjk, other = line_cost[(title, line_index)]
+        totals["cjk"] -= cjk
+        totals["other"] -= other
+        totals["parts"] -= 1
+        totals["other"] -= 1 if totals["parts"] > 0 else 0
+        if not kept[title]:
+            cjk, other = title_cost[title]
+            totals["cjk"] -= cjk
+            totals["other"] -= other
+            totals["parts"] -= 1
+            totals["other"] -= 1 if totals["parts"] > 0 else 0
+
+    def _artifact_totals() -> tuple:
+        """The ``(cjk, other)`` totals of body + footer for the current state."""
+        counts = {title: len(indices) for title, indices in kept.items() if indices}
+        hidden = [title for title in sections if not kept.get(title)]
+        omitted = totals["lines"] - sum(counts.values())
+        foot = token_cost(_render_footer(omitted, hidden, counts))
+        if totals["parts"] == 0:
+            return (foot[1], foot[2])
+        return (totals["cjk"] + foot[1], totals["other"] + foot[2] + 2)
+
     for _score, order_index, line_index in give_up:
-        if estimate_tokens(_compose(sections, kept)) <= max_tokens:
+        if _tokens_for_totals(_artifact_totals()) <= max_tokens:
             break
         title = titles[order_index]
         if line_index in kept[title]:
-            kept[title] = [index for index in kept[title] if index != line_index]
+            _drop(title, line_index)
 
     return {title: indices for title, indices in kept.items() if indices}
+
+
+def _tokens_for_totals(totals) -> int:
+    """Return the token estimate for accumulated ``(cjk, other)`` totals.
+
+    Mirrors :func:`~atom_memory.retriever.estimate_tokens` exactly (including
+    its "empty text is zero" case) so an incremental measurement and a full
+    re-render can never disagree.
+    """
+    cjk, other = totals
+    if cjk <= 0 and other <= 0:
+        return 0
+    return cjk + max(other // 5, 1 if other else 0)
 
 
 def _kept_indices(kept: dict, title: str) -> List[int]:
