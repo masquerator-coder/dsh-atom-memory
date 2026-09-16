@@ -360,7 +360,7 @@ window.__ModuleLoader__.load({
 				injectPresetMax: "超大 · {tokens} tokens",
 				injectSliderHint: "拖动滑块在固定挡位之间切换：{rungs} tokens。",
 				injectOffGrid: "当前 {tokens} tokens 不在挡位梯上（来自旧的自定义值或插件配置）；拖动滑块即切到最接近的固定挡位。",
-				injectHint: "当前 {tokens} tokens。预算是上限而非目标：记忆总量没到上限就一条都不会被舍弃，所以放大挡位只在记忆确实很多时才多花钱。预算越紧，越优先保留最重要且最新的记忆，被舍弃的条目由页脚注明；预算只影响注入系统提示词的那份快照，且仅对之后的新会话生效——已冻结的会话保持原样，以免破坏 KV 缓存。",
+				injectHint: "当前 {tokens} tokens。预算越紧，越优先保留最重要且最新的记忆，被舍弃的条目由页脚注明；预算只影响注入系统提示词的快照，且仅对之后的新会话生效。",
 				modelHeader: "LLM 抽取模型",
 				modelFollowDefault: "跟随 dsh 默认模型",
 				modelManual: "手动指定模型",
