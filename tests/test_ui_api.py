@@ -202,7 +202,13 @@ def test_backup_restore_roundtrip(tmp_path, monkeypatch):
         restored = await mem.restore("u1", snapshot)
         assert restored["facts_written"] == 2
         assert mem.list_facts("u1")["total"] == 2
-        assert len(mem.list_profile("u1")["profile"]) == 1
+        # The profile is a read-through projection of the active facts, so after
+        # the restore it holds every row those facts imply: the exported 职业 row
+        # *and* the 偏好 row derived from the restored preference fact. Asserting
+        # the snapshot's own row count here would pin the old behaviour, where a
+        # profile could describe facts the store no longer had.
+        sections = {r["section"] for r in mem.list_profile("u1")["profile"]}
+        assert sections == {"职业", "偏好"}
         await mem.stop()
 
     _run(scenario())

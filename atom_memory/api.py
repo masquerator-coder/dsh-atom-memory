@@ -14,13 +14,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sqlite3
+import time
 import uuid
 from typing import Optional
 
 from .backup import export_memory, import_memory, validate_backup
 from .config import MemConfig
-from .db import now_ms, open_db
+from .db import index_orphans, now_ms, open_db, record_event
 from .embedder import Embedder
 from .profile import derive_profile_from_facts, profile_md
 from .reinforce import (
@@ -30,11 +32,27 @@ from .reinforce import (
     record_reinforcement,
 )
 from .retriever import Retriever, estimate_tokens, segment_text
+from .sanitize import clean_body, clean_field
 from .summary import generate_summary
 from .validator import is_multi_valued
 from .worker import Worker
 
 logger = logging.getLogger(__name__)
+
+# Candidate statuses that mean "the unit of work is finished". Used by the
+# write acknowledgement, which waits for one of these.
+_TERMINAL_CANDIDATE_STATUS = ("applied", "skipped", "error")
+
+
+def _decode_outcome(raw: Optional[str]) -> dict:
+    """Decode a candidate's stored write outcome (never raises)."""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 class AtomMem:
@@ -71,6 +89,7 @@ class AtomMem:
             conn=self.db,
             embed_one=self.embedder.embed_one,
             top_k_default=10,
+            config=self.config,
         )
         self._worker = Worker(
             conn=self.db,
@@ -79,6 +98,7 @@ class AtomMem:
             max_retries=self.config.max_retries,
             llm_extractor=self.config.llm_extractor,
             privacy_filter=self.config.privacy_filter,
+            config=self.config,
         )
         self._worker.start()
         self._started = True
@@ -112,6 +132,7 @@ class AtomMem:
         session_id: str,
         text: str,
         turn_id: int = 0,
+        wait_ms: Optional[int] = None,
     ) -> dict:
         """Enqueue a user utterance to be extracted into atomic facts.
 
@@ -119,15 +140,28 @@ class AtomMem:
         ``extract`` task is queued; the worker persists extracted facts
         asynchronously.
 
+        The return value is the **enqueue receipt** unless a wait is asked for:
+        ``wait_ms`` (or the configured
+        :attr:`~atom_memory.config.MemConfig.write_ack_timeout_ms`) makes this
+        method wait for its own candidate to finish and report what actually
+        happened — written, superseded, refused-and-why. Without it a caller
+        cannot tell "stored" from "refused", which is exactly how a rejected
+        write used to look like a successful one.
+
         Args:
             user_id: The user who produced the utterance (isolation scope).
             session_id: The session the utterance belongs to.
-            text: The raw utterance text.
+            text: The raw utterance text (cleaned before it is stored or
+                extracted: the provenance copy must not carry invisible
+                characters either).
             turn_id: Optional zero-based turn number.
+            wait_ms: How long to wait for the write outcome. ``None`` uses the
+                configured default (``0`` = do not wait).
 
         Returns:
-            A dict ``{"candidate_id", "status", "trace_id"}`` where
-            ``status`` is ``"pending"``.
+            A dict ``{"candidate_id", "status", "trace_id"}``, plus
+            ``"outcome"`` when the status is terminal: ``{"written",
+            "superseded", "rejected", "reinforced"}``.
         """
         if self.db is None:
             raise RuntimeError("AtomMem is not started; call start() first")
@@ -135,6 +169,7 @@ class AtomMem:
         candidate_id = str(uuid.uuid4())
         trace_id = str(uuid.uuid4())
         created_at = now_ms()
+        text = clean_body(text, self.config.max_content_chars)
 
         with self.db:
             self.db.execute(
@@ -163,7 +198,120 @@ class AtomMem:
                 ),
             )
 
-        return {"candidate_id": candidate_id, "status": "pending", "trace_id": trace_id}
+        return await self._write_receipt(candidate_id, trace_id, wait_ms)
+
+    async def _write_receipt(
+        self, candidate_id: str, trace_id: str, wait_ms: Optional[int]
+    ) -> dict:
+        """Return the enqueue receipt, waiting for the outcome when asked to.
+
+        Args:
+            candidate_id: The candidate this call produced.
+            trace_id: Trace id to echo back.
+            wait_ms: Wait budget; ``None`` uses the configured default.
+
+        Returns:
+            ``{"candidate_id", "status", "trace_id"}`` plus ``"outcome"``,
+            ``"reject_kind"`` and ``"reject_reason"`` once the candidate has
+            reached a terminal state.
+        """
+        receipt = {
+            "candidate_id": candidate_id,
+            "status": "pending",
+            "trace_id": trace_id,
+        }
+        timeout_ms = (
+            self.config.write_ack_timeout_ms if wait_ms is None else int(wait_ms)
+        )
+        if timeout_ms <= 0 or self.db is None:
+            return receipt
+
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while True:
+            row = self.db.execute(
+                "SELECT status, reject_kind, reject_reason, result_fact_ids "
+                "FROM fact_candidates WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if row is not None and row["status"] in _TERMINAL_CANDIDATE_STATUS:
+                receipt["status"] = row["status"]
+                receipt["outcome"] = _decode_outcome(row["result_fact_ids"])
+                if row["reject_kind"]:
+                    receipt["reject_kind"] = row["reject_kind"]
+                if row["reject_reason"]:
+                    receipt["reject_reason"] = row["reject_reason"]
+                return receipt
+            if time.monotonic() >= deadline:
+                return receipt
+            await asyncio.sleep(0.02)
+
+    def candidate_outcome(self, candidate_id: str) -> Optional[dict]:
+        """Return one candidate's terminal state and outcome, or ``None``.
+
+        This is the pull-side of the write acknowledgement: a caller that did
+        not wait can still find out what happened to the write it enqueued.
+
+        Args:
+            candidate_id: The candidate row to read.
+
+        Returns:
+            ``{"status", "outcome", "reject_kind", "reject_reason",
+            "finished_at"}`` or ``None`` when the candidate is unknown or still
+            pending.
+        """
+        if self.db is None:
+            return None
+        row = self.db.execute(
+            "SELECT status, reject_kind, reject_reason, result_fact_ids, "
+            "finished_at FROM fact_candidates WHERE candidate_id = ?",
+            (candidate_id,),
+        ).fetchone()
+        if row is None or row["status"] not in _TERMINAL_CANDIDATE_STATUS:
+            return None
+        return {
+            "status": row["status"],
+            "outcome": _decode_outcome(row["result_fact_ids"]),
+            "reject_kind": row["reject_kind"],
+            "reject_reason": row["reject_reason"],
+            "finished_at": row["finished_at"],
+        }
+
+    def recent_outcomes(self, user_id: str, limit: int = 5) -> list:
+        """Return the user's most recent finished writes, newest first.
+
+        A memory system that refuses a write owes the writer an answer; this is
+        where that answer lives when nobody was waiting at the time (a capture
+        hook, a tool call that timed out).
+
+        Args:
+            user_id: The user whose writes to report.
+            limit: Maximum number of entries.
+
+        Returns:
+            A list of ``{"candidate_id", "status", "reject_kind",
+            "reject_reason", "outcome", "finished_at"}``.
+        """
+        if self.db is None:
+            return []
+        limit = max(1, min(int(limit), 50))
+        rows = self.db.execute(
+            "SELECT candidate_id, status, reject_kind, reject_reason, "
+            "result_fact_ids, finished_at FROM fact_candidates "
+            "WHERE user_id = ? AND finished_at IS NOT NULL "
+            "ORDER BY finished_at DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+        return [
+            {
+                "candidate_id": r["candidate_id"],
+                "status": r["status"],
+                "reject_kind": r["reject_kind"],
+                "reject_reason": r["reject_reason"],
+                "outcome": _decode_outcome(r["result_fact_ids"]),
+                "finished_at": r["finished_at"],
+            }
+            for r in rows
+        ]
 
     # -- recall pipeline ---------------------------------------------------------
 
@@ -239,6 +387,7 @@ class AtomMem:
             "facts": facts,
             "pending": pending,
             "conflicts": self._load_conflicts(user_id),
+            "degraded": list(getattr(self.retriever, "last_degraded", []) or []),
             "token_count": used,
             "trace_id": str(uuid.uuid4()),
         }
@@ -367,20 +516,31 @@ class AtomMem:
 
     # -- mutation surface -----------------------------------------------------------
 
-    async def replace(self, user_id: str, fact_id: str, new_text: str) -> dict:
+    async def replace(
+        self,
+        user_id: str,
+        fact_id: str,
+        new_text: str,
+        wait_ms: Optional[int] = None,
+    ) -> dict:
         """Replace an active fact with a new statement.
 
         The old fact is soft-superseded (``status='superseded'`` with
         ``superseded_by`` pointing at the newest replacement fact) by the
-        worker asynchronously.
+        worker asynchronously. Because the caller *names* the target, the
+        replacement supersedes it whatever the evidence comparison would say —
+        that is the difference between ``replace`` and re-asserting a value
+        through :meth:`add`.
 
         Args:
             user_id: The user who owns the fact.
             fact_id: The active fact to replace.
             new_text: The replacement utterance to extract into facts.
+            wait_ms: How long to wait for the write outcome (see :meth:`add`).
 
         Returns:
-            A dict ``{"candidate_id", "status", "trace_id"}``.
+            A dict ``{"candidate_id", "status", "trace_id"}``, plus
+            ``"outcome"`` once the write finished.
         """
         if self.db is None:
             raise RuntimeError("AtomMem is not started; call start() first")
@@ -397,12 +557,13 @@ class AtomMem:
 
         candidate_id = str(uuid.uuid4())
         created_at = now_ms()
+        text = clean_body(new_text, self.config.max_content_chars)
         with self.db:
             self.db.execute(
                 "INSERT INTO fact_candidates(candidate_id, user_id, session_id, "
                 "turn_id, raw_text, status, created_at) "
                 "VALUES (?, ?, ?, 0, ?, 'pending', ?)",
-                (candidate_id, user_id, old["session_id"], new_text, created_at),
+                (candidate_id, user_id, old["session_id"], text, created_at),
             )
             self.db.execute(
                 "INSERT INTO task_queue(task_id, task_type, payload, status, "
@@ -415,7 +576,7 @@ class AtomMem:
                             "candidate_id": candidate_id,
                             "user_id": user_id,
                             "old_fact_id": fact_id,
-                            "new_text": new_text,
+                            "new_text": text,
                             "session_id": old["session_id"],
                             "turn_id": 0,
                         }
@@ -424,23 +585,38 @@ class AtomMem:
                     created_at,
                 ),
             )
-        return {"candidate_id": candidate_id, "status": "pending", "trace_id": str(uuid.uuid4())}
+        return await self._write_receipt(
+            candidate_id, str(uuid.uuid4()), wait_ms
+        )
 
     async def forget(
-        self, user_id: str, fact_id: Optional[str] = None, session_id: Optional[str] = None
+        self,
+        user_id: str,
+        fact_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        purge: bool = False,
+        wait_ms: Optional[int] = None,
     ) -> dict:
-        """Forget (soft-delete) a fact, or every active fact of a session.
+        """Forget a fact, or every active fact of a session.
 
-        Targeted facts are marked ``status='retracted'`` by the worker
-        asynchronously. Pass exactly one of ``fact_id`` or ``session_id``.
+        Forgetting is a **soft retract** by default: the row stays, ``status``
+        becomes ``retracted``, and every read path stops seeing it, which keeps
+        the provenance of what was removed. ``purge=True`` is the explicit
+        exception — it deletes the facts, their index entries and their
+        reinforcement log, for a user who wants the content gone rather than
+        merely unused.
 
         Args:
             user_id: The user who owns the memory.
             fact_id: The specific fact to retract.
             session_id: Retract all active facts of this session instead.
+            purge: Delete the matched facts physically instead of retracting.
+            wait_ms: How long to wait for the write outcome (see :meth:`add`).
 
         Returns:
-            A dict ``{"candidate_id", "status", "trace_id"}``.
+            A dict ``{"candidate_id", "status", "trace_id"}``, plus
+            ``"outcome"`` once the task finished (``retracted`` / ``purged``
+            list the affected ids, or ``rejected`` says nothing matched).
         """
         if self.db is None:
             raise RuntimeError("AtomMem is not started; call start() first")
@@ -468,13 +644,16 @@ class AtomMem:
                             "user_id": user_id,
                             "fact_id": fact_id,
                             "session_id": session_id,
+                            "purge": bool(purge),
                         }
                     ),
                     self.config.max_retries,
                     created_at,
                 ),
             )
-        return {"candidate_id": candidate_id, "status": "pending", "trace_id": str(uuid.uuid4())}
+        return await self._write_receipt(
+            candidate_id, str(uuid.uuid4()), wait_ms
+        )
 
     # --- UI-facing edit / backup / restore surface ---------------------------
 
@@ -589,18 +768,23 @@ class AtomMem:
         if row is None:
             raise ValueError(f"no active fact {fact_id} for user {user_id}")
 
-        # Apply ordered updates directly to the row.
+        # Apply ordered updates directly to the row. Every text field is cleaned
+        # exactly as an extracted candidate is: the panel is another write path,
+        # so it must not be able to put an invisible character or an unbounded
+        # value into the store that ingest would have stripped.
         updates: dict = {}
         if subject is not None:
-            updates["subject"] = str(subject).strip()
+            updates["subject"] = clean_field(subject, self.config.max_field_chars)
         if predicate is not None:
-            updates["predicate"] = str(predicate).strip()
+            updates["predicate"] = clean_field(predicate, self.config.max_field_chars)
         if object is not None:
-            updates["object"] = str(object).strip()
+            updates["object"] = clean_field(object, self.config.max_field_chars)
         if content is not None:
-            updates["content"] = content or None
+            updates["content"] = (
+                clean_body(content, self.config.max_content_chars) or None
+            )
         if type is not None:
-            updates["type"] = str(type).strip() or "semantic"
+            updates["type"] = clean_field(type, 64) or "semantic"
 
         if updates:
             assignments = ", ".join(f"{k} = ?" for k in updates)
@@ -713,6 +897,13 @@ class AtomMem:
     def list_profile(self, user_id: str) -> dict:
         """List a user's profile rows for the settings UI.
 
+        The profile is a *projection* over the active facts, and this read
+        refreshes it first: a derived view that is only rebuilt when someone
+        happens to call ``user_md`` goes stale, and a stale profile row is
+        indistinguishable from a fact that was never learned. The refresh is
+        idempotent and respects pins and source priority, so reading cannot
+        downgrade anything.
+
         Args:
             user_id: Owner of the profile.
 
@@ -723,6 +914,7 @@ class AtomMem:
         """
         if self.db is None:
             raise RuntimeError("AtomMem is not started; call start() first")
+        derive_profile_from_facts(self.db, user_id)
         rows = self.db.execute(
             "SELECT section, key, value, source, privacy, pinned FROM user_profile "
             "WHERE user_id = ? ORDER BY section, key",
@@ -774,9 +966,9 @@ class AtomMem:
         """
         if self.db is None:
             raise RuntimeError("AtomMem is not started; call start() first")
-        section = str(section).strip()
-        key = str(key).strip()
-        value = str(value).strip()
+        section = clean_field(section, 200)
+        key = clean_field(key, 200)
+        value = clean_body(value, self.config.max_content_chars)
         if not section or not key:
             raise ValueError("profile section and key are required")
         pinned_flag = None if pinned is None else (1 if pinned else 0)
@@ -956,8 +1148,164 @@ class AtomMem:
             "WHERE user_id = ? AND status = 'pending'",
             (user_id,),
         ).fetchone()
+        archived = self.db.execute(
+            "SELECT COUNT(*) AS n FROM facts "
+            "WHERE user_id = ? AND status = 'archived'",
+            (user_id,),
+        ).fetchone()
 
         return {
             "facts": facts["n"],
             "pending": pending["n"],
+            "archived": archived["n"],
+            "recent": self.recent_outcomes(user_id, limit=5),
         }
+
+    # --- lifecycle surface ----------------------------------------------------
+
+    def unarchive(self, user_id: str, fact_id: str) -> dict:
+        """Return an archived fact to the active set.
+
+        The archive tier exists so capacity can be enforced without deleting
+        anything; this is the way back, and the reason archiving is safe to do
+        automatically.
+
+        Args:
+            user_id: Owner of the fact.
+            fact_id: The archived fact to restore.
+
+        Returns:
+            ``{"ok": True, "fact_id": ..., "restored": n}``.
+
+        Raises:
+            ValueError: When the fact is not an archived fact of ``user_id``.
+        """
+        if self.db is None:
+            raise RuntimeError("AtomMem is not started; call start() first")
+        cursor = self.db.execute(
+            "UPDATE facts SET status = 'active', archived_at = NULL "
+            "WHERE user_id = ? AND fact_id = ? AND status = 'archived'",
+            (user_id, fact_id),
+        )
+        self.db.commit()
+        if cursor.rowcount == 0:
+            raise ValueError(
+                f"no archived fact {fact_id} for user {user_id}"
+            )
+        record_event(
+            self.db, "fact_unarchived", {"fact_id": fact_id}, user_id=user_id
+        )
+        return {"ok": True, "fact_id": fact_id, "restored": cursor.rowcount}
+
+    def purge(self, user_id: str, fact_ids: Optional[list] = None) -> dict:
+        """Physically delete facts and their derived rows.
+
+        The erasure path. Unlike :meth:`forget` — which retracts and keeps the
+        provenance — a purge removes the fact row, its FTS entry, its vector and
+        (through the foreign key) its reinforcement log, so the content is gone
+        from the database rather than merely unused. Pass ``fact_ids=None`` to
+        purge every fact of the user, which is the point of an erasure request.
+
+        Args:
+            user_id: Owner of the facts.
+            fact_ids: Explicit ids to purge, or ``None`` for all of the user's
+                facts (active, superseded, retracted **and** archived).
+
+        Returns:
+            ``{"ok": True, "purged_facts": n, "purged_ids": [...]}``.
+        """
+        if self.db is None:
+            raise RuntimeError("AtomMem is not started; call start() first")
+        if fact_ids is None:
+            rows = self.db.execute(
+                "SELECT fact_id FROM facts WHERE user_id = ?", (user_id,)
+            ).fetchall()
+            ids = [r["fact_id"] for r in rows]
+        else:
+            ids = [
+                r["fact_id"]
+                for r in self.db.execute(
+                    "SELECT fact_id FROM facts WHERE user_id = ? AND fact_id IN "
+                    "(" + ",".join("?" for _ in fact_ids) + ")",
+                    (user_id, *fact_ids),
+                ).fetchall()
+            ] if fact_ids else []
+        removed = self._worker.purge_facts(ids) if self._worker else 0
+        record_event(
+            self.db,
+            "facts_purged",
+            {"count": len(ids), "explicit": fact_ids is not None},
+            user_id=user_id,
+        )
+        return {"ok": True, "purged_facts": removed, "purged_ids": ids}
+
+    def vacuum(self) -> dict:
+        """Rebuild the database file, reclaiming space left by purges.
+
+        SQLite does not return freed pages to the filesystem on its own, so a
+        store that has had content purged keeps its size until this runs.
+
+        Returns:
+            ``{"ok": True, "bytes_before": n, "bytes_after": n}``.
+        """
+        if self.db is None:
+            raise RuntimeError("AtomMem is not started; call start() first")
+        path = self.config.resolved_db_path()
+        before = _file_size(path)
+        self.db.commit()
+        self.db.execute("VACUUM")
+        self.db.commit()
+        return {
+            "ok": True,
+            "bytes_before": before,
+            "bytes_after": _file_size(path),
+        }
+
+    async def maintenance(self, user_id: Optional[str] = None) -> dict:
+        """Run the retention, index-repair and capacity passes now.
+
+        Exposed so a caller (or a health check) can ask for the housekeeping
+        instead of waiting for the idle worker to decide it is due.
+
+        Args:
+            user_id: Restrict the capacity pass to one user.
+
+        Returns:
+            The maintenance summary (see :meth:`worker.Worker.maintenance`).
+        """
+        if self._worker is None:
+            raise RuntimeError("AtomMem is not started; call start() first")
+        return await self._worker.maintenance(user_id)
+
+    def index_health(self) -> dict:
+        """Report whether ``facts`` and its two indexes agree.
+
+        Returns:
+            ``{"ok": bool, "orphans": {...}, "counts": {...}}`` — ``ok`` is
+            ``False`` as soon as any fact is missing an index entry, so a caller
+            can tell "nothing matched" from "the index is broken".
+        """
+        if self.db is None:
+            raise RuntimeError("AtomMem is not started; call start() first")
+        orphans = index_orphans(self.db)
+        counts = {
+            name: self.db.execute(
+                f"SELECT COUNT(*) AS n FROM {table}"
+            ).fetchone()["n"]
+            for name, table in (
+                ("active_facts", "facts WHERE status = 'active'"),
+                ("archived_facts", "facts WHERE status = 'archived'"),
+                ("fts_rows", "facts_fts"),
+                ("vector_rows", "facts_vec"),
+            )
+        }
+        broken = any(orphans[key] for key in ("missing_vector", "missing_fts"))
+        return {"ok": not broken, "orphans": orphans, "counts": counts}
+
+
+def _file_size(path: str) -> int:
+    """Return a file's size in bytes, or 0 when it does not exist."""
+    try:
+        return os.path.getsize(path)
+    except OSError:  # pragma: no cover - the file always exists while open
+        return 0
