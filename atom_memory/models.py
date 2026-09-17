@@ -15,6 +15,14 @@ from typing import List, Optional
 TYPE_SEMANTIC = "semantic"          # stable SPO knowledge: preferences, attributes
 TYPE_PROCEDURAL = "procedural"      # ordered workflows / how-to experience
 TYPE_EPISODIC = "episodic"          # one-off events: "at time T, X happened"
+# An outstanding to-do / next step / backlog item. Its own type rather than a
+# predicate convention because it decides *cardinality*: a to-do list is a
+# collection, so a second item is a new claim, never a correction of the first
+# (see `validator.is_multi_valued`). It renders as its own summary section,
+# because a to-do is meaningless without the subject it belongs to — the
+# attribute fold shows only `predicate: value` and would drop which project the
+# item is for.
+TYPE_TASK = "task"
 # Knowledge categories (carry an optional rich ``content`` body).
 TYPE_SOP = "sop"                    # standard operating procedure (often long)
 TYPE_DECISION_RULE = "decision_rule"  # if-then decision guidance
@@ -39,7 +47,8 @@ NEUTRAL_SCORE = 0.5
 
 # Fallback priority per memory type, used whenever a fact carries no explicit
 # importance signal (``importance == NEUTRAL_SCORE``). The order encodes what
-# stays valuable longest: durable rules and lessons outrank one-off events.
+# stays valuable longest: durable rules and lessons outrank a to-do, which is
+# actionable but short-lived, and one-off events rank last.
 # Kept here, next to the type discriminators, so both the Python write path and
 # the derived views share one authority without importing each other.
 TYPE_IMPORTANCE = {
@@ -48,6 +57,7 @@ TYPE_IMPORTANCE = {
     TYPE_SOP: 0.80,
     TYPE_PROCEDURAL: 0.70,
     TYPE_SEMANTIC: 0.60,
+    TYPE_TASK: 0.55,
     TYPE_EPISODIC: 0.50,
     TYPE_FEW_SHOT: 0.50,
 }
@@ -88,7 +98,8 @@ class FactCandidate:
         raw_text: The original user text the fact was extracted from.
         idempotency_key: Optional stable key used to deduplicate writes.
         type: Memory type (``semantic`` / ``procedural`` / ``episodic`` /
-            ``sop`` / ``decision_rule`` / ``few_shot`` / ``lesson``).
+            ``task`` / ``sop`` / ``decision_rule`` / ``few_shot`` /
+            ``lesson``).
         content: Optional rich body (SOP text, few-shot example, decision-rule
             JSON...). The SPO triple acts as a searchable title; ``content``
             holds the full structured form.

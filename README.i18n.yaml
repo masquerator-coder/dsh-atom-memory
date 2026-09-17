@@ -7,6 +7,8 @@
 #  round and again after the hardening round, which also repaired a three-commit
 #  drift: README.md, README.zh.md and this file had last changed in three different
 #  commits, so the record could not have verified anything. Re-recorded again after
-#  the scope round, which edited both sides together.)
-README.md: 8b17c6f62222cf51ac689de1c5cfd0ed577b73c0
-README.zh.md: 3c090fc2e456154aac5ba7bb5b8ec47c36fc0397
+#  the scope round, which edited both sides together. Re-recorded after the
+#  cardinality round, which added one configuration row and one known limitation
+#  to both sides.)
+README.md: cbe73134f16612773fa504a98744a44e4de86e1e
+README.zh.md: 9704a213baad4803c69a865c6b5365e24dffd435

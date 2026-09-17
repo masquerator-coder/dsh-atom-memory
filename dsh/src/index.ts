@@ -99,8 +99,12 @@ export function retryDelayMs(attempt: number): number {
  * These are `MemConfig` field names verbatim: the RPC `start` handler builds
  * the config from them, so a typo becomes an "invalid start params" error rather
  * than a silently ignored setting.
+ *
+ * Exported for the same reason {@link retryDelayMs} is: the params *are* the
+ * wire contract, and a field that is never sent is a setting that silently does
+ * nothing.
  */
-function buildStartParams(config: ConfigShape): Record<string, unknown> {
+export function buildStartParams(config: ConfigShape): Record<string, unknown> {
   const params: Record<string, unknown> = {
     db_path: config.dbPath ?? '~/.dsh/atom-memory/memory.db',
     worker_poll_interval_sec: 0.5,
@@ -129,6 +133,11 @@ function buildStartParams(config: ConfigShape): Record<string, unknown> {
   }
   if (config.writeAckTimeoutMs !== undefined) {
     params.write_ack_timeout_ms = config.writeAckTimeoutMs
+  }
+  // Sent only when non-empty: an unconfigured deployment's start params stay
+  // byte-identical to what they were before this field existed.
+  if (config.multiValuedPredicates !== undefined && config.multiValuedPredicates.length > 0) {
+    params.multi_valued_predicates = config.multiValuedPredicates
   }
   return params
 }

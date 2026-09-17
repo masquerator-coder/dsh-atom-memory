@@ -345,6 +345,109 @@ def test_batch_keeps_one_claim_per_single_valued_key(tmp_path, monkeypatch):
     _run(scenario())
 
 
+def test_two_todos_do_not_overwrite_each_other(tmp_path, monkeypatch):
+    """The second to-do is a new item, not a corrected first one.
+
+    Regression for the reported defect: 待办 was read as a single-valued
+    attribute, so storing the next to-do superseded the previous one
+    (``newer_assertion``) and the user's earlier item disappeared from every
+    read path. Both items must stay active.
+    """
+    mem = _make(tmp_path, monkeypatch)
+
+    async def scenario():
+        await mem.start()
+        first = FactCandidate(
+            candidate_id="t1", user_id="u1", session_id="s",
+            subject="dsh-memory", predicate="待办", object="手机真机实测",
+            confidence=0.7, importance=0.55, type="task",
+        )
+        second = FactCandidate(
+            candidate_id="t2", user_id="u1", session_id="s",
+            subject="dsh-memory", predicate="待办", object="补齐课程大纲",
+            confidence=0.7, importance=0.55, type="task",
+        )
+        one = await mem._worker._apply_candidates([first], "u1", "s")
+        two = await mem._worker._apply_candidates([second], "u1", "s")
+
+        assert one["written"] and two["written"]
+        assert two["superseded"] == [], "a second to-do must not retire the first"
+        active = mem.db.execute(
+            "SELECT object FROM facts WHERE status = 'active' ORDER BY created_at"
+        ).fetchall()
+        assert [r["object"] for r in active] == ["手机真机实测", "补齐课程大纲"]
+        await mem.stop()
+
+    _run(scenario())
+
+
+def test_a_batch_of_todos_all_land(tmp_path, monkeypatch):
+    """One utterance listing several to-dos writes every item.
+
+    This is the other half of the defect and the more destructive one: inside a
+    single batch the losers were dropped entirely (``batch_duplicate``), so they
+    were never stored *and* never superseded — nothing but a line in the write
+    receipt said they had ever existed.
+    """
+    mem = _make(tmp_path, monkeypatch)
+
+    async def scenario():
+        await mem.start()
+        todos = [
+            FactCandidate(
+                candidate_id=f"t{i}", user_id="u1", session_id="s",
+                subject="用户", predicate="待办", object=item,
+                confidence=0.7, importance=0.55, type="task",
+            )
+            for i, item in enumerate(
+                ["新专业申报专班成立", "软著提交", "党务党课讲稿", "课堂质量专项改进"]
+            )
+        ]
+        outcome = await mem._worker._apply_candidates(todos, "u1", "s")
+        assert len(outcome["written"]) == 4
+        assert outcome["rejected"] == []
+        stored = mem.db.execute(
+            "SELECT COUNT(*) c FROM facts WHERE status = 'active' AND type = 'task'"
+        ).fetchone()["c"]
+        assert stored == 4
+        await mem.stop()
+
+    _run(scenario())
+
+
+def test_a_dropped_batch_member_is_recorded_as_an_event(tmp_path, monkeypatch):
+    """A claim that never reaches the store still leaves a trace.
+
+    Only genuinely single-valued keys can lose a candidate inside a batch now,
+    but that path used to be invisible: the receipt was the only record, and it
+    is not queryable after the turn ends.
+    """
+    mem = _make(tmp_path, monkeypatch)
+
+    async def scenario():
+        await mem.start()
+        weak = FactCandidate(
+            candidate_id="weak", user_id="u1", session_id="s",
+            subject="用户", predicate="常用颜色", object="绿色",
+            confidence=0.4, importance=0.4,
+        )
+        strong = FactCandidate(
+            candidate_id="strong", user_id="u1", session_id="s",
+            subject="用户", predicate="常用颜色", object="蓝色",
+            confidence=0.9, importance=0.9,
+        )
+        await mem._worker._apply_candidates([weak, strong], "u1", "s")
+        dropped = [
+            e for e in _events(mem)
+            if e.get("reason") == "batch_duplicate" and e.get("object") == "绿色"
+        ]
+        assert len(dropped) == 1
+        assert dropped[0]["kept_object"] == "蓝色"
+        await mem.stop()
+
+    _run(scenario())
+
+
 def test_write_ack_timeout_degrades_to_the_enqueue_receipt(tmp_path, monkeypatch):
     """A caller that does not wait still gets an honest receipt."""
     mem = _make(tmp_path, monkeypatch, write_ack_timeout_ms=0)

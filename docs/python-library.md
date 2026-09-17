@@ -150,7 +150,7 @@ importance with recency only as a tie-break. `importance` is only treated as a
 signal when the extractor actually supplied one: the neutral default of `0.5`
 means "unknown" and falls back to the fact's type rank
 (`models.TYPE_IMPORTANCE` — `decision_rule` 0.90, `lesson` 0.85, `sop` 0.80,
-`procedural` 0.70, `semantic` 0.60, `episodic`/`few_shot` 0.50). Without that
+`procedural` 0.70, `semantic` 0.60, `task` 0.55, `episodic`/`few_shot` 0.50). Without that
 fallback every fact ties at 0.5 and the order degenerates to plain recency,
 which is exactly what made the injected view a flat, undifferentiated list.
 Recency is a real second dimension — weight 0.3 against importance's 0.7, with a
@@ -275,6 +275,7 @@ class MemConfig:
     reinforce_cooldown_sec: float = 600.0
     write_ack_timeout_ms: int = 0
     conflict_confidence_margin: float = 0.05
+    multi_valued_predicates: tuple = ()
     rrf_k: int = 60
     w_rrf: float = 0.4
     w_importance: float = 0.2
@@ -392,13 +393,15 @@ and `user_profile` are *derived views* rebuilt from facts.
 ### Memory types in the summary
 
 Every fact carries a `type` discriminator (`semantic` / `procedural` /
-`episodic` / `sop` / `decision_rule` / `few_shot` / `lesson`), and the summary
-view's compact bucket groups the types by how each renders, so none is lost:
+`episodic` / `task` / `sop` / `decision_rule` / `few_shot` / `lesson`), and the
+summary view's compact bucket groups the types by how each renders, so none is
+lost:
 
 | Type | Example extraction source | Summary rendering |
 | --- | --- | --- |
 | `semantic` (preferences) | `我 喜欢 X` | `偏好 X (喜欢)` |
 | `semantic` (attributes) | `我的职业是工程师` | `职业: 工程师` |
+| `task` (to-dos) | `待办：补齐课程大纲` | `- dsh-memory：真机挂载验证` (one line per item, subject kept) |
 | `procedural` (workflows) | `发布流程是1.构建 2.测试 3.部署` | `工作流程-发布流程: 1)构建 2)测试 3)部署` |
 | `episodic` (events) | `今天完成了项目发布` | `[今天] 项目发布` |
 
@@ -433,8 +436,16 @@ Provider behavior notes:
   regardless of evidence.
 - **Episodic** — events are naturally many and independent, so different
   events never conflict; the time word is captured as `qualifiers.when`.
+- **Task** — a to-do list is a *collection*: two to-dos under one key are two
+  items, never a correction, so `type: "task"` (not the predicate's wording) is
+  what keeps the store from retiring the earlier item. The rule engine extracts
+  the explicit `待办：X` / `下一步：X` / `TODO: X` forms and the LLM extractor is
+  instructed to emit one `task` candidate per listed item. A task renders as its
+  own `待办` section with one line per item, keeping the subject the item belongs
+  to (`- dsh-memory：真机挂载验证`) — the attribute fold would show only
+  `predicate: value` and drop which project still owes the work.
 - `user_profile` reflects only `semantic` facts (it answers "who is the
-  user"), so procedural workflows and events do not pollute the profile.
+  user"), so procedural workflows, to-dos and events do not pollute the profile.
 
 ## Tests
 
@@ -456,9 +467,10 @@ worker, write receipts, archive + capacity protection, retention pruning, index
 self-repair, read-through profile projection), budget selection against a
 brute-force reference (`tests/test_summary.py`), the ranking gates
 (`tests/test_retriever.py`), rule extraction
-(semantic / procedural / episodic + the
+(semantic / procedural / episodic / task + the
 `lesson` / `sop` / `decision_rule` knowledge categories), the validation chain
-(episodic non-conflict, procedural single-valued, degenerate
+(episodic non-conflict, to-do and collection-predicate non-conflict, procedural
+single-valued, degenerate
 placeholder/predicate-echo rejection), retrieval, derived views
 (three-type summary bucketing + light-vs-long knowledge inclusion, pinned-profile
 rows surviving the facts → profile projection while the panel's own edit still

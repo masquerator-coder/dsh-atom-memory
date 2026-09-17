@@ -94,7 +94,7 @@ Return ONLY a JSON array. Each element is an object with keys:
 - "subject" (entity, use "用户" for the user), "predicate" (relation),
 - "object" (the value), and optionally "type", "content", "importance",
   "confidence", "conditions", "scope_hint".
-"type" is one of: semantic, procedural, episodic, sop, decision_rule, few_shot, lesson.
+"type" is one of: semantic, procedural, episodic, task, sop, decision_rule, few_shot, lesson.
 For knowledge facts, put the full body in "content" and a short title in "object".
 
 Rank every fact so the memory view can show what matters first:
@@ -106,9 +106,19 @@ How to choose "type" - this matters, do not tag everything "semantic":
 - a distilled takeaway from a mistake or a hard-won finding -> lesson
 - an ordered procedure or how-to that must be followed step by step -> sop
 - a workflow or command sequence reported as how something is done -> procedural
+- something still to be done: an open to-do, a next step, a backlog item -> task
 - a stable attribute or preference of the user -> semantic
 - episodic is ONLY for a dated, one-off thing that happened AND is worth
   recalling in a later session. Use it sparingly.
+
+A to-do list is a COLLECTION, and "task" is what says so: the store treats two
+facts sharing a subject and predicate as competing values *unless* the type says
+they are a list, in which case the second item would silently replace the first.
+So when an utterance lists several outstanding items, emit one candidate per
+item, all with "type": "task", the same subject (the project the item belongs to
+- use "用户" when it belongs to no project) and a short list predicate
+("待办", "任务", "下一步"). Never merge several items into one "object" and never
+type them "semantic".
 
 Two optional fields say *when* and *where* a fact applies. Both are optional -
 omit them rather than guessing.

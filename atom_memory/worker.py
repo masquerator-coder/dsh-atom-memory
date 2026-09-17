@@ -655,6 +655,7 @@ class Worker:
                 max_field_chars=self.config.max_field_chars,
                 max_content_chars=self.config.max_content_chars,
                 scope_ids=visible_ids,
+                multi_valued_predicates=self.config.multi_valued_predicates,
             )
             if not result.ok:
                 if result.kind == "idempotent" and result.suppressed:
@@ -765,7 +766,9 @@ class Worker:
         best: dict = {}
         for index, candidate in enumerate(candidates):
             if is_multi_valued(
-                candidate.predicate or "", getattr(candidate, "type", "semantic")
+                candidate.predicate or "",
+                getattr(candidate, "type", "semantic"),
+                self.config.multi_valued_predicates,
             ):
                 best[("multi", index)] = candidate
                 continue
@@ -774,6 +777,7 @@ class Worker:
             current = best.get(key)
             if current is None or weight > _evidence(current):
                 if current is not None:
+                    self._reject_dropped_batch_member(current, candidate)
                     self._reject(
                         outcome,
                         current,
@@ -785,6 +789,7 @@ class Worker:
                     )
                 best[key] = candidate
             else:
+                self._reject_dropped_batch_member(current, candidate)
                 self._reject(
                     outcome,
                     candidate,
@@ -795,6 +800,40 @@ class Worker:
                     ),
                 )
         return list(best.values())
+
+    def _reject_dropped_batch_member(
+        self, candidate: FactCandidate, kept: FactCandidate
+    ) -> None:
+        """Audit-log a candidate dropped by :meth:`_dedupe_batch`.
+
+        A batch drop never reaches the store, so without this the only trace is
+        the write receipt and the outcome JSON on the task row — a memory that
+        was *never written* leaves no queryable record, which is exactly how a
+        dropped to-do can go missing without anyone being able to say what it
+        was. The event is written best-effort, like every other audit event.
+
+        Args:
+            candidate: The dropped candidate.
+            kept: The candidate that won the key and was kept.
+        """
+        record_event(
+            self.conn,
+            "fact_rejected",
+            {
+                "candidate_id": candidate.candidate_id,
+                "subject": candidate.subject,
+                "predicate": candidate.predicate,
+                "object": candidate.object,
+                "kept_candidate_id": kept.candidate_id,
+                "kept_object": kept.object,
+                "reason": REASON_BATCH_DUPLICATE,
+                "detail": (
+                    f"{candidate.predicate!r} was read as single-valued; the "
+                    f"batch kept the stronger claim {kept.object!r}"
+                ),
+            },
+            user_id=candidate.user_id,
+        )
 
     async def _resolve_and_write(
         self,

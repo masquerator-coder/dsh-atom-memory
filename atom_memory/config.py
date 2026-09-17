@@ -92,6 +92,8 @@ class MemConfig:
             evidence must be before it is allowed to *outvote* a newly asserted
             value under a single-valued predicate, rather than being superseded
             by it. ``0.0`` means the newer assertion always wins ties.
+        multi_valued_predicates: Extra predicates to treat as multi-valued,
+            on top of the built-in set (see the field's own comment).
         write_ack_timeout_ms: How long :meth:`AtomMem.add` waits for its own
             candidate to reach a terminal state before returning the enqueue
             receipt. ``0`` (the default) never waits — the library stays purely
@@ -161,6 +163,17 @@ class MemConfig:
 
     # -- conflict resolution --------------------------------------------------
     conflict_confidence_margin: float = 0.05
+    # Predicates to treat as *multi-valued* on top of the built-in set
+    # (`validator.MULTI_VALUED_PREDICATES` and its suffix rule): a different
+    # object under one of these is an independent claim, not a contradiction.
+    #
+    # This exists because predicates are open vocabulary — the extractor writes
+    # them, and a claim that is one-to-many however it is worded ("拥有项目",
+    # "课程大纲编写事项") cannot be enumerated in advance. Without an entry a
+    # second value silently retires the first (`newer_assertion`) or, inside one
+    # batch, is dropped (`batch_duplicate`); declaring the predicate here is the
+    # deployment's fix, with no code change.
+    multi_valued_predicates: tuple = ()
 
     # -- scope awareness (see docs/scopes.md) ---------------------------------
     # Scope is a storage *dimension*, not a semantic property: a fact belongs to

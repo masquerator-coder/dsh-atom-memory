@@ -139,6 +139,17 @@ export interface Config {
    */
   dedupMaxDistance?: number
   /**
+   * Predicates to treat as *multi-valued*, on top of the store's built-in set.
+   *
+   * Under a single-valued key a second, different value retires the first (or,
+   * inside one batch, is dropped) — which is right for "my job title" and wrong
+   * for a claim that is one-to-many however it is worded ("在研课题",
+   * "课程大纲编写事项"). The predicates are written by the extractor, so the
+   * set cannot be closed in advance; this is where a deployment adds the ones
+   * its own memory keeps colliding on. Empty (the default) changes nothing.
+   */
+  multiValuedPredicates?: string[]
+  /**
    * Whether scope-aware memory is on: collect this session's context signals
    * (git root and origin remote, declared package name, working directory) and
    * send them as the `scope_context` payload of every scope-aware RPC call.
@@ -202,6 +213,7 @@ export const Config: z<Config> = z.object({
   maxProfileRows: z.number().default(50),
   maxFactTokens: z.number().default(600),
   dedupMaxDistance: z.number().default(0.10),
+  multiValuedPredicates: z.array(z.string()).default([]),
   scopeEnabled: z.boolean().default(true),
   // Empty means "no tag": an empty signal value is dropped by the payload
   // builder rather than sent, which is what keeps an unconfigured deployment's

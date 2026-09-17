@@ -2,6 +2,70 @@
 
 ## [Unreleased]
 
+### Fixed (第十九轮：待办被当成单值属性，写入即覆盖 / 同批即丢弃)
+
+**问题**：写入侧决定"一个键能不能有多条事实"的唯一权威是
+`validator.is_multi_valued()`，而它是一份**封闭白名单**（偏好/兴趣/爱好/喜欢/不喜欢/
+习惯/擅长）+ 类型逃生口（episodic、四类知识）。谓词却是 dsh 侧 LLM 抽取器**自由生成
+的开放词表**，于是任何一对多关系的谓词都落进"单值"分支，写第二条就把第一条 `supersede`
+掉；同一句话里抽出的多条还会在写库前被 `_dedupe_batch` 去重成一条，其余以
+`batch_duplicate` 直接丢弃。
+
+实测（活库 `~/.dsh/atom-memory/memory.db`，只读查询）：
+
+- `用户 | 待办` 被覆盖 1 条：`低空物流 8 门新课大纲全部待编写` → `教材《AI辅助数据分析与优化》库内章节索引待补`（`newer_assertion`，事件 `fact_superseded` 在案）；
+- **24 条待办候选被丢弃**（4 个批次的 `'待办' is single-valued and already claimed in this batch`）：新专业申报专班成立、软著提交、党务党课讲稿、dsh-memory 真机挂载验证、dgx-monitor GitHub 建仓…
+- **另有 10 条非待办候选同样被丢弃**：`日常工作线`×4、`拥有项目`×4、`教学课程`×1、`硬件配置`×1 —— 说明这是一类问题，不是"待办"个例；
+- 另有 1 条待办因"已存待办证据更强"被拒（0.970 vs 0.900）；
+- 用户侧的规避痕迹也在库里：每条待办换一个 subject（`超星图谱` / `dsh-memory` / `题库导入`…）。
+
+**Python 侧**：
+
+- **拆分两个被混用的集合**：`PREFERENCE_PREDICATES`（渲染与画像投影用：偏好进「偏好」
+  分组、投影成「喜欢 X」）与 `MULTI_VALUED_PREDICATES`（冲突判定用）从此是两个集合，
+  后者是前者的超集。此前把 `待办` 加进唯一那个集合，会让待办渲染成「偏好」并被当成
+  「喜欢 X」投进画像——这正是它当初不能被简单加词的原因。
+- **基数由类型声明（治本）**：新增 `TYPE_TASK = "task"`。`is_multi_valued()` 对 `task`
+  无条件返回多值，与 episodic/知识类型同一处；`TYPE_IMPORTANCE[task] = 0.55`；摘要有
+  独立「待办」分组，且**每个条目一行、保留 subject**（属性折叠只渲染 `predicate: value`，
+  会丢掉"是哪个项目还欠着这件事"，而那是条目的全部内容）。`profile` 只吃 `semantic`，
+  待办不会污染画像。
+- **内置集合补齐实测到的一对多谓词**：`待办/紧急待办/待办事项/任务/下一步` +
+  `拥有项目/教学课程/日常工作线`；再加一条**形状规则**（以 `事项/任务/清单/待办/列表/
+  条目/todo` 结尾的谓词按集合处理），覆盖没人枚举过的名字。
+- **可配置扩展**：新增 `MemConfig.multi_valued_predicates`（默认空），合并进
+  `is_multi_valued()` 的判定；`validate()` / `_check_conflict()` / `worker._dedupe_batch()`
+  / `api._load_conflicts()` 四处调用点同步接线，写入与读路径的上报不会各说各话。
+- **窄口必须守住**：`职业` / `家乡` / `常用颜色` / `计划` 等仍是单值——判定放宽等于
+  让 store 再也答不出"用户现在的取值是哪条"，那正是单值规则存在的理由。`计划` 刻意
+  没进后缀表。
+- **可见性**：批内丢弃此前只写进任务行的 `result_fact_ids` JSON，没有独立事件，等于
+  "从未存在过"；现在每次丢弃写一条 `fact_rejected` 事件（含被丢弃对象与获胜对象），
+  与覆盖路径已有的 `fact_superseded` 对齐。
+- 无 schema 变更，**不需要迁移**：判定完全在代码层，存量待办按谓词即可命中。
+
+**dsh 侧**：抽取器提示词把"待办"提升为一等类型——`type` 枚举加入 `task`，并明确
+"清单是集合：一条 utterance 列了多件事就发多个候选，每个都 `type: "task"`、同一
+subject（所属项目）与短清单谓词（待办/任务/下一步），**绝不合并成一个 object**、绝不标
+`semantic`"。新增部署期字段 `multiValuedPredicates`（默认 `[]`，为空时**不发送**
+`multi_valued_predicates`，参数与引入前逐字节一致），并导出 `buildStartParams` 使
+"参数是否真的发出去"成为可测的线上契约。
+
+**测试**：`test_validator.py` +6（待办非矛盾、task 类型无条件多值、部署扩展、形状规则、
+单值窄口、两集合关系），`test_lifecycle.py` +3（两条待办共存不覆盖、同批四条全部落库、
+丢弃留事件），`test_extractor.py` +4（`待办：X` 规则与变体、必须带冒号、默认重要度），
+`test_summary.py` +2（待办保留 subject、不渲染成偏好），`dsh/tests/config.test.ts` +3
+（默认空、不发参数、声明即转发）。全量：pytest 471 → 486，vitest 245 → 248。
+
+**构建产物**：`dsh/lib` 是随仓库提交的（安装路径直接读它，没有构建步骤），所以本轮
+重建了 `lib/index.mjs` 与 `lib/index.d.mts`。重建同时暴露了一个**既有的构建漂移**：
+HEAD 上的 `lib/index.mjs` 里没有 `memory_domains` 工具、没有 `renderPlacement`、也没有
+domain_hints 那段提示词——这些源码早已提交（`dsh/src`），lib 却停在更早的版本。重建把
+lib 与 src 对齐（`client.js` 逐字节未变，说明 client 侧本来就没有漂移）。
+
+**未做**：不恢复历史丢失的条目（用户明确选择"暂不恢复"）；已丢弃的候选正文只存在于
+`fact_candidates.result_fact_ids.rejected[]`，被覆盖的那 1 条仍在库里（`status='superseded'`）。
+
 ### Added (第十八轮：作用域感知记忆 —— 显式的作用域维度 + dsh 侧上下文采集)
 
 **问题**：记忆此前是"每个用户一个全局池"，事实从哪里来（哪个项目、哪个客户、哪个阶段）

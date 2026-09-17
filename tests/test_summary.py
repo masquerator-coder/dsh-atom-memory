@@ -123,6 +123,48 @@ def test_compact_groups_every_present_type():
         conn.close()
 
 
+def test_a_todo_list_keeps_its_subject_and_its_items():
+    """To-dos render one line per item, each naming what it belongs to.
+
+    The attribute fold would render ``待办: A、B`` — right for a single-valued
+    attribute (whose subject is always the user) and useless for a to-do list,
+    where "which project still owes this" is the item's whole content.
+    """
+    conn = connect_for_tests()
+    try:
+        _insert_fact(conn, "t1", "待办", "真机挂载验证", memory_type="task",
+                     subject="dsh-memory", created_at=3000)
+        _insert_fact(conn, "t2", "待办", "写接口实弹验证", memory_type="task",
+                     subject="超星图谱", created_at=2000)
+        md = _md(conn)
+        lines = md.splitlines()
+
+        assert _COMPACT_LABEL_MARKER + "待办" in lines
+        assert "- dsh-memory：真机挂载验证" in lines
+        assert "- 超星图谱：写接口实弹验证" in lines
+    finally:
+        conn.close()
+
+
+def test_a_todo_is_not_rendered_as_a_preference():
+    """Cardinality and preference are different questions.
+
+    A to-do is multi-valued *and* not a preference; routing it through the
+    preference set would label the user's outstanding work as a taste.
+    """
+    conn = connect_for_tests()
+    try:
+        _insert_fact(conn, "t1", "待办", "真机挂载验证", memory_type="task",
+                     subject="dsh-memory")
+        md = _md(conn)
+        lines = md.splitlines()
+
+        assert _COMPACT_LABEL_MARKER + "偏好" not in lines
+        assert "（不喜欢）" not in md
+    finally:
+        conn.close()
+
+
 # ---- detail depth ------------------------------------------------------------
 
 

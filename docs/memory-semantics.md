@@ -67,8 +67,8 @@ by evidence, not by arrival order alone:
 | Multiple stored claims under one key (legacy or imported data) | Compared against the **strongest** one; a supersede retires all of them |
 
 Evidence weight is `0.7 × confidence + 0.3 × importance`. Multi-valued
-predicates, episodic events and knowledge are unaffected: they are independent
-claims, not competing ones.
+predicates, to-dos, episodic events and knowledge are unaffected: they are
+independent claims, not competing ones.
 
 **Why.** The previous behaviour refused every contradiction and kept the older
 row. That is wrong twice over: the user's newest statement — "I moved to Beijing
@@ -82,9 +82,10 @@ invisible.
 
 Within a single extraction batch, two candidates for the same single-valued key
 are collapsed first: the higher-evidence one is kept, the other is reported as
-rejected with reason `batch_duplicate`. Inside one utterance the store cannot know
-which statement supersedes which, and a visible refusal is recoverable while a
-silent overwrite is not.
+rejected with reason `batch_duplicate` (and recorded as a `fact_rejected` event,
+so a candidate that was never written is still auditable). Inside one utterance
+the store cannot know which statement supersedes which, and a visible refusal is
+recoverable while a silent overwrite is not.
 
 **Owner.** `atom_memory/conflict.py` (the pure policy), `atom_memory/validator.py`
 (`_check_conflict` collects the competing rows), `atom_memory/worker.py`
@@ -97,7 +98,66 @@ silent overwrite is not.
 `test_negation_flip_is_a_correction_not_a_dead_end`),
 `tests/test_rpc.py::test_lifecycle_and_write_receipts_over_the_wire`.
 
-### 2a. The caller learns what was decided
+### 2a. Which keys are single-valued at all
+
+**Rule.** The whole policy above applies *only* under a single-valued key. A key
+is multi-valued — so a different object is an independent claim, never a
+correction — when any of these holds, in this order
+(`validator.is_multi_valued`):
+
+| Test | Examples | Why it is the authority |
+|---|---|---|
+| The **type** says so: `task`, `episodic`, or any knowledge type | a to-do, an event, a SOP | The type is the extractor's *decision about the claim*. It survives whatever predicate the extractor happens to word. |
+| The **predicate** is in the built-in collection set | `偏好`/`兴趣`/`喜欢`…, `待办`/`紧急待办`/`任务`/`下一步`, `拥有项目`/`教学课程`/`日常工作线` | The measured fallback for a claim that arrived typed `semantic`. |
+| The **predicate ends with a collection head noun** | `课程大纲编写事项`, `实验室采购清单` | Predicates are open vocabulary; a shape rule covers names nobody enumerated. |
+| The deployment **declared** the predicate (`MemConfig.multi_valued_predicates`) | `在研课题` | The operational escape hatch: a new collision is a config line, not a release. |
+
+Everything else is a single-valued attribute with exactly one active object.
+
+**Why.** The rule used to be one closed list of preference predicates, and
+"everything not listed is single-valued". That is a correct default *for a
+controlled vocabulary* and a data-losing one for this store, whose predicates are
+written by an LLM: `待办`, `任务`, `拥有项目`, `教学课程`, `日常工作线` all mean
+"many of these", none was listed, and the consequence was measured on a live
+store — 24 to-do candidates dropped inside their batch
+(`'待办' is single-valued and already claimed in this batch`), 10 more under
+`拥有项目` / `教学课程` / `日常工作线`, and one to-do overwritten
+(`newer_assertion`: 低空物流 8 门新课大纲 → 教材章节索引). Nothing was visible
+to the user, because a dropped candidate never became a row.
+
+The asymmetry is what settles the direction: reading a collection as
+single-valued **destroys** a memory (silently), while reading a single-valued
+attribute as a collection only leaves two rows a human can merge. So the type
+marker (primary), the measured predicate lists, the shape rule and the config
+knob all push the same way, and the deliberate counterweight is the narrow end —
+`职业`, `家乡`, `常用颜色` and friends must still be single-valued, or the store
+can no longer answer with the user's *current* value, which is the one thing the
+single-valued rule exists for (`test_genuine_single_valued_attributes_stay_single_valued`).
+
+A to-do is also *not* a preference, and the two questions are answered by two
+different sets: `PREFERENCE_PREDICATES` (routing in the summary view and the
+profile projection) is a strict subset of `MULTI_VALUED_PREDICATES` (cardinality).
+Sharing one set would render "待办: 手机真机实测" as a taste — and file the user's
+outstanding work under `偏好` in the profile.
+
+**Owner.** `atom_memory/validator.py` — `PREFERENCE_PREDICATES`,
+`MULTI_VALUED_PREDICATES`, `MULTI_VALUED_PREDICATE_SUFFIXES`, `is_multi_valued`;
+`atom_memory/models.py` — `TYPE_TASK`; consumed by `worker._dedupe_batch`,
+`validator._check_conflict`, `api._load_conflicts` and `summary._section_of`.
+
+**Tests.** `tests/test_validator.py`
+(`test_a_second_todo_is_not_a_contradiction`,
+`test_task_type_is_multi_valued_whatever_the_predicate_says`,
+`test_a_deployment_can_declare_a_predicate_multi_valued`,
+`test_a_collection_head_noun_is_multi_valued`,
+`test_genuine_single_valued_attributes_stay_single_valued`,
+`test_preference_set_is_narrower_than_the_multi_valued_set`),
+`tests/test_lifecycle.py` (`test_two_todos_do_not_overwrite_each_other`,
+`test_a_batch_of_todos_all_land`), `tests/test_summary.py`
+(`test_a_todo_list_keeps_its_subject_and_its_items`,
+`test_a_todo_is_not_rendered_as_a_preference`).
+
+### 2b. The caller learns what was decided
 
 **Rule.** `memory_add`, `memory_replace` and `memory_forget` accept `wait_ms` and
 return the store's verdict once the candidate reaches a terminal state (or the

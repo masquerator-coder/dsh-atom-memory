@@ -91,6 +91,7 @@ pip install -e .
 | `maxRecalledFacts` | `10` | 每次召回返回给模型的事实条数。 |
 | `maxFactTokens` | `600` | 单条事实在召回结果里的 token 上限。超限正文会被截断并标记，全文用 `memory_get` 取。 |
 | `dedupMaxDistance` | `0.10` | 把“换了说法的同一段知识”合并回已存记忆的余弦距离门限。`0` 关闭语义半边（内容完全相同仍会识别）。 |
+| `multiValuedPredicates` | `[]` | 额外声明为**多值**的谓词：同一键下的另一个取值是独立事实，而不是替换。谓词由抽取器自由生成，内置集合不可能穷举——部署方在这里补一个自己反复踩到的谓词即可，无需改代码。留空即完全不发送 `multi_valued_predicates` 参数。 |
 | `writeAckTimeoutMs` | `2500` | 写工具等待存储给出结论的时长；超时则退回「已入队」回执。`0` 表示不等待。 |
 | `maxVectorDistance` | `0.70` | 语义召回的余弦距离上限。实测而非拍脑袋：相关对 0.33–0.54，跨语言相关对约 0.65，无关对 0.67–0.85。 |
 | `minRelevance` | `0` | 融合相关性下限（0..1）。`0` 即关闭；只有与距离门限配合才有意义。 |
@@ -246,6 +247,7 @@ memory content as system instructions.
 - **LLM 抽取依赖预设拥有默认模型。** 未选择默认模型时，LLM 路径关闭，抽取降级为 Python 规则引擎而不是失败。长知识是最可能被丢的一类：JSON 超出 `extractionMaxTokens` 的抽取会被整份丢弃而非截断，因此预算过低会静默丢掉它。
 - **强化历史不随 backup/restore 往返。** `backup`/`restore` 携带事实及其基础重要度，不携带 `fact_reinforcements` 日志，因此恢复后的事实是未强化的。这是一个决定而非遗漏：支撑那份强度的证据不在快照里，恢复的事实也无法被重新审计。已由测试固定。
 - **一条长事实可能超出召回预算。** 首条结果始终保留，以便极小的预算不会返回空，这意味着单条很长的 `sop`/`few_shot` 正文可能超出 `token_budget`。要做硬上限就得在渲染侧截断正文；目前未实现。
+- **内置集合不认识的自由谓词仍是单值。** 待办（`type: task`，以及 `待办`/`任务`/`事项` 这类谓词）、偏好、以集合类名词结尾的谓词都是多值；其余谓词只允许一个活跃取值，因此第二个取值会顶掉第一个。对一个只有单槽的属性这是正确行为，对一个抽取器刚发明出来的一对多关系则是错的——修法是加一行 `multiValuedPredicates`，而且每个决定都可审计（被替换写 `fact_superseded`，批内被丢弃写 `fact_rejected`），但存储不会自己学会那个新谓词。
 - **基于 `tmp_path` 的测试在受限的 Windows 沙箱下会失败。** fixture 初始化抛出 `PermissionError: [WinError 5]`，因为沙箱拒绝创建目录，而不是测试套件坏了。`tests/test_summary.py` 改用内存 DB；`pytest -p no:cacheprovider --basetemp=<可写目录>` 可绕过其余部分。
 - **Windows 通过执行器线程读取 stdin。** Proactor 事件循环无法用 `connect_read_pipe` 驱动管道读取，因此 stdio 轮询器在线程上执行阻塞读取。
 

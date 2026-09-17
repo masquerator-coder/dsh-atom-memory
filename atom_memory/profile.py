@@ -28,7 +28,7 @@ from typing import Iterable, Optional
 
 from .db import now_ms
 from .retriever import estimate_tokens
-from .validator import MULTI_VALUED_PREDICATES
+from .validator import PREFERENCE_PREDICATES
 
 # Provenance stored in `user_profile.source`. Distinct from the credibility
 # source tags on facts: this one answers "where did the row come from", which
@@ -231,7 +231,7 @@ def suggestible_profile_entries(conn: sqlite3.Connection, user_id: str) -> list:
 
     This is the original projection rule, reused as a suggestion source rather
     than as a writer: single-valued attributes imply ``(predicate, 'value')``
-    and multi-valued preferences imply ``('偏好', object)``. Nothing is written
+    and preferences imply ``('偏好', object)``. Nothing is written
     to the table — the result is candidate material for the LLM synthesis, which
     the user then approves entry by entry.
 
@@ -251,7 +251,11 @@ def suggestible_profile_entries(conn: sqlite3.Connection, user_id: str) -> list:
         if (f["type"] or "semantic") != "semantic":
             continue
         predicate = f["predicate"]
-        if predicate in MULTI_VALUED_PREDICATES:
+        # Preferences only. A to-do list is multi-valued as well, but projecting
+        # it as "likes X" would file the user's outstanding work under their
+        # tastes — and a task fact never reaches here anyway (the type test
+        # above skips everything that is not `semantic`).
+        if predicate in PREFERENCE_PREDICATES:
             section = "偏好"
             key = _clean(f["object"], _MAX_KEY_CHARS)
             value = "不喜欢" if _negation(f["qualifiers"]) else "喜欢"

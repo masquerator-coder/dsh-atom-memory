@@ -47,6 +47,7 @@ pnpm build       # -> lib/index.mjs
 | `contextInjectionEnabled` | `true` | 会话起始冻结快照注入系统提示词 |
 | `maxProfileRows` | `50` | 用户画像表的条目上限（0 = 不限）。画像会写进系统提示词，每条都在每个请求上付费，这是那笔开销的硬上限；超限时**拒绝新增**并回报当前数量与上限（改动已有条目仍允许），不会静默淘汰最旧的一条 |
 | `rpcTimeoutMs` | `30000` | 单次 RPC 超时 |
+| `multiValuedPredicates` | `[]` | 额外声明为**多值**的谓词（部署期）：同一键下的不同取值是各自独立的事实，而不是互相覆盖。谓词由抽取器自由生成，内置集合不可能穷举（`待办` / `任务` / `拥有项目` / `教学课程` 这类一对多关系曾被当成单值：旧条目被 `newer_assertion` 覆盖、同一批里的其余条目以 `batch_duplicate` 直接丢弃）；这里加一行即可止血，无需改代码。留空则**不发送该参数**，与引入它之前逐字节一致 |
 | `scopeEnabled` | `true` | 作用域感知开关（部署期）：采集会话上下文（工作目录 / git 根与 origin / 包名）并作为 `scope_context` 随每次读写与提示词冻结发出；关闭后所有 RPC 参数与引入该维度之前**逐字节一致**（连 `scope_context` 键都不发） |
 | `scopeOrg` / `scopeClient` / `scopeProject` / `scopeSeries` / `scopePhase` | `''` | 显式标签（部署期）：以 `explicit_*` 信号随每次调用发出，可靠性 0.95，高于任何从路径推断出的证据；留空即不发送。刻意**不进**设置命名空间——这不是运行时开关，而是「这个部署服务谁」 |
 
@@ -260,6 +261,11 @@ instructions.`）：工具指引只写在 awareness 段，两段是相邻注入�
 - **单条超预算**：召回预算的首条保留策略意味着**单条**长知识仍可能超过
   `token_budget`（上例中预算 100 却返回了 ~2100 tokens 的一条）。需要硬上限时
   可在 `render` 侧截断正文，目前未做。
+- **单值键的判定仍会漏**：`待办` / `任务` / `事项` 一类已内置，类型为 `task`
+  的候选无条件多值，但一个 store 没见过的自由谓词仍按单值处理——同一键下的新
+  取值会覆盖旧取值。这类漏判现在**可配置修正**（`multiValuedPredicates`）并且
+  一定会留下审计（覆盖写 `fact_superseded`、批内丢弃写 `fact_rejected`），但不会
+  自动学会：遇到新的一对多谓词，需要加一条配置或把它标成 `task`。
 - **Windows**：stdio 轮询通过 `run_in_executor` 线程读取 stdin（Proactor 事件循环
   无法用 `connect_read_pipe` 驱动管道读）。
 

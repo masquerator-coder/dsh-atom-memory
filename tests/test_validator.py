@@ -4,8 +4,14 @@ empty -> degenerate -> confidence -> idempotency -> conflict -> privacy)."""
 from __future__ import annotations
 
 from atom_memory.db import connect_for_tests
-from atom_memory.models import FactCandidate
-from atom_memory.validator import _predicate_core, validate
+from atom_memory.models import TYPE_TASK, FactCandidate
+from atom_memory.validator import (
+    MULTI_VALUED_PREDICATES,
+    PREFERENCE_PREDICATES,
+    _predicate_core,
+    is_multi_valued,
+    validate,
+)
 
 
 def make(**overrides) -> FactCandidate:
@@ -191,6 +197,106 @@ def test_independent_preferences_do_not_conflict():
         assert r.ok
     finally:
         conn.close()
+
+
+def test_a_second_todo_is_not_a_contradiction():
+    """A to-do list is a collection: the next item is a new claim.
+
+    Regression for the defect this rule was written for — a store that read
+    待办 as a single-valued attribute retired the earlier item on the next
+    write, and dropped every sibling item of the same batch.
+    """
+    conn = connect_for_tests()
+    try:
+        conn.execute(
+            "INSERT INTO facts(fact_id, user_id, session_id, subject, predicate, "
+            "object, status, observed_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'active', 1, 1)",
+            ("f1", "u1", "s1", "dsh-memory", "待办", "真机挂载验证",),
+        )
+        conn.commit()
+        r = validate(
+            make(candidate_id="c2", subject="dsh-memory", predicate="待办",
+                 object="补齐课程大纲"),
+            conn=conn,
+        )
+        assert r.ok, r.reason
+    finally:
+        conn.close()
+
+
+def test_task_type_is_multi_valued_whatever_the_predicate_says():
+    """The type marker carries cardinality, not the predicate's wording.
+
+    The extractor invents the predicate ("课程大纲编写事项", "低空物流推进"),
+    so a claim whose type says "to-do" must never be judged single-valued.
+    """
+    conn = connect_for_tests()
+    try:
+        conn.execute(
+            "INSERT INTO facts(fact_id, user_id, session_id, subject, predicate, "
+            "object, type, status, observed_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'task', 'active', 1, 1)",
+            ("f1", "u1", "s1", "用户", "低空物流推进", "新专业申报专班成立",),
+        )
+        conn.commit()
+        r = validate(
+            make(candidate_id="c2", predicate="低空物流推进",
+                 object="实验室建设采购论证", type=TYPE_TASK),
+            conn=conn,
+        )
+        assert r.ok, r.reason
+    finally:
+        conn.close()
+
+
+def test_a_deployment_can_declare_a_predicate_multi_valued():
+    """A predicate the built-in sets do not know is single-valued until a
+    deployment says otherwise — and then it holds many values."""
+    conn = connect_for_tests()
+    try:
+        conn.execute(
+            "INSERT INTO facts(fact_id, user_id, session_id, subject, predicate, "
+            "object, status, observed_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'active', 1, 1)",
+            ("f1", "u1", "s1", "付强", "在研课题", "冷链外包决策",),
+        )
+        conn.commit()
+        candidate = make(candidate_id="c2", subject="付强", predicate="在研课题",
+                         object="低空物流调度")
+        assert not validate(candidate, conn=conn).ok, "not declared yet -> conflict"
+        r = validate(candidate, conn=conn, multi_valued_predicates=("在研课题",))
+        assert r.ok, r.reason
+    finally:
+        conn.close()
+
+
+def test_a_collection_head_noun_is_multi_valued():
+    """Predicates ending in 事项/清单/任务 hold several objects by shape."""
+    for predicate in ("课程大纲编写事项", "实验室采购清单", "培训任务"):
+        assert is_multi_valued(predicate, "semantic"), predicate
+
+
+def test_genuine_single_valued_attributes_stay_single_valued():
+    """The narrow end of the rule: a claim with one slot still has one slot.
+
+    Swept broadly on purpose — a heuristic that quietly made everything
+    multi-valued would pass every to-do test above and destroy the store's
+    ability to answer with the user's *current* value.
+    """
+    for predicate in ("职业", "家乡", "常用颜色", "出生日期", "工号", "计划"):
+        assert not is_multi_valued(predicate, "semantic"), predicate
+
+
+def test_preference_set_is_narrower_than_the_multi_valued_set():
+    """Rendering and conflict judgement must not share one list.
+
+    A to-do is multi-valued but not a preference; if the two questions were
+    answered by the same set, every to-do would render as "X（喜欢）".
+    """
+    assert PREFERENCE_PREDICATES <= MULTI_VALUED_PREDICATES
+    assert "待办" in MULTI_VALUED_PREDICATES
+    assert "待办" not in PREFERENCE_PREDICATES
 
 
 def test_negation_contradiction_detected():

@@ -133,6 +133,17 @@ interface Config {
    */
   dedupMaxDistance?: number;
   /**
+   * Predicates to treat as *multi-valued*, on top of the store's built-in set.
+   *
+   * Under a single-valued key a second, different value retires the first (or,
+   * inside one batch, is dropped) — which is right for "my job title" and wrong
+   * for a claim that is one-to-many however it is worded ("在研课题",
+   * "课程大纲编写事项"). The predicates are written by the extractor, so the
+   * set cannot be closed in advance; this is where a deployment adds the ones
+   * its own memory keeps colliding on. Empty (the default) changes nothing.
+   */
+  multiValuedPredicates?: string[];
+  /**
    * Whether scope-aware memory is on: collect this session's context signals
    * (git root and origin remote, declared package name, working directory) and
    * send them as the `scope_context` payload of every scope-aware RPC call.
@@ -204,6 +215,21 @@ interface ExtractedCandidate {
    * bind a scope on its own.
    */
   scope_hint?: string;
+  /**
+   * What the fact is *about*, as canonical names (``["teaching/ds", "programming"]``).
+   *
+   * Unlike ``scope_hint`` this is acted on: the store resolves each name against
+   * the user's topic vocabulary, and a name the vocabulary does not hold becomes
+   * its nearest registered ancestor plus a queue entry for the user to decide on.
+   * The vocabulary lives in the Python store, so the prompt asks for these only
+   * as plain words; the store owns what they resolve to.
+   */
+  domain_hints?: string[];
+  /**
+   * Which of ``domain_hints`` is the main topic. Moved to the front before the
+   * cap is applied, so the model may list it anywhere.
+   */
+  primary_domain?: string;
 }
 /** The extraction callable signature the capture/tool layer uses. */
 type ExtractFn = (text: string) => Promise<ExtractedCandidate[]>;
@@ -246,6 +272,18 @@ declare const inject: readonly ["tools", "systemPrompt"];
  * @returns Milliseconds to wait, capped at {@link MAX_RETRY_MS}.
  */
 declare function retryDelayMs(attempt: number): number;
+/**
+ * Start params sent to the Python bridge.
+ *
+ * These are `MemConfig` field names verbatim: the RPC `start` handler builds
+ * the config from them, so a typo becomes an "invalid start params" error rather
+ * than a silently ignored setting.
+ *
+ * Exported for the same reason {@link retryDelayMs} is: the params *are* the
+ * wire contract, and a field that is never sent is a setting that silently does
+ * nothing.
+ */
+declare function buildStartParams(config: Config): Record<string, unknown>;
 /** Everything the ingestion point needs, so it can be exercised without a child. */
 interface CaptureWiring {
   /** Master/durability gate: false makes the capture a no-op. */
@@ -282,4 +320,4 @@ interface CaptureWiring {
 declare function createCapture(deps: CaptureWiring): (text: string, sessionId: string, cwd?: string) => Promise<void>;
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { CaptureWiring, Config, apply, createCapture, inject, name, retryDelayMs };
+export { CaptureWiring, Config, apply, buildStartParams, createCapture, inject, name, retryDelayMs };

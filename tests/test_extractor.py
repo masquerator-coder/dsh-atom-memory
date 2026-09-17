@@ -70,6 +70,35 @@ def test_attribute():
     assert (c.subject, c.predicate, c.object) == ("用户", "职业", "工程师")
 
 
+# ---- to-do pattern: 待办：X / 下一步：X / TODO: X ----
+
+def test_todo_marker():
+    c = _first("待办：补齐课程大纲")
+    assert (c.subject, c.predicate, c.object) == ("用户", "待办", "补齐课程大纲")
+    assert c.type == "task"
+    assert json.loads(c.qualifiers).get("todo") is True
+
+
+def test_todo_marker_variants():
+    for text in ("待办事项: 手机真机实测", "下一步：写接口实弹验证",
+                 "TODO: 克隆课小样本验证", "任务：党务党课讲稿"):
+        c = _first(text)
+        assert c.type == "task", text
+        assert c.predicate == "待办", text
+
+
+def test_todo_marker_requires_its_colon():
+    """"待办" as a bare label is not a claim; only the marker+value form is."""
+    assert extract_rules("待办", "u1", "s1") == []
+
+
+def test_a_todo_defaults_to_the_task_importance():
+    from atom_memory.models import default_importance
+
+    c = _first("待办：补齐课程大纲")
+    assert c.importance == default_importance("task")
+
+
 def test_attribute_first_person():
     c = _first("我的家乡是成都")
     assert (c.subject, c.predicate, c.object) == ("用户", "家乡", "成都")

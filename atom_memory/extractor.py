@@ -22,6 +22,7 @@ from .models import (
     TYPE_PROCEDURAL,
     TYPE_SEMANTIC,
     TYPE_SOP,
+    TYPE_TASK,
     default_importance,
 )
 
@@ -46,6 +47,16 @@ _NEGATIVE_RE = re.compile(r"^(?:我|用户)(不喜欢|讨厌|厌恶)(.+)$")
 # 8.1 pattern (3): possession / attribute.
 #   (我|用户)的X是Y                ->  (用户, X, Y)
 _ATTRIBUTE_RE = re.compile(r"^(?:我|用户)的(.+?)是(.+)$", re.UNICODE)
+
+# To-do item: an explicit list marker followed by what still has to be done.
+#   待办：X  /  待办事项: X  /  下一步：X  /  TODO: X   ->  (用户, 待办, X, type=task)
+# Typed ``task`` rather than ``semantic`` because the type, not the predicate,
+# is what tells the store a to-do list is a collection: two to-dos are two
+# items, and a store that reads them as one key retires the earlier one.
+# The colon is required — "待办" alone is a label, not a claim.
+_TODO_RE = re.compile(
+    r"^(?:我|用户)?(?:的)?(待办事项|待办|下一步|任务|TODO|todo|Todo)\s*[:：]\s*(.+)$"
+)
 
 # Procedural: a named workflow / experience with ordered steps.
 #   (X)(的)(步骤|流程|做法|经验|套路)是(步骤列表)  ->  (用户, 工作流程名, 步骤, type=procedural)
@@ -139,6 +150,24 @@ def extract_rules(
                 obj=m.group(2).strip(),
                 importance=0.6,
                 raw_text=raw,
+            )
+        ]
+
+    # To-do: "待办：X" / "下一步：X" / "TODO: X". Checked before every rule that
+    # reads 是/步骤, and before the attribute rule, which would otherwise only
+    # match when the item happens to contain 是.
+    m = _TODO_RE.match(stripped)
+    if m:
+        return [
+            _candidate(
+                user_id, session_id, turn_id,
+                subject=SUBJECT_USER,
+                predicate="待办",
+                obj=m.group(2).strip(),
+                qualifiers={"todo": True},
+                importance=default_importance(TYPE_TASK),
+                raw_text=raw,
+                type=TYPE_TASK,
             )
         ]
 

@@ -15,7 +15,7 @@ import sqlite3
 from typing import List, Optional, Sequence, Tuple
 
 from .context import GLOBAL_SCOPE_ID
-from .models import ALL_KNOWLEDGE, FactCandidate, ValidationResult
+from .models import ALL_KNOWLEDGE, TYPE_TASK, FactCandidate, ValidationResult
 from .sanitize import (
     DEFAULT_MAX_CONTENT_CHARS,
     DEFAULT_MAX_FIELD_CHARS,
@@ -32,13 +32,47 @@ _MAX_CONFIDENCE = 1.0
 # unless it matches the configured privacy filter.
 _DEFAULT_PRIVACY = "private"
 
-# Predicates that naturally hold several values at once (likes, interests,
-# habits...). A different object under these predicates is an independent
-# claim, not a contradiction. Everything not listed is treated as a
-# single-valued attribute whose object may only have one active value.
-MULTI_VALUED_PREDICATES = {
+# Predicates that name a *preference* (a like, a dislike, a habit). This is the
+# narrower of the two sets below, and it is the one the derived views route on:
+# a preference renders as its own section and is projected into the user profile
+# as "likes X". Multi-valuedness is a different question (see
+# :data:`MULTI_VALUED_PREDICATES`) — a to-do list holds many items and is not a
+# preference, so anything that needs "is this a preference" must ask here.
+PREFERENCE_PREDICATES = {
     "偏好", "兴趣", "爱好", "喜欢", "不喜欢", "习惯", "擅长",
 }
+
+# Predicates that naturally hold several values at once. A different object
+# under these predicates is an independent claim, not a contradiction.
+# Everything not covered here — and not covered by the type/suffix tests in
+# :func:`is_multi_valued` — is treated as a single-valued attribute whose object
+# may only have one active value.
+#
+# The to-do family is here because a to-do list is a *collection*: the second
+# to-do a user states is a new item, never a correction of the first, and
+# judging it single-valued retires the earlier item (`newer_assertion`) or drops
+# it inside the batch (`batch_duplicate`). The three " owns / teaches / works on
+# many of these" relations below are the same failure measured on a live store:
+# the predicate is one-to-many however the extractor happens to word it, and the
+# predicates are *open vocabulary* (an LLM writes them), so this list is a
+# fallback rather than the authority — the type marker (``TYPE_TASK``), the
+# suffix rule and ``MemConfig.multi_valued_predicates`` carry the general case.
+MULTI_VALUED_PREDICATES = PREFERENCE_PREDICATES | {
+    "待办", "紧急待办", "待办事项", "任务", "下一步",
+    "拥有项目", "教学课程", "日常工作线",
+}
+
+# Predicate *endings* that head a collection rather than naming one value
+# ("课程大纲编写事项", "实验室采购清单"). Checked case-insensitively, after the
+# exact sets above. Deliberately short, and deliberately not a general "looks
+# plural" heuristic: a false positive only keeps two rows that a human can
+# merge, while a false negative silently retires a memory — but an over-eager
+# rule here would stop the store from ever answering with the *newest* value of
+# a genuine single-valued attribute (a colour, a job title), which is the one
+# behaviour the single-valued rule exists for.
+MULTI_VALUED_PREDICATE_SUFFIXES = (
+    "事项", "任务", "清单", "待办", "列表", "条目", "todo",
+)
 
 # ---- degenerate-fact filtering -------------------------------------------------
 #
@@ -85,6 +119,7 @@ def validate(
     max_field_chars: int = DEFAULT_MAX_FIELD_CHARS,
     max_content_chars: int = DEFAULT_MAX_CONTENT_CHARS,
     scope_ids: Optional[Sequence[int]] = None,
+    multi_valued_predicates: Optional[Sequence[str]] = None,
 ) -> ValidationResult:
     """Run the full validation chain on a candidate.
 
@@ -109,6 +144,8 @@ def validate(
             given, the conflict check only considers stored facts visible from
             those scopes, so a project's statement is not judged contradictory
             against another project's — the design's "跨作用域只建链接或标参考".
+        multi_valued_predicates: Deployment-declared multi-valued predicates
+            (``MemConfig.multi_valued_predicates``), on top of the built-in set.
 
     Returns:
         A :class:`ValidationResult` describing the outcome.
@@ -119,7 +156,9 @@ def validate(
     truncated = normalize_candidate_meta(
         candidate, max_field_chars=max_field_chars, max_content_chars=max_content_chars
     )
-    result = _validate_checks(candidate, conn, privacy_filter, scope_ids)
+    result = _validate_checks(
+        candidate, conn, privacy_filter, scope_ids, multi_valued_predicates
+    )
     result.truncated_fields = truncated
     return result
 
@@ -129,6 +168,7 @@ def _validate_checks(
     conn: Optional[sqlite3.Connection],
     privacy_filter: str,
     scope_ids: Optional[Sequence[int]] = None,
+    multi_valued_predicates: Optional[Sequence[str]] = None,
 ) -> ValidationResult:
     """Run the check chain on a candidate that has already been normalised.
 
@@ -137,6 +177,8 @@ def _validate_checks(
         conn: Optional connection for the idempotency/conflict lookups.
         privacy_filter: Configured privacy tag.
         scope_ids: Scopes the write targets (see :func:`validate`).
+        multi_valued_predicates: Extra multi-valued predicates (see
+            :func:`validate`).
 
     Returns:
         The first failing result, or a passing one.
@@ -162,7 +204,7 @@ def _validate_checks(
         return idem
 
     # 5. Conflict
-    conflict = _check_conflict(candidate, conn, scope_ids)
+    conflict = _check_conflict(candidate, conn, scope_ids, multi_valued_predicates)
     if not conflict.ok:
         return conflict
 
@@ -400,24 +442,56 @@ def _check_idempotency(
     return ValidationResult.pass_(candidate.candidate_id)
 
 
-def is_multi_valued(predicate: str, memory_type: str) -> bool:
+def is_multi_valued(
+    predicate: str,
+    memory_type: str,
+    extra_predicates: Optional[Sequence[str]] = None,
+) -> bool:
     """Whether an SPO (predicate, type) may legitimately hold many objects.
 
-    A predicate is multi-valued when it is a preference/collection predicate
-    (``MULTI_VALUED_PREDICATES``), an episodic event, or a knowledge item
-    (``ALL_KNOWLEDGE``) — under any of these a *different* object is an
-    independent claim, not a contradiction. Everything else is a single-valued
-    attribute whose object may only have one active value.
+    A predicate is multi-valued when
 
-    This is the single authority for the rule, shared by the write-path conflict
-    check (:func:`_check_conflict`) and the read-path conflict report
-    (:func:`atom_memory.api.AtomMem.recall`), so both stay in agreement.
+    * its **type** says so — a to-do (``TYPE_TASK``), an episodic event, or a
+      knowledge item (``ALL_KNOWLEDGE``). The type is the primary marker because
+      it is a decision the extractor makes about the *claim*, while the
+      predicate is free text it invents;
+    * its **predicate** is a known collection predicate
+      (``MULTI_VALUED_PREDICATES``, or a deployment's
+      ``MemConfig.multi_valued_predicates``);
+    * or its predicate **ends with a collection head noun**
+      (``MULTI_VALUED_PREDICATE_SUFFIXES``).
+
+    Under any of these a *different* object is an independent claim, not a
+    contradiction. Everything else is a single-valued attribute whose object may
+    only have one active value.
+
+    This is the single authority for the rule, shared by the write-path batch
+    dedup (:meth:`atom_memory.worker.Worker._dedupe_batch`), the write-path
+    conflict check (:func:`_check_conflict`) and the read-path conflict report
+    (:func:`atom_memory.api.AtomMem.recall`), so all of them stay in agreement.
+
+    Args:
+        predicate: The stored/extracted predicate.
+        memory_type: The memory type discriminator of the same claim.
+        extra_predicates: Additional predicates a deployment declared
+            multi-valued (``MemConfig.multi_valued_predicates``).
+
+    Returns:
+        ``True`` when the key may hold several active values at once.
     """
-    if predicate in MULTI_VALUED_PREDICATES:
+    if memory_type == TYPE_TASK:
         return True
     if memory_type == "episodic" or predicate == "事件":
         return True
     if memory_type in ALL_KNOWLEDGE:
+        return True
+    if predicate in MULTI_VALUED_PREDICATES:
+        return True
+    if extra_predicates and predicate in extra_predicates:
+        return True
+    if predicate and str(predicate).strip().lower().endswith(
+        MULTI_VALUED_PREDICATE_SUFFIXES
+    ):
         return True
     return False
 
@@ -514,6 +588,7 @@ def _check_conflict(
     candidate: FactCandidate,
     conn: Optional[sqlite3.Connection],
     scope_ids: Optional[Sequence[int]] = None,
+    multi_valued_predicates: Optional[Sequence[str]] = None,
 ) -> ValidationResult:
     """Detect a contradiction against an existing active fact.
 
@@ -526,11 +601,11 @@ def _check_conflict(
       (``idempotent``), a flipped negation is a direct contradiction
       (``conflict`` against *that* row).
     - **Pass 2 — a different object under the same key.** Multi-valued
-      predicates, knowledge items and episodic events hold many objects, so this
-      is an independent claim, not a conflict. Under a single-valued predicate
-      it is a contradiction against *every* active value under the key, and all
-      of those rows are handed back in ``conflict_rows`` (newest first) so the
-      write path can resolve the whole key rather than one arbitrary row.
+      predicates, knowledge items, to-dos and episodic events hold many objects,
+      so this is an independent claim, not a conflict. Under a single-valued
+      predicate it is a contradiction against *every* active value under the key,
+      and all of those rows are handed back in ``conflict_rows`` (newest first)
+      so the write path can resolve the whole key rather than one arbitrary row.
 
     Inactive (e.g. ``superseded`` / ``retracted`` / ``archived``) facts are
     ignored throughout.
@@ -549,7 +624,9 @@ def _check_conflict(
     cand_type = getattr(candidate, "type", "semantic") or "semantic"
     # Knowledge items stay independent under a shared predicate: a second SOP or
     # lesson is a new item, not a contradiction of the first.
-    multi_valued = is_multi_valued(candidate.predicate, cand_type)
+    multi_valued = is_multi_valued(
+        candidate.predicate, cand_type, multi_valued_predicates
+    )
 
     scope_sql, scope_args = _scope_clause(scope_ids, alias="f")
     rows = conn.execute(

@@ -561,7 +561,11 @@ class AtomMem:
         groups: dict = {}
         for r in rows:
             memory_type = r["type"] or "semantic"
-            if is_multi_valued(str(r["predicate"]), memory_type):
+            if is_multi_valued(
+                str(r["predicate"]),
+                memory_type,
+                self.config.multi_valued_predicates,
+            ):
                 continue
             bound = scope_map.get(r["fact_id"], ())
             scope_key = tuple(bound) if bound else (GLOBAL_SCOPE_ID,)

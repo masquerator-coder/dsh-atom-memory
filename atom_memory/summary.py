@@ -52,7 +52,7 @@ from .models import (
 from .retriever import CHARS_PER_TOKEN, estimate_tokens, token_cost
 from .reinforce import adjust, effective_importance
 from .scope import ScopeStore, resolution_for
-from .validator import MULTI_VALUED_PREDICATES
+from .validator import PREFERENCE_PREDICATES
 
 # Maximum characters of a rendered *content line* in the compact digest.
 #
@@ -125,6 +125,7 @@ _SECTION_TITLES = {
     "sop": "流程（SOP）",
     "procedural": "流程",
     "preference": "偏好",
+    "task": "待办",
     "attribute": "属性",
     "few_shot": "示例",
     "episodic": "事件",
@@ -136,6 +137,7 @@ _SECTION_ORDER = [
     "sop",
     "procedural",
     "preference",
+    "task",
     "attribute",
     "few_shot",
     "episodic",
@@ -742,7 +744,10 @@ def _section_of(fact: dict) -> str:
     memory_type = fact["type"]
     if memory_type == TYPE_SEMANTIC:
         predicate = fact["predicate"]
-        if predicate in MULTI_VALUED_PREDICATES:
+        # The *preference* set, not the multi-valued one: a to-do list is
+        # multi-valued too, and rendering it as a preference would both mislabel
+        # it and fold it into "X（喜欢）".
+        if predicate in PREFERENCE_PREDICATES:
             return "preference"
         if predicate == PRED_EVENT:
             return "episodic"
@@ -855,9 +860,27 @@ def _render_section_lines(section: str, facts: List[dict]) -> List[Tuple[str, fl
         lines = [(f"- {text}", score) for text, score in _fold_preferences(facts)]
     elif section == "attribute":
         lines = [(f"- {text}", score) for text, score in _attribute_lines(facts)]
+    elif section == "task":
+        lines = [(_render_task_line(fact), fact["score"]) for fact in facts]
     else:
         lines = [(_render_fact_line(section, fact), fact["score"]) for fact in facts]
     return [(_clip(text, _MAX_COMPACT_LINE_CHARS), score) for text, score in lines]
+
+
+def _render_task_line(fact: dict) -> str:
+    """Render one to-do, keeping the subject it belongs to.
+
+    The attribute fold uses ``predicate: value``, which is right for a
+    single-valued attribute (the subject is the user, always) and wrong for a
+    to-do list: "待办: 手机真机实测" does not say *which project* still owes the
+    test, and that is the whole content of the item. One line per item also
+    keeps two open to-dos from being folded into one unreadable line.
+    """
+    subject = " ".join(str(fact.get("subject") or "").split())
+    title = _fact_title(fact)
+    if not subject:
+        return f"- {title}"
+    return f"- {subject}：{title}"
 
 
 def _fold_preferences(facts: List[dict]) -> List[Tuple[str, float]]:
