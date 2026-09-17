@@ -190,6 +190,17 @@ class MemConfig:
     # content anchor cannot — creating one from weak evidence is how a store
     # fills up with near-duplicate scopes that each hold half the facts.
     scope_new_threshold: float = 0.8
+    # Evidence a new *document* (or email thread) needs, which is deliberately
+    # higher than the general threshold. This is a recall fix, not a hygiene one:
+    # recall's candidate set is "own scope + ancestors + phases + root", so a fact
+    # bound to a document is invisible from every *sibling* document — while a
+    # fact bound to a project is visible from all of them. A weak signal that
+    # creates a document (folder_path 0.50, doc_title 0.50) therefore silently
+    # buries the fact it was attached to: teaching a chapter in one file and
+    # asking about it in the next file finds nothing. Only a durable document id
+    # (doc_id / folder_id 0.90, email_thread 0.90) may create one; a share_link
+    # (0.75), a title or a path may still *bind to* an existing document.
+    scope_new_threshold_document: float = 0.85
     # A sub-threshold candidate is queued instead of created, and promoted once
     # it has been seen this many times with consistent evidence.
     scope_promote_after: int = 3
@@ -200,6 +211,44 @@ class MemConfig:
     # project (the design's "默认召回所有阶段的 active 事实"). Off restricts
     # recall to the current phase, which is rarely what a user wants.
     scope_all_phases: bool = True
+
+    # -- topic dimension (see docs/Domain 维度落地方案) -------------------------
+    # A second, orthogonal axis: scope says *in which context* a fact holds,
+    # domain says *about what*. Multi-label and registered rather than
+    # free-form, because a tag vocabulary that grows on every write stops being
+    # a vocabulary.
+    #
+    # `off` is the default and means "label everything, filter nothing": phase
+    # one of the rollout writes fact_domain and leaves every read path exactly as
+    # it is, so the labels can be inspected (and corrected) before they are
+    # allowed to influence what is returned. `should` ranks topic matches,
+    # `must` filters on them.
+    domain_recall: str = "off"
+    # Confidence a query's inferred topic needs before `must` may be used on it.
+    # Hard-filtering a query whose topic was guessed is how a cross-topic
+    # question ("write me a Python script for this lesson") loses the answer.
+    domain_must_threshold: float = 0.8
+    # Ranking weights for the topic terms, *added* to the base four (and to the
+    # scope terms) rather than re-normalising them, so a stored weight set keeps
+    # meaning the same thing in every mode.
+    domain_should_weight: float = 0.15
+    domain_primary_weight: float = 1.0
+    domain_secondary_weight: float = 0.7
+    # At most this many labels on one fact, and this many proposals honoured per
+    # write. Both exist to stop one generic sentence accumulating every topic.
+    domain_max_per_fact: int = 5
+    domain_max_per_hint: int = 3
+    # Tagging mode: `off` labels nothing, `auto` labels silently (the labelled
+    # source is reported in the write receipt), `confirm_new` additionally
+    # surfaces unregistered proposals in the receipt.
+    domain_tagging_mode: str = "auto"
+    # `((scope_path_prefix, domain_name), ...)`: the statement that "everything
+    # under this project is teaching". This is the rule that keeps `general`
+    # from becoming the default bucket.
+    scope_domain_map: tuple = ()
+    # `((keyword, domain_name), ...)`: the fallback when the session says nothing
+    # and the extractor proposed nothing.
+    domain_keywords: tuple = ()
 
     # -- write acknowledgement ------------------------------------------------
     write_ack_timeout_ms: int = 0

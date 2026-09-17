@@ -52,6 +52,7 @@ from .conflict import (
 from .config import MemConfig
 from .context import GLOBAL_SCOPE_ID, MAX_CONDITIONS, normalize_conditions
 from .db import index_orphans, now_ms, record_event
+from .domain import DomainAssignment, DomainStore
 from .fingerprint import BODY_IDENTIFIED_TYPES, content_fingerprint
 from .models import (
     FactCandidate,
@@ -147,6 +148,13 @@ def _candidate_from_rpc_dict(
         # The host may send `{"language": "typescript"}` as readily as the
         # list form the extraction prompt asks for; both mean the same thing.
         conditions = [{"key": k, "value": v} for k, v in conditions.items()]
+    hints = d.get("domain_hints")
+    if isinstance(hints, str):
+        hints = [hints]
+    elif isinstance(hints, (list, tuple)):
+        hints = [str(h) for h in hints if str(h or "").strip()]
+    else:
+        hints = None
     return FactCandidate(
         candidate_id=str(uuid.uuid4()),
         user_id=d.get("user_id") or user_id,
@@ -165,6 +173,8 @@ def _candidate_from_rpc_dict(
         content=d.get("content"),
         conditions=conditions if isinstance(conditions, list) else None,
         scope_hint=d.get("scope_hint"),
+        domain_hints=hints or None,
+        primary_domain=d.get("primary_domain") or None,
     )
 
 
@@ -634,8 +644,10 @@ class Worker:
         )
         visible_ids = self._write_scope_ids(resolution)
         outcome["scope"] = resolution.to_dict(store)
+        domains = self._resolve_write_domains(user_id, winners, resolution)
+        outcome["domains"] = [assignment.to_dict() for assignment in domains]
 
-        for candidate in winners:
+        for candidate, assignment in zip(winners, domains):
             result = validate(
                 candidate,
                 self.conn,
@@ -651,6 +663,7 @@ class Worker:
                     changed = self._reinforce(
                         result.suppressed, user_id, session_id, KIND_USER_RESTATED
                     )
+                    self._attach_domains(result.suppressed, assignment)
                     outcome["reinforced"].append(
                         {
                             "fact_id": result.suppressed,
@@ -667,7 +680,8 @@ class Worker:
                     continue
                 if result.kind == "conflict" and result.conflict_rows:
                     await self._resolve_and_write(
-                        candidate, result, outcome, forced, resolution, visible_ids
+                        candidate, result, outcome, forced, resolution, visible_ids,
+                        assignment,
                     )
                     continue
                 self._reject(
@@ -684,6 +698,7 @@ class Worker:
                 scope_ids=visible_ids,
                 bind_scope_id=resolution.scope_id,
                 conditions=self._conditions_for(candidate, resolution),
+                domains=assignment,
             )
             if not persisted.written:
                 # The claim (or the body) is already stored: this is a repeat, and
@@ -789,6 +804,7 @@ class Worker:
         forced: set,
         scope_resolution: ScopeResolution,
         visible_ids: List[int],
+        domains: Optional[DomainAssignment] = None,
     ) -> None:
         """Apply the conflict policy to one contradicting candidate.
 
@@ -799,6 +815,7 @@ class Worker:
             forced: Fact ids the caller explicitly asked to replace.
             scope_resolution: The scope the batch is being written into.
             visible_ids: The scopes visible from it (dedup/conflict window).
+            domains: The topics the batch resolved for this candidate.
         """
         rows = list(result.conflict_rows or [])
         resolution = resolve_conflict(
@@ -846,11 +863,13 @@ class Worker:
             scope_ids=visible_ids,
             bind_scope_id=scope_resolution.scope_id,
             conditions=self._conditions_for(candidate, scope_resolution),
+            domains=domains,
         )
         if not persisted.written:
             # The new value turned out to be the one already stored (a reworded
             # repeat of an active claim). Retiring anything now would remove the
             # very value that matched, so the reinforcement is the whole effect.
+            self._attach_domains(persisted.existing_fact_id, domains)
             outcome["reinforced"].append(
                 {
                     "fact_id": persisted.existing_fact_id,
@@ -1030,6 +1049,7 @@ class Worker:
         scope_ids: Optional[List[int]] = None,
         bind_scope_id: Optional[int] = None,
         conditions: Tuple[Tuple[str, str], ...] = (),
+        domains: Optional[DomainAssignment] = None,
     ) -> PersistResult:
         """Persist a validated candidate, or fold it into a memory already held.
 
@@ -1057,11 +1077,12 @@ class Worker:
         the evidence :meth:`~atom_memory.scope.ScopeStore.abstraction_candidates`
         promotes into a global rule, and folding it away destroys exactly that.
 
-        The fact row, its FTS entry, its vector, its scope binding and its
-        conditions go in **one transaction**, and the embedding is computed before
-        it opens. They are one logical fact: an interruption between them used to
-        leave a row that full-text search could find and semantic search could
-        not, which no caller could distinguish from "the fact is fine".
+        The fact row, its FTS entry, its vector, its scope binding, its topic
+        labels and its conditions go in **one transaction**, and the embedding is
+        computed before it opens. They are one logical fact: an interruption
+        between them used to leave a row that full-text search could find and
+        semantic search could not, which no caller could distinguish from "the
+        fact is fine".
 
         Args:
             candidate: The validated candidate.
@@ -1071,6 +1092,9 @@ class Worker:
             bind_scope_id: The scope the new fact is filed under. ``None`` leaves
                 the fact unbound, which every read path reads as global.
             conditions: Normalised conditions to store with the fact.
+            domains: The topics the batch decided this fact is about. ``None``
+                (or an empty assignment) stores no labels, which is what
+                ``domain_tagging_mode = "off"`` does.
 
         Returns:
             What happened: the new fact id, or the fact this candidate was
@@ -1101,7 +1125,12 @@ class Worker:
             [candidate.user_id, fingerprint, *scope_args],
         ).fetchone()
         if existing is not None:
-            return self._fold_into(str(existing["fact_id"]), candidate, "fingerprint")
+            fact_id = str(existing["fact_id"])
+            # A restatement is also a second observation of the topic, so the
+            # labels merge (by max confidence — see DomainStore.attach) rather
+            # than being discarded with the duplicate row.
+            self._attach_domains(fact_id, domains)
+            return self._fold_into(fact_id, candidate, "fingerprint")
 
         fact_id = str(uuid.uuid4())
         text = f"{candidate.subject} {candidate.predicate} {candidate.object}"
@@ -1115,6 +1144,7 @@ class Worker:
 
         near = self._near_duplicate(candidate, blob, scope_ids)
         if near is not None:
+            self._attach_domains(near, domains)
             return self._fold_into(near, candidate, "embedding")
 
         with self.conn:
@@ -1174,6 +1204,28 @@ class Worker:
                     "INSERT INTO fact_condition(fact_id, key, value) VALUES (?, ?, ?)",
                     (fact_id, key, value),
                 )
+            # Topic labels share the transaction for the same reason the scope
+            # binding does: a fact whose topic was decided but not stored would be
+            # read as unlabelled (the compatibility rule) and silently escape
+            # every topic filter once one exists.
+            if domains is not None and domains.labels:
+                for label in domains.labels:
+                    self.conn.execute(
+                        "INSERT INTO fact_domain(fact_id, domain_id, confidence, "
+                        "is_primary, source, created_at) VALUES (?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT(fact_id, domain_id) DO UPDATE SET "
+                        "confidence = MAX(confidence, excluded.confidence), "
+                        "is_primary = MAX(is_primary, excluded.is_primary), "
+                        "source = excluded.source",
+                        (
+                            fact_id,
+                            int(label.domain_id),
+                            float(label.confidence),
+                            1 if label.is_primary else 0,
+                            str(label.source),
+                            created_at,
+                        ),
+                    )
         return PersistResult(fact_id)
 
     def _fingerprint(self, candidate: FactCandidate) -> str:
@@ -1312,6 +1364,117 @@ class Worker:
         renamed or merged in another process.
         """
         return ScopeStore(self.conn, self.config)
+
+    # -- topic plumbing ------------------------------------------------------
+
+    def domain_store(self) -> DomainStore:
+        """Return the topic store bound to this worker's connection.
+
+        Rebuilt per call for the same reason :meth:`scope_store` is: the store
+        caches names, and a worker outliving a rename would keep labelling facts
+        with a name that no longer exists.
+        """
+        return DomainStore(self.conn, self.config)
+
+    def _resolve_write_domains(
+        self,
+        user_id: str,
+        candidates: List[FactCandidate],
+        resolution: ScopeResolution,
+    ) -> List[DomainAssignment]:
+        """Decide the topics of a batch, one assignment per candidate.
+
+        The session's topic set is derived **once per batch** (like the scope
+        resolution, and for the same reason: one utterance comes from one place),
+        then each candidate is labelled against it. Tagging mode ``off`` returns
+        empty assignments for everyone, which is what keeps phase one of the
+        rollout free of any behaviour change.
+
+        Args:
+            user_id: Owner of the words the labels come from.
+            candidates: The batch, in order.
+            resolution: The scope the batch is being written into.
+
+        Returns:
+            An assignment per candidate, positionally aligned.
+        """
+        mode = str(getattr(self.config, "domain_tagging_mode", "auto") or "auto")
+        if mode == "off" or not candidates:
+            return [DomainAssignment() for _ in candidates]
+        store = self.domain_store()
+        scope_store = self.scope_store()
+        scope_id = int(resolution.scope_id)
+        path = scope_store.path_of(scope_id)
+        session = store.session_domains(user_id, scope_ids=[scope_id], scope_paths=[path])
+        out: List[DomainAssignment] = []
+        for candidate in candidates:
+            hints = self._ordered_hints(candidate)
+            out.append(
+                store.assign(
+                    user_id,
+                    hints=hints,
+                    text=" ".join(
+                        part
+                        for part in (
+                            candidate.subject or "",
+                            candidate.predicate or "",
+                            candidate.object or "",
+                            candidate.content or "",
+                        )
+                        if part
+                    ),
+                    session=session,
+                    scope_id=scope_id,
+                )
+            )
+        return out
+
+    def _ordered_hints(self, candidate: FactCandidate) -> List[str]:
+        """Return a candidate's topic proposals, primary first.
+
+        The order matters twice over: the first entry becomes the fact's primary
+        label, and the cap drops from the tail. So the extractor's own
+        ``primary_domain`` is moved to the front **before** anything is capped —
+        the version of this that capped first threw away a primary the model had
+        deliberately placed last, which is the one ordering the cap must not be
+        allowed to break.
+
+        Args:
+            candidate: The candidate being labelled.
+
+        Returns:
+            At most ``domain_max_per_hint`` proposals, primary first.
+        """
+        raw = [str(hint) for hint in (candidate.domain_hints or ()) if str(hint or "").strip()]
+        primary = str(candidate.primary_domain or "").strip()
+        ordered: List[str] = []
+        if primary:
+            ordered.append(primary)
+        for hint in raw:
+            if hint != primary:
+                ordered.append(hint)
+        cap = max(1, int(getattr(self.config, "domain_max_per_hint", 3) or 3))
+        return ordered[:cap]
+
+    def _attach_domains(
+        self, fact_id: str, assignment: Optional[DomainAssignment]
+    ) -> List:
+        """Merge a batch's topic labels onto a fact that already exists.
+
+        Args:
+            fact_id: The fact being folded into.
+            assignment: The labels the batch resolved to, or ``None``.
+
+        Returns:
+            The labels stored on the fact afterwards.
+        """
+        if not fact_id or assignment is None or not assignment.labels:
+            return []
+        try:
+            return self.domain_store().attach(fact_id, assignment)
+        except sqlite3.Error:  # pragma: no cover - defensive
+            logger.exception("Failed to attach domain labels to %s", fact_id)
+            return []
 
     def _resolve_write_scope(
         self,

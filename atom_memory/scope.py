@@ -58,8 +58,10 @@ from .config import MemConfig
 from .context import (
     GLOBAL_SCOPE_ID,
     SCOPE_DEPTH,
+    SCOPE_DOCUMENT,
     SCOPE_GLOBAL,
     SCOPE_PHASE,
+    SCOPE_THREAD,
     SCOPE_TYPES,
     ChainLevel,
     ScopeContext,
@@ -843,10 +845,46 @@ class ScopeStore:
                 [now, *ids],
             )
 
+    def _creation_threshold(self, scope_type: str) -> float:
+        """Return the evidence a *new* scope of this type must clear.
+
+        Two thresholds, because "what counts as evidence" is not the same
+        question for every scope type. A ``document`` is the case that matters:
+        recall's candidate set is the scope's own path plus its ancestors, its
+        phases and the root (see :func:`expanded_scope_ids` and
+        :meth:`ScopeView.visible_ids`), so a fact bound to a document is
+        *invisible from every sibling document* while the same fact bound to a
+        project is visible from all of them. A weak signal that creates a
+        document therefore buries the fact instead of filing it — the classic
+        shape being a per-chapter file whose ``folder_path`` (0.50) is the only
+        evidence present, which makes chapter 3's notes unreachable while
+        working on chapter 4.
+
+        Raising the bar for ``document`` / ``thread`` keeps those facts filed at
+        the level that is actually reachable (the project) and lets the weak
+        signal bind to a document that stronger evidence already created. The
+        other levels keep the single general threshold: a project created from a
+        bare ``path`` (0.50) is still a project, and it is reachable from every
+        phase and document beneath it.
+
+        Args:
+            scope_type: The type a new scope would have.
+
+        Returns:
+            The minimum ``level.confidence`` that may create it.
+        """
+        if scope_type in (SCOPE_DOCUMENT, SCOPE_THREAD):
+            return float(
+                self.config.scope_new_threshold_document
+                if self.config.scope_new_threshold_document is not None
+                else self.config.scope_new_threshold
+            )
+        return float(self.config.scope_new_threshold)
+
     def _create_chain(
         self, chain: Sequence[ChainLevel], ctx: ScopeContext
     ) -> Optional[Tuple[int, float, ChainLevel]]:
-        """Create the deepest level whose evidence clears the creation threshold.
+        """Create the deepest level whose evidence clears its creation threshold.
 
         Args:
             chain: The context's chain, most general first.
@@ -855,17 +893,20 @@ class ScopeStore:
 
         Returns:
             ``(scope_id, confidence, level)`` for the deepest level created, or
-            ``None`` when no level reaches ``scope_new_threshold``.
+            ``None`` when no level reaches its creation threshold (see
+            :meth:`_creation_threshold`).
         """
         del ctx  # the chain already carries everything the walk needs
-        threshold = float(self.config.scope_new_threshold)
         parent_id: Optional[int] = GLOBAL_SCOPE_ID
         created: Optional[Tuple[int, float, ChainLevel]] = None
         for level in chain:
-            if level.confidence < threshold:
-                # A level below the threshold stops the walk rather than being
+            if level.confidence < self._creation_threshold(level.scope_type):
+                # A level below its threshold stops the walk rather than being
                 # skipped: creating a *phase* without its project would file the
                 # phase under the root, where every project's recall finds it.
+                # The same applies to a document under a parent that was never
+                # created — filing it under the root would make one chapter's
+                # notes visible to every unrelated context.
                 break
             scope_id = self.create(
                 scope_type=level.scope_type,
@@ -1229,6 +1270,96 @@ class ScopeStore:
                     (fact_id, scope_id, priority),
                 )
         return bound
+
+    def promote_fact(self, fact_id: str, to_scope_id: int) -> dict:
+        """Make ``to_scope_id`` a fact's primary binding, keeping the others.
+
+        The correction that resolution deliberately refuses to make on its own.
+        Recall's candidate set is a scope's path plus its *ancestors*, so a fact
+        filed too deep — a teaching preference captured while writing one
+        chapter's file, and therefore bound to that document — is unreachable
+        from anywhere else. Nothing in the text says "this holds for every
+        chapter"; only the user knows, so this is an explicit act.
+
+        The general rule is enforced rather than assumed: the target must be
+        *more general* than the current primary (a fact may be lifted out of a
+        document to its project, never pushed down into one). Pushing down is
+        what resolution already does with evidence, and doing it by hand would
+        hide a fact from every context that used to see it.
+
+        ``fact_scope.priority`` is the tie-break the retriever uses, so the new
+        binding takes ``priority = 0`` and the previous primary is demoted to
+        ``1`` rather than deleted: it stays as context, and the move is a
+        re-prioritisation that a later promotion can undo.
+
+        Args:
+            fact_id: The fact to lift.
+            to_scope_id: The scope it should primarily belong to.
+
+        Returns:
+            ``{"fact_id", "from_scope_id", "to_scope_id", "action"}`` where
+            action is ``moved`` or ``already-primary``. ``from_scope_id`` is
+            ``None`` when the fact had no primary binding to begin with.
+
+        Raises:
+            ValueError: For an unknown target scope, or a target that is not more
+                general than the fact's current primary scope.
+        """
+        target = int(to_scope_id)
+        if not self.exists(target):
+            raise ValueError(f"unknown scope: {target}")
+        target = self.resolve_id(target)
+        row = self.conn.execute(
+            "SELECT scope_id FROM fact_scope WHERE fact_id = ? "
+            "ORDER BY priority ASC, scope_id ASC LIMIT 1",
+            (fact_id,),
+        ).fetchone()
+        current = self.resolve_id(int(row["scope_id"])) if row is not None else None
+        if current == target:
+            return {
+                "fact_id": fact_id,
+                "from_scope_id": current,
+                "to_scope_id": target,
+                "action": "already-primary",
+            }
+        if current is not None:
+            current_type = self.scope_type(current)
+            target_type = self.scope_type(target)
+            if SCOPE_DEPTH.get(target_type, 99) >= SCOPE_DEPTH.get(current_type, 99):
+                raise ValueError(
+                    f"scope {target} ({target_type}) is not more general than the "
+                    f"fact's current scope {current} ({current_type}); promoting "
+                    f"must lift a fact, not bury it deeper"
+                )
+        with self.conn:
+            if current is not None:
+                self.conn.execute(
+                    "UPDATE fact_scope SET priority = 1 WHERE fact_id = ? "
+                    "AND scope_id = ?",
+                    (fact_id, current),
+                )
+            self.conn.execute(
+                "INSERT INTO fact_scope(fact_id, scope_id, priority) VALUES (?, ?, 0) "
+                "ON CONFLICT(fact_id, scope_id) DO UPDATE SET priority = 0",
+                (fact_id, target),
+            )
+        record_event(
+            self.conn,
+            "fact_scope_promoted",
+            {
+                "fact_id": fact_id,
+                "from_scope_id": current,
+                "from_path": self.path_of(current) if current is not None else None,
+                "to_scope_id": target,
+                "to_path": self.path_of(target),
+            },
+        )
+        return {
+            "fact_id": fact_id,
+            "from_scope_id": current,
+            "to_scope_id": target,
+            "action": "moved",
+        }
 
     def set_conditions(
         self, fact_id: str, conditions: Iterable

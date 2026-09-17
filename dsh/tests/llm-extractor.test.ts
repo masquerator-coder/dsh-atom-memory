@@ -70,6 +70,54 @@ describe('parseCandidates', () => {
     expect(out[0]!.scope_hint).toBe('acme onboarding')
   })
 
+  it('passes the user-level marker through, because the store owns its meaning', () => {
+    // The prompt asks for the literal marker `user` on a durable fact about the
+    // user rather than about the current piece of work. It must survive parsing:
+    // the store is what recognises it as a *level* and refuses to turn it into a
+    // scope name (see `RESERVED_SCOPE_HINTS`), and a host that dropped it here
+    // would leave that rule untestable end to end.
+    const out = parseCandidates(JSON.stringify([
+      { subject: '用户', predicate: '偏好', object: '喜欢黑咖啡', scope_hint: 'user' },
+    ]))
+    expect(out[0]!.scope_hint).toBe('user')
+  })
+
+  it('keeps topic proposals, capped and de-duplicated', () => {
+    // The vocabulary lives in the Python store, so the host does not validate
+    // names into it — but a chatty model must not make one fact carry a
+    // paragraph, and the same name twice is one topic.
+    const out = parseCandidates(JSON.stringify([
+      {
+        subject: '用户', predicate: '偏好', object: '先讲概念再举例',
+        domain_hints: ['teaching', 'teaching', 42, '  ', 'programming', 'life'],
+      },
+      { subject: '用户', predicate: '偏好', object: 'B', domain_hints: 'teaching' },
+      { subject: '用户', predicate: '偏好', object: 'C', domain_hints: [] },
+    ]))
+    expect(out[0]!.domain_hints).toEqual(['teaching', 'programming', 'life'])
+    expect(out[1]!.domain_hints).toEqual(['teaching'])
+    expect(out[2]!.domain_hints).toBeUndefined()
+  })
+
+  it('drops a primary topic that is not among the proposals', () => {
+    // A primary the store cannot see would silently become whichever label the
+    // resolver happened to put first — worse than having none.
+    const out = parseCandidates(JSON.stringify([
+      {
+        subject: '用户', predicate: '偏好', object: 'A',
+        domain_hints: ['teaching', 'programming'], primary_domain: 'life',
+      },
+      {
+        subject: '用户', predicate: '偏好', object: 'B',
+        domain_hints: ['teaching'], primary_domain: ' teaching ',
+      },
+      { subject: '用户', predicate: '偏好', object: 'C', primary_domain: 'teaching' },
+    ]))
+    expect(out[0]!.primary_domain).toBeUndefined()
+    expect(out[1]!.primary_domain).toBe('teaching')
+    expect(out[2]!.primary_domain).toBeUndefined()
+  })
+
   it('understands the mapping spelling of conditions', () => {
     // A model that answers with the other accepted shape has still answered;
     // dropping the conditions would silently widen the fact's reach.

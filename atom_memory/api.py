@@ -24,6 +24,7 @@ from .backup import export_memory, import_memory, validate_backup
 from .config import MemConfig
 from .context import GLOBAL_SCOPE_ID, make_signal
 from .db import index_orphans, now_ms, open_db, record_event
+from .domain import GENERAL_DOMAIN, DomainStore, normalize_canonical
 from .embedder import Embedder
 from .profile import (
     SOURCE_USER,
@@ -118,8 +119,66 @@ class AtomMem:
             config=self.config,
         )
         self._worker.start()
+        self._seed_domains()
         self._started = True
         logger.info("AtomMem started (db=%s)", self.config.resolved_db_path())
+
+    def _seed_domains(self) -> None:
+        """Build the starting topic vocabulary from the scopes already stored.
+
+        Called on every start and cheap because it is idempotent: a name that
+        exists is skipped. The alternative — shipping a fixed list of root topics
+        — is a guess about someone else's work, while the scope tree is a record
+        of what they actually do. A failure here must not stop the store from
+        starting: labelling falls back to ``general``, which is a worse
+        vocabulary rather than a broken database.
+        """
+        if self.db is None:
+            return
+        if str(getattr(self.config, "domain_tagging_mode", "auto") or "auto") == "off":
+            return
+        try:
+            store = DomainStore(self.db, self.config)
+            # `scope_signal` has no user column (a signal identifies a scope, not
+            # an owner), so the owners come from the two tables that do carry one
+            # — and the scope tree those users already have is what seeds the
+            # vocabulary.
+            users = [
+                str(row["user_id"])
+                for row in self.db.execute(
+                    "SELECT DISTINCT user_id FROM scope_candidate"
+                ).fetchall()
+            ]
+            users += [
+                str(row["user_id"])
+                for row in self.db.execute(
+                    "SELECT DISTINCT user_id FROM facts"
+                ).fetchall()
+            ]
+            for user_id in dict.fromkeys(users):
+                if user_id:
+                    store.seed_from_scopes(user_id)
+            # Last, the owners that only the *scope usage* records: a fact
+            # binding is written per user, so it is the one place a scope's owner
+            # appears even when the fact itself has since been purged.
+            for row in self.db.execute(
+                "SELECT DISTINCT f.user_id AS user_id FROM fact_scope fs "
+                "JOIN facts f ON f.fact_id = fs.fact_id"
+            ).fetchall():
+                if row["user_id"]:
+                    store.seed_from_scopes(str(row["user_id"]))
+            # A user whose scopes are older than this dimension still needs a
+            # vocabulary root: `general` is the label of last resort, so it has to
+            # exist before the first write needs it. The scope tree is the only
+            # record of who those users are.
+            for row in self.db.execute(
+                "SELECT DISTINCT user_id FROM facts "
+                "UNION SELECT DISTINCT user_id FROM fact_candidates"
+            ).fetchall():
+                if row["user_id"]:
+                    store.ensure_root(str(row["user_id"]))
+        except sqlite3.Error:  # pragma: no cover - defensive
+            logger.exception("Domain seeding failed; continuing with an empty vocabulary")
 
     async def stop(self) -> None:
         """Stop the worker and close the database.
@@ -876,6 +935,262 @@ class AtomMem:
             ],
             "origins": store.origins_of(fact_id),
             "evolution": store.evolution_of(fact_id),
+        }
+
+    def fact_scope_promote(self, user_id: str, fact_id: str, to_scope_id: int) -> dict:
+        """Lift a fact to a more general scope, making it its primary binding.
+
+        The user-facing correction for a fact filed too deep. Recall's candidate
+        set is a scope's path plus its ancestors, so a fact bound to a document
+        is invisible from its sibling documents; a preference that holds for
+        every chapter has to live at the project (or ``user``) level to be found.
+        Nothing in the text says so, which is why this is an explicit call rather
+        than something the resolver infers.
+
+        The rest of the fact's bindings are kept and demoted, so the move is a
+        re-prioritisation rather than a deletion.
+
+        Args:
+            user_id: Owner of the fact (isolation check).
+            fact_id: The fact to lift.
+            to_scope_id: The scope it should primarily belong to; must be more
+                general than its current primary scope.
+
+        Returns:
+            ``{"fact_id", "from_scope_id", "to_scope_id", "action"}``.
+
+        Raises:
+            ValueError: When the fact is not an active fact of that user, or the
+                target scope is unknown or not more general.
+        """
+        store = self._scope_store()
+        self._require_fact(user_id, fact_id)
+        return store.promote_fact(fact_id, int(to_scope_id))
+
+    # -- topic surface -------------------------------------------------------------
+
+    def _domain_store(self) -> DomainStore:
+        """Return a topic store over the live connection.
+
+        Rebuilt per call for the same reason the scope store is; like it, this
+        surface ignores ``domain_tagging_mode``: switching automatic labelling off
+        must not take away the ability to inspect or repair the vocabulary.
+        """
+        if self.db is None:
+            raise RuntimeError("AtomMem is not started; call start() first")
+        return DomainStore(self.db, self.config)
+
+    def domain_list(self, user_id: str, status: str = "active") -> list:
+        """List a user's topic vocabulary, ordered by path.
+
+        Args:
+            user_id: Owner of the vocabulary.
+            status: ``active`` / ``merged`` / ``archived``.
+
+        Returns:
+            The matching rows as dicts.
+        """
+        return [row.to_dict() for row in self._domain_store().list_domains(user_id, status)]
+
+    def domain_resolve(
+        self, user_id: str, labels: list, scope_context: Optional[dict] = None
+    ) -> dict:
+        """Explain what a set of topic names resolves to right now.
+
+        The read-only counterpart of labelling: it reports the session set, each
+        proposal's resolved ancestor and what is still unregistered, and creates
+        nothing — a diagnostic call must not grow the vocabulary.
+
+        Args:
+            user_id: Owner of the vocabulary.
+            labels: Proposed topic names (from an extractor, or typed by a user).
+            scope_context: The session context payload, when there is one.
+
+        Returns:
+            ``{"session": {...}, "proposals": [...], "unresolved": [...]}``.
+        """
+        store = self._domain_store()
+        scope_ids: list = []
+        paths: list = []
+        if scope_context is not None and self.config.scope_aware:
+            from .scope import resolution_for
+
+            _, resolution = resolution_for(
+                self.db, self.config, scope_context, user_id=user_id, create=False
+            )
+            scope_store = self._scope_store()
+            scope_ids = [int(resolution.scope_id)]
+            paths = [scope_store.path_of(int(resolution.scope_id))]
+        session = store.session_domains(
+            user_id, scope_ids=scope_ids, scope_paths=paths
+        )
+        proposals = []
+        unresolved: list = []
+        for label in labels or ():
+            found, missing = store.resolve_chain(user_id, label)
+            proposals.append(
+                {
+                    "proposed": label,
+                    "resolved": store.name_of(found) if found else None,
+                    "domain_id": found,
+                    "ancestors": [store.name_of(a) for a in store.ancestors(found)]
+                    if found
+                    else [],
+                }
+            )
+            unresolved.extend(missing)
+        return {
+            "session": {
+                **session.to_dict(),
+                "names": [store.name_of(i) for i in session.domain_ids],
+            },
+            "proposals": proposals,
+            "unresolved": list(dict.fromkeys(unresolved)),
+        }
+
+    def domain_create(
+        self,
+        user_id: str,
+        name: str,
+        display_name: str = "",
+        parent_id: Optional[int] = None,
+    ) -> dict:
+        """Register a topic name.
+
+        Args:
+            user_id: Owner of the vocabulary.
+            name: The canonical name (``teaching/ds``).
+            display_name: Free-form label for humans (may be CJK).
+            parent_id: Explicit parent; omitted attaches to the nearest existing
+                ancestor, or to ``general``.
+
+        Returns:
+            The row as a dict.
+
+        Raises:
+            ValueError: When the name is not a storable canonical name.
+        """
+        store = self._domain_store()
+        canonical = normalize_canonical(name)
+        domain_id = store.create(
+            user_id, canonical, display_name=display_name, parent_id=parent_id
+        )
+        if not domain_id:
+            raise ValueError(f"invalid domain name: {name!r}")
+        row = store.get(domain_id)
+        return row.to_dict() if row is not None else {"domain_id": domain_id}
+
+    def domain_rename(self, user_id: str, domain_id: int, name: str) -> dict:
+        """Rename a topic; label bindings are keyed by id, so no fact changes."""
+        return self._domain_store().rename(user_id, int(domain_id), name)
+
+    def domain_merge(self, user_id: str, from_id: int, to_id: int) -> dict:
+        """Fold one topic into another, keeping the source as ``merged``."""
+        return self._domain_store().merge(user_id, int(from_id), int(to_id))
+
+    def domain_archive(self, user_id: str, domain_id: int) -> dict:
+        """Archive a topic so it stops being offered for new labels."""
+        return {
+            "domain_id": int(domain_id),
+            "archived": self._domain_store().archive(user_id, int(domain_id)),
+        }
+
+    def domain_bridge_add(
+        self, user_id: str, from_id: int, to_id: int, weight: float = 0.5
+    ) -> dict:
+        """Record a cross-topic bridge (ranking weight only, never a filter)."""
+        return {
+            "from": int(from_id),
+            "to": int(to_id),
+            "added": self._domain_store().set_bridge(
+                user_id, int(from_id), int(to_id), weight
+            ),
+        }
+
+    def domain_unresolved(self, user_id: str, limit: int = 50) -> list:
+        """List the pending registration queue (proposals with no ancestor)."""
+        return [signal.to_dict() for signal in self._domain_store().unresolved(user_id, limit)]
+
+    def domain_signal_reject(self, user_id: str, name: str) -> dict:
+        """Mark a queued proposal as rejected so it stops being offered."""
+        store = self._domain_store()
+        canonical = normalize_canonical(name)
+        if not canonical:
+            raise ValueError("domain_signal_reject requires a name")
+        with self.db:
+            cursor = self.db.execute(
+                "UPDATE domain_signal SET status = 'rejected' WHERE user_id = ? "
+                "AND canonical_name = ? AND status = 'pending'",
+                (user_id, canonical),
+            )
+        return {"name": canonical, "rejected": int(cursor.rowcount or 0)}
+
+    def domain_signal_promote(
+        self, user_id: str, name: str, display_name: str = ""
+    ) -> dict:
+        """Register a queued proposal, which is how a new topic enters the vocabulary.
+
+        Args:
+            user_id: Owner of the vocabulary.
+            name: The canonical name from the queue.
+            display_name: Free-form label for humans.
+
+        Returns:
+            The created row as a dict.
+        """
+        store = self._domain_store()
+        canonical = normalize_canonical(name)
+        domain_id = store.create(user_id, canonical, display_name=display_name)
+        if not domain_id:
+            raise ValueError(f"invalid domain name: {name!r}")
+        with self.db:
+            self.db.execute(
+                "UPDATE domain_signal SET status = 'promoted', nearest_ancestor = ? "
+                "WHERE user_id = ? AND canonical_name = ? AND status = 'pending'",
+                (domain_id, user_id, canonical),
+            )
+        row = store.get(domain_id)
+        return row.to_dict() if row is not None else {"domain_id": domain_id}
+
+    def fact_domain_set(self, user_id: str, fact_id: str, domains: list) -> dict:
+        """Replace a fact's topics with exactly the given names.
+
+        The authoritative correction, unlike the write path's merge: what is not
+        named is removed, because "correct this label" is a decision rather than
+        another observation.
+
+        Args:
+            user_id: Owner of the fact (isolation check) and of the vocabulary.
+            fact_id: The fact to relabel.
+            domains: Canonical names, most important first (the first becomes
+                primary). A name the vocabulary lacks is registered.
+
+        Returns:
+            ``{"fact_id", "domains": [...]}``.
+
+        Raises:
+            ValueError: For an inactive fact, or an empty/invalid/oversized list.
+        """
+        store = self._domain_store()
+        self._require_fact(user_id, fact_id)
+        labels = store.set_fact_domains(fact_id, domains or [], user_id=user_id)
+        primary = next((label for label in labels if label.is_primary), None)
+        return {
+            "fact_id": fact_id,
+            "domains": [label.to_dict() for label in labels],
+            "primary": primary.name if primary is not None else None,
+        }
+
+    def fact_domain_get(self, user_id: str, fact_id: str) -> dict:
+        """Return a fact's topics with the rule that chose each one."""
+        store = self._domain_store()
+        self._require_fact(user_id, fact_id)
+        labels = store.labels_of(fact_id)
+        primary = next((label for label in labels if label.is_primary), None)
+        return {
+            "fact_id": fact_id,
+            "domains": [label.to_dict() for label in labels],
+            "primary": primary.name if primary is not None else None,
         }
 
     def _require_fact(self, user_id: str, fact_id: str) -> None:

@@ -76,6 +76,25 @@ SCOPE_DEPTH: Dict[str, int] = {name: i for i, name in enumerate(SCOPE_TYPES)}
 #: The reserved root scope id written by migration 011.
 GLOBAL_SCOPE_ID = 1
 
+#: Values of the ``scope_hint`` field that name a *level* rather than a place.
+#:
+#: The field is normally a content anchor — a phrase the model copied out of the
+#: text ("第3章课件", "acme 的 api 项目") — and it is 0.25 evidence that can only
+#: corroborate a resolution or accumulate in the candidate queue. These two
+#: values are different in kind: the extractor emits them for a fact that belongs
+#: to the *user* rather than to whatever document the session happens to be in
+#: (a durable preference, a stable attribute). They are markers, so they must
+#: never become a scope name: a content anchor is a name, and a project called
+#: "user" would be created once per session that mentioned a preference.
+#:
+#: Honouring ``user`` fully — filing such a fact at the user scope, so that every
+#: project sees it — needs the topic dimension to exist first: lifting every
+#: preference to a level visible from everywhere is precisely how a preference
+#: about programming would start leaking into teaching work. Until then the
+#: marker is recognised and *ignored*, which keeps the write where the session is
+#: and creates no bogus scope.
+RESERVED_SCOPE_HINTS: frozenset = frozenset({SCOPE_GLOBAL, SCOPE_USER})
+
 # -- signal types -------------------------------------------------------------
 
 
@@ -690,12 +709,16 @@ def context_from_payload(
 
     # An LLM's `scope_hint` is a content anchor: it can corroborate a resolution
     # or accumulate in the unresolved queue, but it can never bind on its own
-    # (0.25 reliability is far below every auto-bind threshold).
+    # (0.25 reliability is far below every auto-bind threshold). The two reserved
+    # level markers are not names at all — see RESERVED_SCOPE_HINTS — so they are
+    # recognised and dropped here rather than turned into a content anchor.
     hint = payload.get("scope_hint")
-    if isinstance(hint, str) and hint.strip() and hint.strip().casefold() != SCOPE_GLOBAL:
-        signal = make_signal(SIGNAL_HINT, hint)
-        if signal is not None:
-            signals.append(signal)
+    if isinstance(hint, str) and hint.strip():
+        normalized_hint = hint.strip().casefold()
+        if normalized_hint not in RESERVED_SCOPE_HINTS:
+            signal = make_signal(SIGNAL_HINT, hint)
+            if signal is not None:
+                signals.append(signal)
 
     phase = ""
     for signal in signals:

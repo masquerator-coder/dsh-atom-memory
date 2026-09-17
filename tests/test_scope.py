@@ -192,6 +192,30 @@ def test_a_context_with_nothing_usable_is_none():
     assert context_from_payload({}, user_id="u") is None
     assert context_from_payload({"signals": {}}, user_id="u") is None
     assert context_from_payload({"scope_hint": "global"}, user_id="u") is None
+    assert context_from_payload({"scope_hint": "user"}, user_id="u") is None
+
+
+def test_a_level_marker_is_never_turned_into_a_scope_name(conn, config):
+    """``scope_hint`` is normally a name the extractor copied out of the text, and
+    as 0.25 evidence it accumulates in the candidate queue. The two *level*
+    markers are different in kind — they say "this belongs to the user", not
+    "this belongs to a place called user" — so they must be dropped rather than
+    queued, or a deployment that prefers durable facts at the user level would
+    collect one bogus project per session."""
+    for marker in ("user", "User", " global "):
+        resolution_for(conn, config, {"scope_hint": marker}, user_id="u")
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM scope"
+    ).fetchone()["n"] == 1, "only the root should exist"
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM scope_candidate"
+    ).fetchone()["n"] == 0, "a level marker is not a hypothesis about a place"
+
+    _, real = resolution_for(
+        conn, config, {"scope_hint": "第3章课件"}, user_id="u"
+    )
+    assert real.status == STATUS_UNRESOLVED
+    assert [c.canonical_name for c in real.candidates] == ["第3章课件"]
 
 
 # -- resolution --------------------------------------------------------------
@@ -244,6 +268,111 @@ def test_a_third_consistent_sighting_promotes_the_candidate(conn, config):
     assert conn.execute(
         "SELECT scope_type FROM scope WHERE id = ?", (resolution.scope_id,)
     ).fetchone()["scope_type"] == "project"
+
+
+def test_a_weak_signal_may_not_create_a_document(conn, config):
+    """A document is the one scope type whose facts are unreachable from their
+    siblings, so the weak signals that merely *name* a document (a folder path,
+    a title — both 0.50) must not bring one into existence. Doing so buries the
+    fact: the notes taken while writing chapter 3 could never be recalled while
+    working on chapter 4, which is exactly the recall gap this threshold closes."""
+    _, resolution = resolution_for(
+        conn,
+        config,
+        {"signals": {"git_remote": "git@github.com:acme/course.git",
+                     "folder_path": "D:/work/course/ch3",
+                     "doc_title": "第3章课件"}},
+        user_id="u",
+    )
+    assert resolution.status == STATUS_CREATED
+    assert conn.execute(
+        "SELECT scope_type FROM scope WHERE id = ?", (resolution.scope_id,)
+    ).fetchone()["scope_type"] == "project"
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM scope WHERE scope_type = 'document'"
+    ).fetchone()["n"] == 0
+
+
+def test_a_durable_document_id_still_creates_a_document(conn, config):
+    """The gate is on *evidence*, not on the type: a durable id (0.90) is enough.
+    Suppressing document creation outright would lose the real ones."""
+    _, resolution = resolution_for(
+        conn,
+        config,
+        {"signals": {"git_remote": "git@github.com:acme/course.git",
+                     "doc_id": "drive-file-42"}},
+        user_id="u",
+    )
+    assert resolution.status == STATUS_CREATED
+    assert conn.execute(
+        "SELECT scope_type FROM scope WHERE id = ?", (resolution.scope_id,)
+    ).fetchone()["scope_type"] == "document"
+
+
+def test_a_weak_document_signal_binds_to_a_document_that_already_exists(conn, config):
+    """The threshold governs *creation*. A path or a title seen again still binds:
+    re-identification is proof of the identity, and refusing it would split one
+    document's history across two scopes."""
+    _, created = resolution_for(
+        conn,
+        config,
+        {"signals": {"git_remote": "git@github.com:acme/course.git",
+                     "doc_id": "drive-file-42"}},
+        user_id="u",
+    )
+    _, bound = resolution_for(
+        conn,
+        config,
+        {"signals": {"git_remote": "git@github.com:acme/course.git",
+                     "doc_id": "drive-file-42",
+                     "folder_path": "D:/work/course/ch3"}},
+        user_id="u",
+    )
+    assert bound.status == STATUS_BOUND
+    assert bound.scope_id == created.scope_id
+
+
+def test_the_document_threshold_is_configurable_and_general_levels_are_unaffected(
+    conn,
+):
+    """A deployment that wants the old behaviour sets the threshold back down, and
+    the general threshold never moves onto other scope types (a project created
+    from a bare path is still a project — and it is reachable from its phases and
+    documents, which is why only ``document`` / ``thread`` are gated)."""
+    permissive = MemConfig(scope_aware=True, scope_new_threshold_document=0.5)
+    _, resolution = resolution_for(
+        conn, permissive, {"signals": {"folder_path": "D:/work/course/ch3"}},
+        user_id="u",
+    )
+    assert conn.execute(
+        "SELECT scope_type FROM scope WHERE id = ?", (resolution.scope_id,)
+    ).fetchone()["scope_type"] == "document"
+
+    _, project = resolution_for(
+        conn, permissive, {"signals": {"path": "D:/work/plain"}}, user_id="u"
+    )
+    assert project.scope_id == GLOBAL_SCOPE_ID, "0.50 still cannot create a project"
+
+
+def test_a_project_with_a_weak_document_below_it_is_still_created(conn, config):
+    """The walk stops at the level it cannot create instead of skipping it: a
+    document filed under the *root* would be visible from every unrelated
+    context, which is worse than filing the fact at the project."""
+    _, resolution = resolution_for(
+        conn,
+        config,
+        {"signals": {"git_remote": "git@github.com:acme/course.git",
+                     "folder_path": "D:/work/course/ch3"}},
+        user_id="u",
+    )
+    assert resolution.status == STATUS_CREATED
+    row = conn.execute(
+        "SELECT scope_type, parent_id FROM scope WHERE id = ?",
+        (resolution.scope_id,),
+    ).fetchone()
+    assert row["scope_type"] == "project"
+    assert row["parent_id"] == GLOBAL_SCOPE_ID
+
 
 
 def test_a_second_different_signal_does_not_promote_the_first(conn, config):

@@ -112,6 +112,23 @@ _METHODS: Dict[str, str] = {
     "fact_scope_bind": "fact_scope_bind",
     "fact_condition_set": "fact_condition_set",
     "fact_scope_get": "fact_scope_get",
+    "fact_scope_promote": "fact_scope_promote",
+    # Topic surface: the vocabulary, its registration queue, and the per-fact
+    # labels. `domain_recall` governs whether recall *uses* them; this surface
+    # exists regardless, because inspecting and correcting a label is how the
+    # dimension earns the right to filter anything.
+    "domain_list": "domain_list",
+    "domain_resolve": "domain_resolve",
+    "domain_create": "domain_create",
+    "domain_rename": "domain_rename",
+    "domain_merge": "domain_merge",
+    "domain_archive": "domain_archive",
+    "domain_bridge_add": "domain_bridge_add",
+    "domain_unresolved": "domain_unresolved",
+    "domain_signal_promote": "domain_signal_promote",
+    "domain_signal_reject": "domain_signal_reject",
+    "fact_domain_set": "fact_domain_set",
+    "fact_domain_get": "fact_domain_get",
 }
 
 

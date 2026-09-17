@@ -431,6 +431,99 @@ def test_fact_scope_binding_conditions_and_provenance(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_promoting_a_fact_makes_it_reachable_from_its_siblings(tmp_path, monkeypatch):
+    """The recall gap that a *stronger document threshold* alone cannot close.
+
+    A fact bound to a document is invisible from its sibling documents — that is
+    the design (`expanded_scope_ids`), and it is right: chapter 2's notes are not
+    chapter 3's. But a preference that holds for the whole course gets captured
+    while writing one chapter, and nothing in its text says so. Only the user
+    knows, so promoting it is an explicit act — and afterwards the fact must be
+    reachable from the sibling document, which is what this pins.
+    """
+    mem = _mem(tmp_path, monkeypatch)
+    fake = _FakeEmbedder()
+    course = {"signals": {"git_remote": "git@github.com:acme/course",
+                          "git_root": "D:/work/course"}}
+    # Chapter 3 carries a folder path and no durable id, so by the document
+    # threshold it is filed at the *project* level — the reachable one.
+    ch3 = {"signals": {**course["signals"], "folder_path": "D:/work/course/ch3"}}
+
+    async def scenario():
+        await mem.start()
+        try:
+            resolved = mem.scope_resolve("u", course, create=True)
+            project_id = resolved["scope_id"]
+            ch3_id = mem.scope_resolve("u", ch3, create=True)["scope_id"]
+            assert ch3_id == project_id, (
+                "a weak document signal must not detach a chapter from its project"
+            )
+            # A durable id *does* make its own document, and the write already
+            # registered it as a signal, so chapter 4's context resolves to it.
+            ch4_id = mem.scope_create(
+                "document", "drive-ch4",
+                parent_id=project_id,
+                signals={"doc_id": "drive-ch4"},
+            )["scope_id"]
+            assert ch4_id not in (project_id, ch3_id)
+            ch4 = {"signals": {**course["signals"], "doc_id": "drive-ch4"}}
+            assert mem.scope_resolve("u", ch4, create=False)["scope_id"] == ch4_id
+
+            text = "教学 偏好 先讲概念再举例"
+            mem.db.execute(
+                "INSERT INTO facts(fact_id, user_id, session_id, subject, predicate, "
+                "object, observed_at, created_at) VALUES ('f1','u','s','教学','偏好',"
+                "'先讲概念再举例', ?, ?)",
+                (now_ms(), now_ms()),
+            )
+            mem.db.execute(
+                "INSERT INTO facts_fts(fact_id, text) VALUES ('f1', ?)", (text,)
+            )
+            mem.db.execute(
+                "INSERT INTO facts_vec(fact_id, embedding) VALUES ('f1', ?)",
+                (fake.embed_one(text),),
+            )
+            mem.db.commit()
+
+            # Where a chapter-scoped capture would file it, and the gap that
+            # creates: the sibling chapter cannot see it.
+            mem.fact_scope_bind("u", "f1", [ch4_id])
+            hidden = await mem.recall("u", "先讲概念再举例", scope_context=ch3)
+            assert hidden["facts"] == []
+
+            promoted = mem.fact_scope_promote("u", "f1", project_id)
+            assert promoted["action"] == "moved"
+            assert promoted["from_scope_id"] == ch4_id
+            assert promoted["to_scope_id"] == project_id
+
+            after = await mem.recall("u", "先讲概念再举例", scope_context=ch4)
+            assert [f["fact_id"] for f in after["facts"]] == ["f1"], (
+                "after promotion the project-level fact is visible from every "
+                "document beneath it"
+            )
+            # The old binding is demoted, not deleted: the move stays reversible
+            # and the fact remains readable as a document-scoped fact.
+            detail = mem.fact_scope_get("u", "f1")
+            assert [s["scope_id"] for s in detail["scopes"]] == [ch4_id, project_id]
+
+            events = mem.db.execute(
+                "SELECT COUNT(*) AS n FROM events WHERE type = 'fact_scope_promoted'"
+            ).fetchone()
+            assert events["n"] == 1, "the move is auditable"
+
+            # Promotion lifts a fact; it never buries one deeper.
+            with pytest.raises(ValueError):
+                mem.fact_scope_promote("u", "f1", ch4_id)
+            with pytest.raises(ValueError):
+                mem.fact_scope_promote("u", "f1", 999999)
+            with pytest.raises(ValueError):
+                mem.fact_scope_promote("someone-else", "f1", project_id)
+        finally:
+            await mem.stop()
+
+    asyncio.run(scenario())
+
+
 def test_recall_and_summary_carry_the_scope_context(tmp_path, monkeypatch):
     mem = _mem(tmp_path, monkeypatch)
 
@@ -522,6 +615,8 @@ def test_every_scope_rpc_method_is_reachable_and_forwards_its_params():
             ("fact_condition_set", {"user_id": "u", "fact_id": "f",
                                     "conditions": [{"key": "k", "value": "v"}]}),
             ("fact_scope_get", {"user_id": "u", "fact_id": "f"}),
+            ("fact_scope_promote", {"user_id": "u", "fact_id": "f",
+                                    "to_scope_id": 1}),
         ]
         results = []
         for method, params in requests:
@@ -533,11 +628,12 @@ def test_every_scope_rpc_method_is_reachable_and_forwards_its_params():
         "scope_list", "scope_resolve", "scope_create", "scope_alias_add",
         "scope_confirm", "scope_merge", "scope_split", "scope_reparent",
         "scope_unresolved", "scope_promote", "fact_scope_bind",
-        "fact_condition_set", "fact_scope_get",
+        "fact_condition_set", "fact_scope_get", "fact_scope_promote",
     ]
     forwarded = dict(server.mem.calls)
     assert forwarded["scope_resolve"]["scope_context"] == PROJECT_A
     assert forwarded["fact_scope_bind"]["scope_ids"] == [1]
+    assert forwarded["fact_scope_promote"]["to_scope_id"] == 1
 
 
 def test_scope_context_reaches_the_summary_and_persist_handlers():

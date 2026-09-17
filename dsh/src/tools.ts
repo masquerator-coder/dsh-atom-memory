@@ -61,6 +61,22 @@ const EXPLICIT_IMPORTANCE = 0.9
 /** Confidence stamped on a fact the user explicitly asked to remember. */
 const EXPLICIT_CONFIDENCE = 0.9
 
+/** One label the store attached to a written fact. */
+interface DomainLabel {
+  name?: string
+  confidence?: number
+  is_primary?: boolean
+  source?: string
+}
+
+/** Where a write was filed, and what it was labelled with. */
+interface DomainAssignment {
+  domains?: DomainLabel[]
+  primary?: string | null
+  unregistered?: string[]
+  detail?: string
+}
+
 /** How the store may answer a write. Mirrors the Python write outcome. */
 interface WriteReceipt {
   candidate_id?: string
@@ -69,6 +85,10 @@ interface WriteReceipt {
   reject_reason?: string
   outcome?: {
     written?: string[]
+    /** The scope the batch was filed under (see `ScopeResolution`). */
+    scope?: { scope_id?: number; path?: string | null; display_name?: string | null; status?: string }
+    /** One entry per surviving candidate, positionally aligned with the batch. */
+    domains?: DomainAssignment[]
     superseded?: Array<{
       old_object?: string | null
       new_object?: string | null
@@ -218,7 +238,53 @@ export function renderWriteReceipt(receipt: WriteReceipt): string {
   }
   if (shortened) parts.push(`注意：内容过长已截断——${shortened}`)
   if (parts.length === 0) return '没有可写入的事实（抽取为空）。'
-  return `${parts.join('，')}。`
+  const placement = renderPlacement(outcome.scope, outcome.domains)
+  return placement ? `${parts.join('，')}。${placement}` : `${parts.join('，')}。`
+}
+
+/**
+ * Render where a write was filed: its scope, and its topic labels.
+ *
+ * This exists because both dimensions are *guessed* by the store, and a guess
+ * that is never shown cannot be corrected. Two things matter in the wording:
+ * the primary label is named first (it is the one ranking and conflict judgement
+ * read), and a topic the vocabulary did not hold is reported as *unregistered* —
+ * the fact was stored under its nearest known ancestor, and only the user can
+ * decide whether the new name is worth registering.
+ *
+ * @param scope - The scope the batch was filed under, when the store sent one.
+ * @param assignments - One topic assignment per surviving candidate.
+ * @returns A line to append to the receipt, or `''` when there is nothing to say.
+ */
+function renderPlacement(
+  scope: NonNullable<WriteReceipt['outcome']>['scope'],
+  assignments: DomainAssignment[] | undefined,
+): string {
+  const lines: string[] = []
+  const path = scope?.path ?? scope?.display_name
+  if (path) lines.push(`作用域：${path}${scope?.status === 'unresolved' ? '（未确认）' : ''}`)
+  const labels = (assignments ?? []).flatMap(a => a.domains ?? [])
+  if (labels.length > 0) {
+    // One write can carry several candidates; show the distinct labels rather
+    // than repeating the same topic once per fact.
+    const seen = new Set<string>()
+    const parts: string[] = []
+    for (const label of labels) {
+      const name = label.name ?? '?'
+      if (seen.has(name)) continue
+      seen.add(name)
+      parts.push(label.is_primary ? `${name}（主）` : name)
+    }
+    if (parts.length > 0) lines.push(`主题：${parts.join(' · ')}`)
+  }
+  const unregistered = [...new Set((assignments ?? []).flatMap(a => a.unregistered ?? []))]
+  if (unregistered.length > 0) {
+    lines.push(
+      `未注册的主题：${unregistered.join(' · ')}（已归入最近的已注册主题，`
+      + '如需新建可用 memory_domains 的 create）',
+    )
+  }
+  return lines.length > 0 ? `\n${lines.join('\n')}` : ''
 }
 
 /** Ask the store for the outcome of a write, within a bounded wait. */
@@ -442,10 +508,137 @@ export function renderScopeResult(action: string, value: unknown): string {
         + `别名 ${v.aliases_moved ?? 0} 个、信号 ${v.signals_moved ?? 0} 个、子作用域 ${v.children_moved ?? 0} 个。`
         + '源作用域保留为 merged 状态，历史仍可读。'
     }
+    case 'promote': {
+      const v = value as {
+        from_scope_id?: number | null; to_scope_id?: number; action?: string
+      }
+      if (v.action === 'already-primary') {
+        return `事实已主要归属作用域 [${v.to_scope_id ?? '?'}]，无需提升。`
+      }
+      const from = v.from_scope_id === undefined || v.from_scope_id === null
+        ? '（原本没有主作用域）'
+        : `[${v.from_scope_id}]`
+      return `已把事实的主要归属从 ${from} 提升到 [${v.to_scope_id ?? '?'}]：`
+        + '此后它在本作用域及其所有后代上下文中都能被召回，原归属降为次要绑定（未被删除）。'
+    }
     default:
       // Unreachable through `execute` (an unknown action throws before any RPC),
       // but `render` is also replayed over logged arguments: showing the raw
       // value beats an empty line when a stored action is not recognised.
+      return JSON.stringify(value)
+  }
+}
+
+/**
+ * Render the result of a `memory_domains` action for the model.
+ *
+ * @param action - The action the call ran with.
+ * @param value - The structured value that action returned.
+ * @returns The model-visible text.
+ */
+export function renderDomainResult(action: string, value: unknown): string {
+  switch (action) {
+    case 'list': {
+      const rows = (value as { domains?: Array<Record<string, unknown>> }).domains ?? []
+      if (rows.length === 0) return '（主题词表为空；写一条记忆或维护一个项目后会自动生成）'
+      const lines = rows.map((row) => {
+        const path = String(row.path ?? row.name ?? '?')
+        const depth = Math.max(0, path.split('/').filter(p => p.length > 0).length - 1)
+        const display = row.display_name && row.display_name !== row.name ? `（${row.display_name}）` : ''
+        const seeded = row.system_seeded === true ? ' · 自动生成' : ''
+        return `${'  '.repeat(depth)}- [${row.domain_id ?? '?'}] ${path}${display}${seeded}`
+      })
+      return [`主题词表（${rows.length} 个，按层级缩进）：`, ...lines].join('\n')
+    }
+    case 'resolve': {
+      const v = value as {
+        session?: { names?: string[]; source?: string; detail?: string }
+        proposals?: Array<{ proposed?: string; resolved?: string | null; ancestors?: string[] }>
+        unresolved?: string[]
+      }
+      const lines: string[] = []
+      const session = v.session ?? {}
+      const names = session.names ?? []
+      lines.push(
+        names.length > 0
+          ? `当前会话主题：${names.join(' · ')}（依据 ${session.source ?? '?'}${session.detail ? `：${session.detail}` : ''}）`
+          : '当前会话没有解析到任何主题（写入时会退回 general）。',
+      )
+      for (const proposal of v.proposals ?? []) {
+        lines.push(
+          proposal.resolved
+            ? `- "${proposal.proposed ?? '?'}" → ${proposal.resolved}`
+              + (proposal.ancestors && proposal.ancestors.length > 0
+                ? `（上级：${proposal.ancestors.join(' / ')}）`
+                : '')
+            : `- "${proposal.proposed ?? '?'}"：未注册，会归入最近的已注册祖先（若无则退到 general）`,
+        )
+      }
+      if (v.unresolved && v.unresolved.length > 0) {
+        lines.push(`待注册：${v.unresolved.join(' · ')}`)
+      }
+      return lines.join('\n')
+    }
+    case 'create': {
+      const v = value as { domain_id?: number; path?: string; name?: string; display_name?: string }
+      return `已注册主题 [${v.domain_id ?? '?'}] ${v.path ?? v.name ?? '?'}`
+        + `${v.display_name && v.display_name !== v.name ? `（${v.display_name}）` : ''}。`
+    }
+    case 'rename': {
+      const v = value as { domain_id?: number; from?: string; to?: string; children_moved?: number }
+      return `已把主题 [${v.domain_id ?? '?'}] 从 "${v.from ?? '?'}" 改名为 "${v.to ?? '?'}"`
+        + `（已有标记按 id 关联，未改动；下级主题 ${v.children_moved ?? 0} 个路径已同步）。`
+    }
+    case 'merge': {
+      const v = value as {
+        from?: number; to?: number; labels_moved?: number; children_moved?: number
+      }
+      return `已把主题 [${v.from ?? '?'}] 合并进 [${v.to ?? '?'}]：关联标记 ${v.labels_moved ?? 0} 条、`
+        + `下级 ${v.children_moved ?? 0} 个。源主题保留为 merged 状态，历史仍可读。`
+    }
+    case 'signal_reject': {
+      const v = value as { name?: string; rejected?: number }
+      return v.rejected
+        ? `已忽略待注册建议 "${v.name ?? '?'}"。`
+        : `没有找到待注册建议 "${v.name ?? '?'}"。`
+    }
+    case 'bridge_add': {
+      const v = value as { from?: number; to?: number; added?: boolean }
+      return v.added
+        ? `已记录主题桥接 [${v.from ?? '?'}] → [${v.to ?? '?'}]：只在排序上加权，不改变过滤集合。`
+        : `桥接未记录（起点或终点主题不存在，或两者相同）。`
+    }
+    case 'archive': {
+      const v = value as { domain_id?: number; archived?: boolean }
+      return v.archived === false
+        ? `主题 [${v.domain_id ?? '?'}] 未归档（可能不存在或已归档）。`
+        : `已归档主题 [${v.domain_id ?? '?'}]：它不再被建议给新的记忆，已有标记不受影响。`
+    }
+    case 'unresolved': {
+      const signals = (value as { signals?: Array<Record<string, unknown>> }).signals ?? []
+      if (signals.length === 0) return '（没有待注册的主题建议）'
+      const lines = signals.map(
+        s => `- ${s.name ?? '?'}（出现 ${s.seen_count ?? 1} 次`
+          + `${s.nearest_ancestor ? `，当前归入 [${s.nearest_ancestor}]` : ''}）`,
+      )
+      return ['待注册的主题建议（达到一定次数后由用户决定是否注册）：', ...lines].join('\n')
+    }
+    case 'fact_set':
+    case 'fact_get': {
+      const v = value as {
+        fact_id?: string
+        primary?: string | null
+        domains?: Array<{ name?: string; is_primary?: boolean; source?: string }>
+      }
+      if (!v.domains || v.domains.length === 0) {
+        return `事实 ${v.fact_id ?? '?'} 没有主题标记（早于主题维度写入的记忆）。`
+      }
+      const parts = v.domains.map(
+        d => `${d.name ?? '?'}${d.is_primary ? '（主）' : ''}·${d.source ?? '?'}`,
+      )
+      return `事实 ${v.fact_id ?? '?'} 的主题：${parts.join(' · ')}`
+    }
+    default:
       return JSON.stringify(value)
   }
 }
@@ -829,12 +1022,14 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
       '查看与维护记忆的作用域层级（org / team / client / project / series / phase / document / thread）——作用域决定一条记忆归属哪里、以及在什么上下文里被召回，但不改变任何记忆的内容。'
       + 'action=list 列出作用域树；resolve 说明当前上下文解析到哪个作用域、还有哪些候选证据不足待确认；'
       + 'create 显式创建一个作用域（可带身份信号）；confirm 确认一个作用域（此后该上下文无需更多证据即解析到它）；'
-      + 'alias_add 给作用域加一个别名；merge 把重复的两个作用域合并。',
+      + 'alias_add 给作用域加一个别名；merge 把重复的两个作用域合并；'
+      + 'promote 把一条事实的主要归属提升到更通用的作用域（例如从某个文档提升到项目或用户级），'
+      + '让"这条经验适用于所有同类工作"立即生效——事实被绑在文档上时，从同级的其他文档里是召回不到的。',
     parameters: {
       action: {
         type: 'string',
         required: true,
-        description: '要执行的操作：list / resolve / create / confirm / alias_add / merge',
+        description: '要执行的操作：list / resolve / create / confirm / alias_add / merge / promote',
       },
       scopeType: {
         type: 'string',
@@ -851,6 +1046,14 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
       alias: { type: 'string', description: 'alias_add 必填：别名（另一个名字、路径或 remote）' },
       fromId: { type: 'integer', description: 'merge 必填：被合并掉的作用域 id' },
       toId: { type: 'integer', description: 'merge 必填：保留的作用域 id' },
+      factId: {
+        type: 'string',
+        description: 'promote 必填：要提升的事实 id（来自 memory_recall / memory_list_facts 的结果）',
+      },
+      toScopeId: {
+        type: 'integer',
+        description: 'promote 必填：提升到哪个作用域 id（必须比该事实当前的主作用域更通用，来自 list / resolve）',
+      },
       status: { type: 'string', description: 'list 可选：作用域状态（默认 active，也可用 merged / archived）' },
       user: { type: 'string', description: '可选：归属用户 id（默认当前用户，跨会话共享）' },
     },
@@ -910,10 +1113,145 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
           if (args.toId === undefined) throw new Error('memory_scope merge requires toId')
           return await call<any>('scope_merge', { from_id: args.fromId, to_id: args.toId })
         }
+        case 'promote': {
+          if (!args.factId) throw new Error('memory_scope promote requires factId')
+          if (args.toScopeId === undefined) throw new Error('memory_scope promote requires toScopeId')
+          return await call<any>('fact_scope_promote', {
+            user_id: uid,
+            fact_id: args.factId,
+            to_scope_id: args.toScopeId,
+          })
+        }
         default:
           throw new Error(
             `memory_scope: unknown action ${String(args.action)}`
-            + '（可用：list / resolve / create / confirm / alias_add / merge）',
+            + '（可用：list / resolve / create / confirm / alias_add / merge / promote）',
+          )
+      }
+    },
+  })))
+
+  disposers.push(ctx.tools.register(defineTool({
+    name: 'memory_domains',
+    description:
+      '查看与维护记忆的主题词表（teaching / programming / life 等）——主题说明一条记忆"关于什么"，'
+      + '与作用域（"在什么上下文"）正交：作用域靠环境自动解析，主题由抽取建议 + 词表校验得到。'
+      + '一条事实只能属于一个主作用域，但可以有多个主题（主主题参与排序与冲突判定）。'
+      + '词表是注册制：抽取建议了未注册的主题时，会归入最近的已注册祖先并记入待注册队列，不会自动新建。'
+      + 'action=list 列出词表；resolve 说明当前会话解析到哪些主题、某个主题名会归到哪里；create 注册新主题；'
+      + 'rename / merge / archive 维护词表；bridge_add 记录跨主题关联（只影响排序权重，不改变过滤）；'
+      + 'unresolved 列出待注册队列；signal_reject 忽略某个待注册建议；'
+      + 'fact_set / fact_get 读取或改写某条事实的主题（改写是权威的：未列出的主题会被移除）。',
+    parameters: {
+      action: {
+        type: 'string',
+        required: true,
+        description:
+          '要执行的操作：list / resolve / create / rename / merge / archive / bridge_add / '
+          + 'unresolved / signal_reject / fact_set / fact_get',
+      },
+      name: { type: 'string', description: 'create / rename / signal_reject 必填：主题规范名（小写 ASCII，斜杠分隔，如 teaching/ds）' },
+      displayName: { type: 'string', description: 'create 可选：给人看的中文显示名' },
+      labels: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'resolve 必填：要解析的主题名列表；fact_set 时是新的主题列表（第一个为主主题）',
+      },
+      domainId: { type: 'integer', description: 'rename / archive / bridge_add 必填：目标主题 id（来自 list）' },
+      fromId: { type: 'integer', description: 'merge / bridge_add 必填：被合并掉 / 起点主题 id' },
+      toId: { type: 'integer', description: 'merge / bridge_add 必填：保留 / 终点主题 id' },
+      weight: { type: 'number', description: 'bridge_add 可选：桥接权重（0..1，默认 0.5）' },
+      parentId: { type: 'integer', description: 'create 可选：父主题 id（省略则自动挂到最近的已注册祖先，或 general）' },
+      factId: { type: 'string', description: 'fact_set / fact_get 必填：事实 id' },
+      status: { type: 'string', description: 'list 可选：主题状态（默认 active，也可用 merged / archived）' },
+      user: { type: 'string', description: '可选：归属用户 id（默认当前用户，跨会话共享）' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true },
+      render(args, value) {
+        return [{ type: 'text', text: renderDomainResult(args.action, value) }]
+      },
+    },
+    async execute(args, exec) {
+      if (deps.isEnabled?.() === false) throw disabledError()
+      const uid = args.user ?? userIdOf(exec, scope)
+      switch (args.action) {
+        case 'list': {
+          const domains = await call<any>('domain_list', {
+            user_id: uid,
+            ...(args.status !== undefined && args.status !== '' ? { status: args.status } : {}),
+          })
+          return { domains: domains ?? [] }
+        }
+        case 'resolve': {
+          const resolution = await call<any>('domain_resolve', {
+            user_id: uid,
+            labels: args.labels ?? [],
+            ...scopeParam(deps, exec),
+          })
+          return resolution ?? {}
+        }
+        case 'create': {
+          if (!args.name) throw new Error('memory_domains create requires name')
+          return await call<any>('domain_create', {
+            user_id: uid,
+            name: args.name,
+            display_name: args.displayName ?? '',
+            parent_id: args.parentId,
+          })
+        }
+        case 'rename': {
+          if (args.domainId === undefined) throw new Error('memory_domains rename requires domainId')
+          if (!args.name) throw new Error('memory_domains rename requires name')
+          return await call<any>('domain_rename', {
+            user_id: uid, domain_id: args.domainId, name: args.name,
+          })
+        }
+        case 'merge': {
+          if (args.fromId === undefined) throw new Error('memory_domains merge requires fromId')
+          if (args.toId === undefined) throw new Error('memory_domains merge requires toId')
+          return await call<any>('domain_merge', {
+            user_id: uid, from_id: args.fromId, to_id: args.toId,
+          })
+        }
+        case 'archive': {
+          if (args.domainId === undefined) throw new Error('memory_domains archive requires domainId')
+          return await call<any>('domain_archive', { user_id: uid, domain_id: args.domainId })
+        }
+        case 'bridge_add': {
+          if (args.fromId === undefined) throw new Error('memory_domains bridge_add requires fromId')
+          if (args.toId === undefined) throw new Error('memory_domains bridge_add requires toId')
+          return await call<any>('domain_bridge_add', {
+            user_id: uid,
+            from_id: args.fromId,
+            to_id: args.toId,
+            weight: args.weight ?? 0.5,
+          })
+        }
+        case 'unresolved':
+          return { signals: (await call<any>('domain_unresolved', { user_id: uid })) ?? [] }
+        case 'signal_reject': {
+          if (!args.name) throw new Error('memory_domains signal_reject requires name')
+          return await call<any>('domain_signal_reject', { user_id: uid, name: args.name })
+        }
+        case 'fact_set': {
+          if (!args.factId) throw new Error('memory_domains fact_set requires factId')
+          if (!args.labels || args.labels.length === 0) {
+            throw new Error('memory_domains fact_set requires labels')
+          }
+          return await call<any>('fact_domain_set', {
+            user_id: uid, fact_id: args.factId, domains: args.labels,
+          })
+        }
+        case 'fact_get': {
+          if (!args.factId) throw new Error('memory_domains fact_get requires factId')
+          return await call<any>('fact_domain_get', { user_id: uid, fact_id: args.factId })
+        }
+        default:
+          throw new Error(
+            `memory_domains: unknown action ${String(args.action)}`
+            + '（可用：list / resolve / create / rename / merge / archive / bridge_add / '
+            + 'unresolved / signal_reject / fact_set / fact_get）',
           )
       }
     },

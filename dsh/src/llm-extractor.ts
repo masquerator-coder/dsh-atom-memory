@@ -58,6 +58,21 @@ export interface ExtractedCandidate {
    * bind a scope on its own.
    */
   scope_hint?: string
+  /**
+   * What the fact is *about*, as canonical names (``["teaching/ds", "programming"]``).
+   *
+   * Unlike ``scope_hint`` this is acted on: the store resolves each name against
+   * the user's topic vocabulary, and a name the vocabulary does not hold becomes
+   * its nearest registered ancestor plus a queue entry for the user to decide on.
+   * The vocabulary lives in the Python store, so the prompt asks for these only
+   * as plain words; the store owns what they resolve to.
+   */
+  domain_hints?: string[]
+  /**
+   * Which of ``domain_hints`` is the main topic. Moved to the front before the
+   * cap is applied, so the model may list it anywhere.
+   */
+  primary_domain?: string
 }
 
 /** Minimal structural surface of the ``llm`` service. */
@@ -112,6 +127,22 @@ conditions per fact. Do NOT restate the subject or the topic as a condition.
 thread it came from - as a short phrase. It is a hint, not a decision: it helps
 place the fact, it never overrides where the session actually is. Use it only
 when the text names a place the fact belongs to; never invent one.
+For a fact that is true of the user themselves rather than of the current piece
+of work - a durable preference, a stable attribute ("likes coffee", "prefers
+concise answers", "writes in Chinese") - put the exact marker "user" here
+instead of a place name, or omit the field. Do not name the current project for
+such a fact: a preference captured while working on one chapter holds for every
+chapter, and naming the project would hide it from the others.
+
+"domain_hints" says WHAT TOPIC the fact is about - teaching, programming, life,
+travel - as 1 to 3 short lowercase ASCII names ("teaching", "teaching/ds",
+"programming"). It is a different question from scope_hint: a fact about writing
+Python while working on a lesson belongs to the course's scope but is about
+programming. Put the main topic first, or name it in "primary_domain". Use plain
+topic words rather than restating the subject, and omit both fields when the
+topic is not clear - the store derives one from where the work is happening. A
+topic name the store has never seen is not an error: it is filed under the
+nearest known topic and offered to the user for registration.
 
 CRITICAL - only extract facts that are worth remembering long-term:
 - Save durable, reusable knowledge: decisions, workflows, procedures, lessons,
@@ -527,6 +558,50 @@ function parseScopeHint(value: unknown): string | undefined {
   return trimmed.length > 0 ? trimmed : undefined
 }
 
+/** Most topic proposals one candidate may carry (the store caps again). */
+const MAX_DOMAIN_HINTS = 3
+
+/**
+ * Coerce the model's topic proposals into a usable list.
+ *
+ * The names are *not* validated into a vocabulary here: the vocabulary lives in
+ * the Python store, which resolves an unknown name to its nearest registered
+ * ancestor. This only drops what cannot be a name at all (non-strings, blanks)
+ * and de-duplicates, so a chatty model cannot make one fact carry a paragraph.
+ *
+ * @param value - The raw `domain_hints` field (a list, or a single string).
+ * @returns The proposals, or `undefined` when there are none.
+ */
+function parseDomainHints(value: unknown): string[] | undefined {
+  const raw = typeof value === 'string' ? [value] : value
+  if (!Array.isArray(raw)) return undefined
+  const out: string[] = []
+  for (const item of raw) {
+    if (typeof item !== 'string') continue
+    const name = item.trim()
+    if (name.length === 0 || out.includes(name)) continue
+    out.push(name)
+    if (out.length >= MAX_DOMAIN_HINTS) break
+  }
+  return out.length > 0 ? out : undefined
+}
+
+/**
+ * Keep a `primary_domain` only when it is one of the proposals.
+ *
+ * A primary the store cannot see is worse than none: it would silently become
+ * whichever label the resolver happened to put first.
+ *
+ * @param value - The raw `primary_domain` field.
+ * @param hints - The proposals it must belong to.
+ * @returns The matching proposal, or `undefined`.
+ */
+function parsePrimaryDomain(value: unknown, hints: string[] | undefined): string | undefined {
+  if (typeof value !== 'string' || !hints || hints.length === 0) return undefined
+  const name = value.trim()
+  return name.length > 0 && hints.includes(name) ? name : undefined
+}
+
 /**
  * Parse and sanitize the LLM's JSON output into typed candidates. Malformed or
  * non-object entries are dropped; a fully-invalid payload yields ``[]`` so the
@@ -552,6 +627,7 @@ export function parseCandidates(raw: string): ExtractedCandidate[] {
     // Belt-and-braces: drop transient process-only candidates the prompt
     // may have let through (asking/complaining/proposing this-turn talk).
     if (isEphemeral(c)) continue
+    const domainHints = parseDomainHints(c.domain_hints)
     out.push({
       subject: c.subject,
       predicate: c.predicate,
@@ -563,6 +639,8 @@ export function parseCandidates(raw: string): ExtractedCandidate[] {
       importance: parseScore(c.importance),
       conditions: parseConditions(c.conditions),
       scope_hint: parseScopeHint(c.scope_hint),
+      domain_hints: domainHints,
+      primary_domain: parsePrimaryDomain(c.primary_domain, domainHints),
     })
   }
   return out

@@ -101,6 +101,15 @@ class FactCandidate:
             *hint*, never a decision: the resolver treats it as a low-reliability
             content anchor (see :mod:`~atom_memory.context`) and only the store's
             own signals can bind a scope.
+        domain_hints: Optional extractor/explicit proposal of what the fact is
+            *about* (``["teaching/ds", "programming"]``). Unlike ``scope_hint``
+            this is a decision the store acts on, subject to the registry: a name
+            the vocabulary does not hold is replaced by its nearest registered
+            ancestor and recorded in the registration queue — it never becomes a
+            scope or a label of its own.
+        primary_domain: Which of ``domain_hints`` the extractor considers the main
+            topic. Must be one of them; when it is missing or unusable the first
+            resolved label becomes primary.
     """
 
     candidate_id: str
@@ -120,6 +129,8 @@ class FactCandidate:
     content: Optional[str] = None
     conditions: Optional[list] = None
     scope_hint: Optional[str] = None
+    domain_hints: Optional[list] = None
+    primary_domain: Optional[str] = None
 
     def is_complete(self) -> bool:
         """Return ``True`` when all three SPO fields are non-empty."""
