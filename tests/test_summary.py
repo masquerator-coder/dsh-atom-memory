@@ -433,6 +433,140 @@ def test_budget_is_a_hard_cap_including_the_footer():
         conn.close()
 
 
+# ---- the label a scope block renders under injection -------------------------
+
+
+def test_the_section_label_marker_is_two_hashes():
+    """标签标记是 ``## ``：注入端每行加 ``| `` 后，一个 ``#`` 与条目无法区分。
+
+    The dsh host prefixes every injected line with ``| `` so that no stored line
+    can occupy column zero. That prefix costs the artifact its first-character
+    hierarchy: under it ``| # 决策规则`` and ``| - 事实`` differ in one character
+    out of two and read as one flat list, which is exactly the complaint this
+    marker answers. The assertion is on the marker itself rather than on a
+    rendered string, because the property that matters is the *width relative to
+    a bullet*, and a test that only checked ``"## 决策规则" in md`` would pass
+    again the day someone rendered a two-hash heading by accident.
+    """
+    assert _COMPACT_LABEL_MARKER == "## "
+    assert not _COMPACT_LABEL_MARKER.startswith("- "), "a label must not look like a bullet"
+
+    conn = connect_for_tests()
+    try:
+        _insert_fact(conn, "f1", "决定", "先回滚再排查", memory_type="decision_rule")
+        md = _md(conn)
+        labels = [line for line in md.splitlines() if line.startswith("## ")]
+        assert labels == ["## 决策规则"]
+    finally:
+        conn.close()
+
+
+def test_a_path_value_keeps_its_tail_and_prose_keeps_its_head():
+    """路径从**尾部**截断，正文仍从头部截断——两者都仍受同一个字符上限。
+
+    ``C:\\Users\\fuqia\\.dsh\\profiles\\web\\node_m…`` ends at the one segment the
+    reader cannot guess, so head-clipping preserved a prefix of the location while
+    discarding its identity. The second half of the test is the guard on that
+    fix: front-clipping content would be strictly worse than the behaviour it
+    replaces, so prose must stay head-clipped.
+
+    The values are deliberately long enough to cross
+    :data:`_MAX_COMPACT_LINE_CHARS` — a short value is returned untouched by both
+    branches, so a test that used one would assert nothing.
+    """
+    conn = connect_for_tests()
+    try:
+        path = r"C:\Users\fuqia\.dsh\profiles\web\node_modules\dsh-im-gateway\lib\client.js"
+        prose = "稳定性：不崩、不乱码、可复现；速度：吞吐/延迟调优，另外还要考虑并发下的表现与退化路径"
+        _insert_fact(conn, "p1", "实现包路径", path)
+        _insert_fact(conn, "p2", "调研重点", prose)
+        md = _md(conn)
+        lines = md.splitlines()
+
+        path_line = next(line for line in lines if "实现包路径" in line)
+        # The last `_MAX_CLIPPED_PATH_SEGMENTS` components survive — the directory
+        # that names the install and the file itself. The drive letter is kept as
+        # part of the prefix, so the ellipsis lands *inside* the path rather than
+        # at the delimiter.
+        assert "lib" in path_line and "client.js" in path_line, path_line
+        assert path_line.startswith("- 实现包路径: "), path_line
+        assert "…" in path_line and path_line.index("…") < path_line.index("lib"), path_line
+        assert "fuqia" not in path_line, "the head of the path is what gets dropped"
+
+        prose_line = next(line for line in lines if "调研重点" in line)
+        assert "稳定性" in prose_line, "prose must not be tail-clipped"
+        assert "吞吐/延迟调优" in prose_line, "a slash pair in prose is not a path"
+
+        # Both forms still respect the one cap that bounds every rendered line.
+        for line in lines:
+            assert len(line) <= _MAX_COMPACT_LINE_CHARS, line
+    finally:
+        conn.close()
+
+
+def test_a_path_with_chinese_directory_names_is_still_a_path():
+    """带中文目录名的路径仍判为路径：本部署的项目目录普遍是中文。
+
+    Anchoring has to be decided before the "contains CJK" prose signal, because
+    ``C:\\Users\\…\\AI智慧课程\\…`` is a path this user actually stores and a
+    prose-first check silently sent it back to head-clipping.
+    """
+    conn = connect_for_tests()
+    try:
+        path = r"C:\Users\fuqia\Documents\AIWorkspace\AI智慧课程\scripts\templates\render.py"
+        _insert_fact(conn, "p1", "脚本模板位置", path)
+        md = _md(conn)
+        line = next(line for line in md.splitlines() if "脚本模板位置" in line)
+
+        assert "templates" in line and "render.py" in line, line
+        assert "AI智慧课程" not in line, "the head is what gets dropped, CJK or not"
+        assert "…" in line, line
+    finally:
+        conn.close()
+
+
+def test_prose_with_slashes_is_not_mistaken_for_a_path():
+    """含斜杠的正文不是路径：``…/ 下一步：X`` 这类行曾被前端截断，信息归零。
+
+    The first version of the path branch keyed on "contains two separators",
+    which swept up memory bodies that quote other predicates. Tail-clipping those
+    keeps the sentence's tail and throws away what it was about, so the test pins
+    the negative case as hard as the positive one.
+    """
+    conn = connect_for_tests()
+    try:
+        body = "Python 规则引擎新增「待办：X / 下一步：X / TODO: X」兜底（type=task），并且迁移期不改任何 schema"
+        _insert_fact(conn, "b1", "抽取端", "占位", memory_type="sop", content=body)
+        md = _md(conn)
+        line = next(line for line in md.splitlines() if "Python 规则引擎" in line)
+
+        assert line.startswith("- Python 规则引擎"), line
+        assert not line.startswith("- …"), line
+    finally:
+        conn.close()
+
+
+def test_the_documented_path_example_is_the_rendered_one():
+    """文档里引用的截断例子必须就是真实输出，否则文档会静默变成谎言。
+
+    `docs/scopes.md` §6, `README.md` and `README.zh.md` all quote this exact
+    rewrite, so it is pinned here: a change to the path branch that keeps the
+    tests green while invalidating the quoted example would leave the docs
+    describing a shape the renderer no longer produces.
+    """
+    conn = connect_for_tests()
+    try:
+        _insert_fact(
+            conn, "p1", "实现包路径",
+            r"C:\Users\fuqia\.dsh\profiles\web\node_modules",
+        )
+        md = _md(conn)
+        line = next(line for line in md.splitlines() if "实现包路径" in line)
+        assert line == r"- 实现包路径: C:…web\node_modules", line
+    finally:
+        conn.close()
+
+
 def test_an_unusable_budget_yields_nothing_not_a_notice():
     """A budget below the footer's own cost renders empty text, on purpose.
 
@@ -797,8 +931,12 @@ def test_incremental_selection_charges_each_label_what_it_renders():
         )
         ceilings.add(estimate_tokens(rendered))
     # The sweep must actually cross the artifact's full size, or the assertion
-    # above would hold vacuously (an empty render fits every budget).
-    assert max(ceilings) >= 28
+    # above would hold vacuously (an empty render fits every budget). 23 is the
+    # full two-label artifact: 12 tokens of body plus the 11-token footer. The
+    # bound is deliberately the *measured* size rather than a loose one — a loose
+    # bound stops being a check the day the artifact shrinks under it, which is
+    # exactly what happened when the footer lost its "N 条事实 · 类型分布：" prefix.
+    assert max(ceilings) >= 23
 
 
 def test_selecting_a_large_render_is_not_quadratic():

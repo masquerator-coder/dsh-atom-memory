@@ -36,6 +36,7 @@ because it lives in the section that sorts last.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from typing import List, Mapping, Optional, Sequence, Tuple
@@ -145,12 +146,32 @@ _SECTION_ORDER = [
 
 _EMPTY_NOTICE = "_暂无持久化的原子记忆。_ (No active atomic facts yet.)"
 
-# Marker opening a compact section label (``# 决策规则``). Held as a constant
+# Marker opening a compact section label (``## 决策规则``). Held as a constant
 # because it is measured as well as rendered: `_select` accounts for the label's
 # cost while it trims the artifact, so a marker that only existed inside
 # `_render_body` would let the budget under-count every surviving section — by
 # one token per label, which is exactly the kind of leak the hard cap forbids.
-_COMPACT_LABEL_MARKER = "# "
+#
+# Two hashes, not one: the dsh host prefixes every injected line with ``| ``
+# (`dsh/src/memory-data.ts`) so that no stored line can occupy column zero. That
+# prefix costs the artifact its first-character hierarchy — under it a label
+# (``| # …``) and a bullet (``| - …``) differ in one character out of two, which
+# reads as one flat list. Widening the label to ``## `` restores the distinction
+# *after* the prefix, at one extra character per label (a Chinese title pair, so
+# the estimate does not move). The marker must stay a hash rather than a longer
+# banner: it is paid for once per section on every request of every session.
+_COMPACT_LABEL_MARKER = "## "
+
+# Separator between two scope blocks, replacing the blank line the single-block
+# artifact uses.
+#
+# A blank line does not survive injection: the host prefixes it too, so the block
+# boundary arrives as ``| `` — a line that looks like a content line carrying
+# nothing. A single colon is the cheapest mark that reads as structure (1 token,
+# measured) and, under the ``| `` prefix, gives the four line kinds four distinct
+# first characters: ``[`` block heading, ``#`` section label, ``-`` fact, ``:``
+# separator.
+_BLOCK_SEPARATOR = ":"
 
 # -- scope blocks (design §6.7) -----------------------------------------------
 #
@@ -184,6 +205,12 @@ _BLOCK_DROP_TOKENS = 10
 #: so this reaches the fixpoint of any realistic layout; the cap exists so a
 #: pathological budget cannot make rendering loop.
 _BLOCK_SHRINK_PASSES = 8
+
+#: Passes allowed for the block heading / selection fixpoint (see
+#: :func:`_assemble_blocks`). Two would do for any heading whose width changes by
+#: a few characters; the third is slack so a pathological case settles rather
+#: than exits mid-loop.
+_BLOCK_HEADING_PASSES = 3
 
 #: Short Chinese label per scope type, used in block headings.
 _SCOPE_LABELS = {
@@ -469,7 +496,7 @@ def _compose_blocks(blocks: List[_Block], max_tokens: int) -> str:
     # count would trade a memory for a statistic.
     body, footer = _assemble_blocks(active, sections_by_block, budgets, split=True)
     if footer:
-        with_footer = f"{body}\n\n{footer}" if body else footer
+        with_footer = _join_footer(body, footer)
         if estimate_tokens(with_footer) <= max_tokens:
             return with_footer
     if body and estimate_tokens(body) <= max_tokens:
@@ -521,14 +548,43 @@ def _assemble_blocks(
         budget = budgets.get(block.key)
         if not sections or budget is None or budget <= 0:
             continue
-        heading = f"[{block.title}] · {len(block.facts)} 条"
-        heading_cost = estimate_tokens(heading)
-        if budget <= heading_cost:
-            continue
-        kept = _select(sections, budget - heading_cost, footer=False)
-        body = _render_body(sections, kept)
+        # The heading is derived from the selection, and the selection is charged
+        # for the heading — a circularity that a single pass cannot satisfy. Two
+        # passes with a fixpoint check: select under the whole budget, build the
+        # real heading from that selection, and if the two together do not fit,
+        # re-select with the heading charged. `_BLOCK_HEADING_PASSES` bounds the
+        # loop; each pass can only shrink the selection, and a heading's own width
+        # changes by at most a few characters when it does, so the second pass is
+        # the one that normally settles it.
+        #
+        # A heading quoting the block's *original* fact count (``len(block.facts)``)
+        # needs none of this and is what the code used to do — but it contradicts
+        # the lines below it whenever the budget trims the block, by an amount that
+        # grows as the squeeze gets tighter, which is precisely when the reader is
+        # relying on the counts to see what was lost.
+        kept = _select(sections, budget, footer=False)
+        for _pass in range(_BLOCK_HEADING_PASSES):
+            if not kept:
+                break
+            heading = _render_block_heading(block, sections, kept)
+            heading_cost = estimate_tokens(heading)
+            if budget <= heading_cost:
+                kept = {}
+                break
+            if estimate_tokens(_render_body(sections, kept)) + heading_cost <= budget:
+                break
+            smaller = _select(sections, budget - heading_cost, footer=False)
+            if smaller == kept:
+                # Charging for the heading no longer changes the selection, so
+                # this is the fixpoint: the heading describes `kept` exactly.
+                break
+            kept = smaller
+        body = _render_body(sections, kept) if kept else ""
         if not body:
             continue
+        # The heading must be rebuilt from the final selection: the loop above can
+        # exit on an iteration that changed `kept`.
+        heading = _render_block_heading(block, sections, kept)
         parts.append(heading + "\n" + body)
         for title, lines in sections.items():
             count = len(kept.get(title) or ())
@@ -537,13 +593,53 @@ def _assemble_blocks(
                 kept_totals[title] = kept_totals.get(title, 0) + count
             elif title not in hidden:
                 hidden.append(title)
-    body = "\n\n".join(parts)
+    body = ("\n" + _BLOCK_SEPARATOR + "\n").join(parts)
     footer_text = _render_footer(omitted_total, hidden, kept_totals) if parts else ""
     if split:
         return body, footer_text
     if not footer:
         return body
-    return body + "\n\n" + footer_text if body and footer_text else (body or footer_text)
+    return _join_footer(body, footer_text)
+
+
+def _join_footer(body: str, footer_text: str) -> str:
+    """Append the footer to the body with a separator that survives injection.
+
+    Never a blank line: the dsh host prefixes every line, blank ones included, so
+    a blank separator reaches the prompt as ``| `` — a line that looks like
+    content carrying nothing. :data:`_BLOCK_SEPARATOR` is the same mark the blocks
+    use, so there is exactly one way this artifact separates its parts.
+    """
+    if body and footer_text:
+        return body + "\n" + _BLOCK_SEPARATOR + "\n" + footer_text
+    return body or footer_text
+
+
+def _render_block_heading(block: "_Block", sections: Mapping[str, dict], kept: Mapping) -> str:
+    """Render one block's heading: what the block is, and what it actually holds.
+
+    ``[当前项目: dsh-atom-memory · 8 条 · 决策规则 6 · 教训 1]`` — the scope label,
+    the number of lines the block renders, and its type breakdown. Three facts in
+    one line, because the alternative (a heading plus one breakdown line per
+    block) pays the per-line cost twice on every request of every session.
+
+    The count is the **rendered** line count, not ``len(block.facts)``. That
+    distinction is the whole point of deriving the heading from ``kept``: the
+    original count is what the block *started* with, and at a tight budget it is
+    a number the block visibly does not deliver.
+
+    Only sections that survived are named, so the breakdown and the body below it
+    always describe the same set.
+    """
+    counts = [
+        (title, len(kept.get(title) or ()))
+        for title in sections
+    ]
+    counts = [(title, count) for title, count in counts if count]
+    rendered = sum(count for _title, count in counts)
+    breakdown = " · ".join(f"{title} {count}" for title, count in counts)
+    tail = f" · {breakdown}" if breakdown else ""
+    return f"[{block.title} · {rendered} 条{tail}]"
 
 
 # -- loading ------------------------------------------------------------------
@@ -823,6 +919,21 @@ def _render_footer(omitted: int, hidden: List[str], kept: dict) -> str:
         hidden: Titles of the sections dropped in full.
         kept: The surviving ``section title -> line count`` mapping.
 
+    The count/inventory line says **按行** (by line) and not *条事实* (facts). The
+    numbers in it are line counts: a folded preference list stands for several
+    facts on one line and a to-do list renders one line per item, so summing it
+    and calling the result a fact count was simply wrong — and it invited the
+    reader to compare it against a fact count elsewhere that is counted a
+    different way. What the line *is* good for is the breakdown, which says
+    which kinds of memory this digest is spending its budget on; the per-block
+    share of the same information now lives in the block headings, so the footer
+    only carries the whole-artifact total and what was dropped.
+
+    Each block heading already names the types *that block* holds, so repeating
+    them here would pay for the same words twice; this line is the artifact-wide
+    view, which is why it can disagree with an individual block without either
+    being wrong.
+
     The count/inventory lines use ``-- `` rather than markdown's ``> ``: the
     footer is summary material, not a quotation, and once the dsh host prefixes
     every line with ``| `` a quote marker renders as the meaningless ``| > ``.
@@ -830,10 +941,8 @@ def _render_footer(omitted: int, hidden: List[str], kept: dict) -> str:
     Returns:
         The footer text.
     """
-    lines = [
-        f"-- {sum(kept.values())} 条事实 · 类型分布："
-        + " · ".join(f"{title} {count}" for title, count in kept.items())
-    ]
+    breakdown = " · ".join(f"{title} {count}" for title, count in kept.items())
+    lines = [f"-- （按行）{breakdown}" if breakdown else "-- （按行）"]
     if omitted or hidden:
         lines.append(
             f"-- 已省略 {omitted} 条低优先级记忆"
@@ -971,13 +1080,127 @@ def _clip(text: str, limit: int) -> str:
     that bounds a rendered line by ``limit`` can rely on ``len(result) <= limit``.
     (Appending the ellipsis on top of ``limit`` characters, as this used to do,
     made every "cap" one character larger than advertised.)
+
+    A value that ends in a filesystem path is truncated from the **front**
+    instead of the back. Head-clipping is right for prose — the opening words say
+    what the sentence is about — and exactly wrong for a path, where the
+    discriminating part is the last component: ``C:\\Users\\fuqia\\.dsh\\profiles\\web\\node_m…``
+    ends at the one segment the reader cannot guess, so it survives the cap as a
+    prefix of the real location while carrying none of its identity. Both forms
+    still fit ``limit`` exactly, so the budget arithmetic is untouched.
     """
     text = " ".join(text.split())
     if len(text) <= limit:
         return text
     if limit <= 1:
         return text[:max(limit, 0)]
+    match = _TRAILING_PATH_RE.search(text) or _TRAILING_PATH_AT_START_RE.search(text)
+    if match is not None:
+        prefix = text[: match.start()]
+        # `limit - len(prefix) - 1` leaves room for the ellipsis this branch
+        # prepends; _tail_segments never adds one of its own.
+        tail = _tail_segments(match.group(0), limit - len(prefix) - 1)
+        if tail:
+            return prefix + "…" + tail
     return text[:limit - 1] + "…"
+
+
+# A filesystem path occupying the **end** of a rendered line.
+#
+# Matched by shape rather than by first splitting the line at its delimiter: the
+# line the clip sees is the whole rendered line (`- 实现包路径: C:\…\client.js`),
+# so a test anchored at position 0 never fires, and a split-then-test approach
+# has to get the split offset right against drive letters
+# (`C:\` contains a delimiter-shaped colon). One regex has neither problem: it
+# finds the path wherever it sits, and everything before it is prefix.
+#
+# Three conditions keep prose out, and each one was needed:
+#
+#  * the match must run to the end of the line;
+#  * it must start at a value boundary — a delimiter, the bullet, or the start of
+#    the line — rather than mid-word, so `吞吐/延迟调优` inside a sentence is not a
+#    candidate at all;
+#  * a relative path's first component may not contain CJK. A bare `a/b` segment
+#    is far more often a slash-joined pair of Chinese nouns (`稳定性/速度`) than a
+#    directory, whereas an *anchored* path may contain CJK freely — Chinese
+#    directory names are the norm here (`…\AI智慧课程\scripts\templates`).
+_TRAILING_PATH_RE = re.compile(
+    r"""(?<=[\s:：])
+        (?:
+          [A-Za-z]:[\\/][^\s]*                  # a drive-letter path: C:\...
+        | \\\\[^\s\\/]+[\\/][^\s]*              # a UNC path: \\host\share\...
+        | [\\/][^\s\\/]+[\\/][^\s]*             # a rooted path: \Users\... or /usr/...
+        | [A-Za-z0-9._-]+[\\/][^\s]*            # a relative path: src/channels/...
+        )
+        $
+    """,
+    re.VERBOSE,
+)
+
+# The same shapes at the very start of the line, where the `(?<=…)` lookbehind
+# above has nothing to match. Kept separate because Python's `re` cannot express
+# "start of string or one of these characters" as a single fixed-width lookbehind.
+_TRAILING_PATH_AT_START_RE = re.compile(
+    r"""^
+        (?:
+          [A-Za-z]:[\\/][^\s]*                  # C:\...
+        | \\\\[^\s\\/]+[\\/][^\s]*              # \\host\share\...
+        | [\\/][^\s\\/]+[\\/][^\s]*             # \Users\... or /usr/...
+        | [A-Za-z0-9._-]+[\\/][^\s]*            # src/channels/...
+        )
+        $
+    """,
+    re.VERBOSE,
+)
+
+
+# How many trailing path segments a tail-clipped path keeps. One segment is the
+# discriminating part, but a directory whose own name is generic (``web``,
+# ``src``) reads better with its parent.
+_MAX_CLIPPED_PATH_SEGMENTS = 2
+
+
+def _tail_segments(text: str, limit: int) -> str:
+    """Return the last path segments of ``text``, fitting ``limit`` characters.
+
+    Walks the components from the right and keeps the final
+    :data:`_MAX_CLIPPED_PATH_SEGMENTS` of them, joined by their original
+    separators, until ``limit`` is reached — whichever comes first. A
+    caller-prepended ellipsis is not this function's business, so it never renders
+    one, and the result never *begins* with a separator (a leading separator would
+    read as a rooted path that the ellipsis already replaced).
+
+    Falls back to a plain tail slice when not even one component fits, so the
+    result is never longer than ``limit``.
+    """
+    parts = [part for part in re.split(r"([\\/])", text) if part]
+    kept: List[str] = []
+    length = 0
+    segments = 0
+    index = len(parts) - 1
+    while index >= 0:
+        part = parts[index]
+        if part in "\\/":
+            # A separator is kept only when a component already sits to its right,
+            # and never as the leftmost thing in the result.
+            if kept:
+                kept.insert(0, part)
+                length += 1
+            index -= 1
+            continue
+        if segments >= _MAX_CLIPPED_PATH_SEGMENTS or length + len(part) > limit:
+            break
+        kept.insert(0, part)
+        length += len(part)
+        segments += 1
+        index -= 1
+    # A separator that survived without a component to its left is dead weight.
+    while kept and kept[0] in "\\/":
+        kept.pop(0)
+    while kept and kept[-1] in "\\/":
+        kept.pop()
+    tail = "".join(kept)
+    return tail if tail else text[-limit:]
 
 
 def _select(sections: dict, max_tokens: int, footer: bool = True) -> dict:
@@ -1091,7 +1314,15 @@ def _select(sections: dict, max_tokens: int, footer: bool = True) -> dict:
         foot = token_cost(_render_footer(omitted, hidden, counts))
         if totals["parts"] == 0:
             return (foot[1], foot[2])
-        return (totals["cjk"] + foot[1], totals["other"] + foot[2] + 2)
+        # The body/footer join is ``"\n" + _BLOCK_SEPARATOR + "\n"``: two newlines,
+        # "other" characters like any other, plus the separator itself. Derived
+        # from the constants rather than written as a literal "+2", because a
+        # hard-coded count is how the incremental measurement would silently stop
+        # agreeing with the artifact the caller receives — the one thing this
+        # function exists to prevent. Asserted by
+        # `test_incremental_selection_matches_the_reference_exactly`.
+        gap_cjk, gap_other = token_cost(_BLOCK_SEPARATOR + "\n\n")[1:]
+        return (totals["cjk"] + foot[1] + gap_cjk, totals["other"] + foot[2] + gap_other)
 
     for _score, order_index, line_index in give_up:
         if _tokens_for_totals(_artifact_totals()) <= max_tokens:
@@ -1130,8 +1361,12 @@ def _render_body(sections: dict, kept: dict) -> str:
     keep their original (score-descending) order inside a section: the selection
     chooses *what* survives, never the layout.
 
-    Each label gets the ``# `` marker (see :func:`_render_compact` for why one
-    hash), so a section stays findable by jumping to the next ``# `` line.
+    Each label gets the ``## `` marker rather than a single hash: under the dsh
+    host's per-line ``| `` prefix a one-hash label and a ``- `` bullet differ in
+    one character out of two and read as one flat list (see
+    :data:`_COMPACT_LABEL_MARKER`), so the label must stay visibly wider than the
+    bullets it heads, and a section stays findable by jumping to the next
+    ``## `` line.
     """
     parts: List[str] = []
     for title, lines in sections.items():
@@ -1158,7 +1393,7 @@ def _compose(sections: dict, kept: dict, footer: bool = True) -> str:
     hidden = [title for title in sections if not kept.get(title)]
     omitted = sum(len(lines) for lines in sections.values()) - sum(counts.values())
     foot = _render_footer(omitted, hidden, counts)
-    return body + "\n\n" + foot if body else foot
+    return _join_footer(body, foot)
 
 
 def _render_detail(buckets: dict, user_id: str, max_tokens: int) -> str:

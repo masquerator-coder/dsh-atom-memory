@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import uuid
 
 import pytest
@@ -793,14 +794,14 @@ def test_the_digest_names_the_blocks_it_renders(conn, config):
     text = generate_summary(
         conn, "u", 400, detail=False, scope_context=PROJECT_A, config=config
     )
-    assert "[当前项目: api]" in text
-    assert "[客户: acme]" in text
-    assert "[阶段: draft]" in text
-    assert "[全局规则]" in text
+    assert "[当前项目: api · 1 条 · 属性 1]" in text
+    assert "[客户: acme · 1 条 · 偏好 1]" in text
+    assert "[阶段: draft · 1 条 · 属性 1]" in text
+    assert "[全局规则 · 1 条 · 属性 1]" in text
     assert "不要提交密钥" in text
     # The block headings are the point: without them a project rule and a company
     # rule read as two contradicting statements.
-    assert text.index("[当前项目: api]") < text.index("[全局规则]")
+    assert text.index("[当前项目: api") < text.index("[全局规则")
 
 
 def test_the_scoped_digest_never_exceeds_its_budget(conn, config):
@@ -823,6 +824,111 @@ def test_the_scoped_digest_never_exceeds_its_budget(conn, config):
             conn, "u", budget, detail=False, scope_context=PROJECT_A, config=config
         )
         assert estimate_tokens(text) <= budget, f"budget {budget} overshot"
+
+
+def test_a_block_heading_counts_what_the_block_renders(conn, config):
+    """块头里的条数必须等于它下面真正渲染出的条目数。
+
+    The heading used to quote ``len(block.facts)`` — the count the block *started*
+    with — while the lines under it were whatever survived the budget. At a tight
+    budget the two disagree, and they disagree by more the tighter the squeeze
+    gets, which is exactly when a reader trusts the number to see what was lost.
+    The heading is now derived from the selection, so the count is checkable
+    against the body it sits above.
+    """
+    from atom_memory.retriever import estimate_tokens
+
+    store = ScopeStore(conn, config)
+    project = store.create(
+        "project", "github.com/acme/api",
+        signals=[__import__("atom_memory.context", fromlist=["make_signal"]).make_signal(
+            "git_remote", "git@github.com:acme/api.git")],
+    )
+    for index in range(12):
+        add_fact(conn, [project], subject="项目", predicate=f"规范{index}",
+                 obj=f"项目规则{index}")
+    for index in range(12):
+        add_fact(conn, [GLOBAL_SCOPE_ID], subject="全局", predicate=f"约定{index}",
+                 obj=f"全局约定{index}")
+
+    for budget in (150, 250, 400, 800):
+        text = generate_summary(
+            conn, "u", budget, detail=False, scope_context=PROJECT_A, config=config
+        )
+        assert estimate_tokens(text) <= budget
+        # Split on the block headings; each heading owns the lines up to the next
+        # one (or the footer), and its count must match the bullets in that span.
+        blocks = re.split(r"^\[(?=[^\]]*\]\s*$)", text, flags=re.M)[1:]
+        assert blocks, f"no block headings at budget {budget}: {text!r}"
+        for block in blocks:
+            heading, _, rest = block.partition("]\n")
+            body = rest.split("\n-- ")[0]
+            bullets = [line for line in body.splitlines() if line.startswith("- ")]
+            claimed = int(re.search(r"· (\d+) 条", heading).group(1))
+            assert claimed == len(bullets), (budget, heading, body)
+
+
+def test_a_block_heading_names_only_the_types_it_renders(conn, config):
+    """块头的类型分布只列真正存在于该块的分组，且与正文一致。"""
+    store = ScopeStore(conn, config)
+    project = store.create(
+        "project", "github.com/acme/api",
+        signals=[__import__("atom_memory.context", fromlist=["make_signal"]).make_signal(
+            "git_remote", "git@github.com:acme/api.git")],
+    )
+    add_fact(conn, [project], subject="项目", predicate="规范", obj="项目规则")
+    add_fact(conn, [GLOBAL_SCOPE_ID], subject="全局", predicate="偏好", obj="正式语气")
+    conn.execute(
+        "UPDATE facts SET type = 'decision_rule' WHERE predicate = '规范'"
+    )
+    conn.execute("UPDATE facts SET type = 'lesson' WHERE predicate = '偏好'")
+    conn.commit()
+
+    text = generate_summary(
+        conn, "u", 400, detail=False, scope_context=PROJECT_A, config=config
+    )
+    assert "[当前项目: api · 1 条 · 决策规则 1]" in text
+    assert "[全局规则 · 1 条 · 教训 1]" in text
+    # A type the block does not contain must not be named in its heading.
+    assert "偏好" not in text.split("[全局规则")[0]
+
+    # The footer carries the artifact-wide view and no longer says "facts": the
+    # numbers are rendered *lines*, and a folded preference list or a to-do list
+    # makes "lines" and "facts" differ by construction.
+    assert "类型分布" not in text
+    assert "条事实" not in text
+    assert "-- （按行）" in text
+
+
+def test_scope_blocks_are_separated_by_a_line_that_survives_injection(conn, config):
+    """块之间用一个 ``:`` 行分隔，而不是空行——空行注入后变成 ``| ``。
+
+    The host prefixes every line, blank ones included, so a blank separator
+    arrives as a line holding nothing but the prefix. A single colon costs one
+    token, reads as structure, and gives the four line kinds four distinct first
+    characters under the prefix: ``[`` heading, ``#`` label, ``-`` fact, ``:``
+    separator.
+    """
+    store = ScopeStore(conn, config)
+    project = store.create(
+        "project", "github.com/acme/api",
+        signals=[__import__("atom_memory.context", fromlist=["make_signal"]).make_signal(
+            "git_remote", "git@github.com:acme/api.git")],
+    )
+    add_fact(conn, [project], subject="项目", predicate="规范", obj="项目规则")
+    add_fact(conn, [GLOBAL_SCOPE_ID], subject="全局", predicate="规则", obj="不要提交密钥")
+
+    text = generate_summary(
+        conn, "u", 400, detail=False, scope_context=PROJECT_A, config=config
+    )
+    lines = text.splitlines()
+    assert ":" in lines
+    assert "" not in lines, "a blank line would inject as a bare '| '"
+    # The separator sits between the blocks, not inside one.
+    assert lines.index(":") > lines.index("## 属性")
+    assert lines.index(":") < next(
+        index for index, line in enumerate(lines) if line.startswith("[全局规则")
+    )
 
 
 def test_the_current_scope_and_the_global_rules_survive_a_squeeze(conn, config):
@@ -852,8 +958,8 @@ def test_the_current_scope_and_the_global_rules_survive_a_squeeze(conn, config):
         conn, "u", 90, detail=False, scope_context=PROJECT_A, config=config
     )
     assert estimate_tokens(text) <= 90
-    assert "[当前项目: api]" in text
-    assert "[全局规则]" in text
+    assert "[当前项目: api" in text
+    assert "[全局规则" in text
 
 
 def test_another_projects_phase_is_not_injected_as_this_projects_phase(conn, config):
@@ -895,7 +1001,7 @@ def test_a_condition_matching_fact_from_another_scope_gets_its_own_block(conn, c
     payload = dict(PROJECT_A, conditions={"doc_type": "proposal"})
     text = generate_summary(conn, "u", 400, detail=False, scope_context=payload,
                             config=config)
-    assert "[条件规则: doc_type=proposal]" in text
+    assert "[条件规则: doc_type=proposal" in text
     assert "先写执行摘要" in text
     assert "与提案无关" not in text, "no condition match, so not injected"
 

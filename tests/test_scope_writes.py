@@ -566,7 +566,7 @@ def test_recall_and_summary_carry_the_scope_context(tmp_path, monkeypatch):
             digest = await mem.summary(
                 "u", 400, detail=False, scope_context=PROJECT_A
             )
-            assert "[当前项目: api]" in digest
+            assert "[当前项目: api" in digest
             flat = await mem.summary("u", 400, detail=False)
             assert "[当前项目" not in flat
         finally:

@@ -230,13 +230,35 @@ let _initProto;function _applyDecs(e,t,n,r,o,i){var a,c,u,s,f,l,p,d=Symbol.metad
 *
 * @param line - A line of memory content.
 * @returns The line, prefixed with {@link MEMORY_LINE_PREFIX}.
-*/function fenceMemoryLine(line){return`| ${line.replace(/\u0000/gu,"")}`;}/**
+*/function fenceMemoryLine(line){return`| ${line.replace(/\u0000/gu,"")}`;}/** Prefix of a scope-block heading line (`[当前项目: api · 2 条 · 决策规则 1]`). */const BLOCK_HEADING_OPEN="[";/** Prefix of a section label line inside a block (`## 决策规则`). */const SECTION_LABEL_OPEN="## ";/**
+* Fold a block heading into the section label that follows it.
+*
+* The scoped digest arrives as a heading line followed by a label line:
+*
+* ```
+* [当前项目: api · 2 条 · 决策规则 1]
+* ## 决策规则
+* ```
+*
+* Two lines that describe the same thing, each paying the per-line cost of the
+* `| ` prefix on every request of every session. Folding them into one keeps the
+* hierarchy and drops a line: `[当前项目: api · 2 条] ## 决策规则`.
+*
+* Only that exact adjacency is folded — a heading whose next line is a fact, a
+* separator or another heading is left alone, because there the two lines are not
+* describing the same thing. This is a rendering of the digest the Python half
+* produced, not a re-parse of it: nothing else about the layout is touched, and a
+* digest in the flat (single-section) shape passes through untouched.
+*
+* @param lines - The sanitised digest lines.
+* @returns The lines with every heading/label pair merged.
+*/function foldBlockHeadings(lines){const out=[];for(let i=0;i<lines.length;i+=1){const line=lines[i];const next=lines[i+1];if(line.startsWith(BLOCK_HEADING_OPEN)&&line.endsWith("]")&&next?.startsWith(SECTION_LABEL_OPEN)){out.push(`${line} ${next}`);i+=1;continue;}out.push(line);}return out;}/**
 * Render a memory digest as a fenced, line-prefixed data block.
 *
 * @param digest - The compact memory digest (already rendered by the Python half).
 * @param options - `header` overrides the default header text.
 * @returns The complete block, or `''` when there is nothing to render.
-*/function renderMemoryDataBlock(digest,options={}){const cleaned=sanitizeMemoryText(digest);if(!cleaned)return"";const lines=cleaned.split("\n").map(fenceMemoryLine);return[options.header??DEFAULT_MEMORY_HEADER,"",MEMORY_BLOCK_BEGIN,...lines,MEMORY_BLOCK_END].join("\n");}/**
+*/function renderMemoryDataBlock(digest,options={}){const cleaned=sanitizeMemoryText(digest);if(!cleaned)return"";const lines=foldBlockHeadings(cleaned.split("\n")).map(fenceMemoryLine);return[options.header??DEFAULT_MEMORY_HEADER,"",MEMORY_BLOCK_BEGIN,...lines,MEMORY_BLOCK_END].join("\n");}/**
 * Header wrapped around the snapshot. Kept short on purpose: tool guidance
 * already lives in the awareness section, so this states only the contract the
 * block itself needs — what it is, and that it is not an instruction.

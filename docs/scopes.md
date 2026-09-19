@@ -205,20 +205,48 @@ phase mismatch; only an explicit disagreement is discounted).
 The session-start snapshot is rendered as blocks instead of one flat list:
 
 ```
-[当前项目: api] · 2 条
-# 决策规则
+[当前项目: api · 2 条 · 决策规则 1 · 属性 1] ## 决策规则
 - 提交前跑测试
-
-[客户: acme] · 1 条
-# 偏好
+## 属性
+- 框架: FastAPI
+:
+[客户: acme · 1 条 · 偏好 1] ## 偏好
 - 正式语气
-
-[全局规则] · 3 条
+:
+[全局规则 · 3 条 · 决策规则 3] ## 决策规则
 ...
 
--- 7 条事实 · 类型分布：决策规则 5 · 偏好 1 · 属性 1
+-- （按行）决策规则 4 · 属性 1 · 偏好 1
 ```
 
+Every line kind has a distinct **first character** — `[` heading, `#` section
+label, `-` fact, `:` separator, `-` footer — and that is a requirement rather than
+a coincidence. The dsh host prefixes every injected line with `| ` so that no
+stored line can occupy column zero ([memory semantics](memory-semantics.md) §5),
+which costs the artifact the leading character it used to have. So the markers are
+chosen to stay distinguishable *after* the prefix: one `#` was too close to a
+`-` bullet (differing in one character out of two, which read as one flat list),
+and a blank line separator arrived as a bare `| `.
+
+The host then folds each block heading into the section label that follows it
+(`dsh/src/memory-data.ts`, `foldBlockHeadings`): those two lines describe the same
+block, and each was paying the per-line prefix cost on every request, so they
+become one line carrying both. Only that exact adjacency is folded — a heading
+whose next line is a fact or a separator is left alone — so the block above is
+what actually reaches the model, while the digest the Python half returns still
+carries the two lines separately.
+
+* Each block heading carries the scope label, the number of lines it **actually
+  renders**, and the type breakdown of those lines. The count is derived from the
+  selection, not from the block's original size, so it can never contradict the
+  body beneath it — at a tight budget a block visibly renders fewer lines, and a
+  heading quoting what it *started* with would disagree by exactly the amount the
+  reader is trying to measure.
+* The footer carries the **artifact-wide** view and counts *lines*, which is why
+  it says 按行 rather than 条事实: a folded preference list stands for several facts
+  on one line, and a to-do list renders one item per line, so "lines" and "facts"
+  differ by construction. It may therefore disagree with an individual block
+  heading without either being wrong.
 * Each block has its **own budget**; the current scope gets the largest share and
   the global block has a reserved minimum, because "全局规则始终包含" is only true
   if a large project block cannot spend the reserve first.
@@ -227,6 +255,12 @@ The session-start snapshot is rendered as blocks instead of one flat list:
   ancestors → current scope → global rules last), then the footer (the one line
   that carries no memory), then whole blocks. An oversized digest is the failure
   mode a budget exists to prevent.
+* A value that ends in a filesystem path is clipped from the **front**, keeping
+  its last two components: `C:\Users\fuqia\.dsh\profiles\web\node_modules` becomes
+  `C:…web\node_modules` instead of the unusable
+  `C:\Users\fuqia\.dsh\profiles\web\node_m…`. Everything else is still clipped
+  from the back, because for prose the opening words are what say what the
+  sentence is about.
 * Facts bound to a scope that is neither visible nor condition-matched are **not
   injected at all** — the design's "其他项目参考默认不注入". They stay reachable
   through `memory_recall`.
