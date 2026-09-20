@@ -376,7 +376,7 @@ window.__ModuleLoader__.load({
 				injectOffGrid: "当前 {tokens} tokens 不在挡位梯上（来自旧的自定义值或插件配置）；拖动滑块即切到最接近的固定挡位。",
 				injectHint: "当前 {tokens} tokens。预算越紧，越优先保留最重要且最新的记忆，被舍弃的条目由页脚注明；预算只影响注入系统提示词的快照，且仅对之后的新会话生效。",
 				overviewHeader: "工作总览后台生成",
-				overviewDesc: "在空闲时用模型把记忆库总结成「以前做过的工作」总览，下次新会话注入时生效。这是本插件唯一会主动消耗模型调用的开关；关闭后注入照常，只是改为使用规则生成的确定性总览。",
+				overviewDesc: "在空闲时用模型把记忆库总结成「以前做过的工作」总览，下次新会话注入时生效。",
 				overviewRefresh: "立即重新生成",
 				overviewRefreshing: "生成中…",
 				overviewRefreshDone: "结果：{outcome}",
