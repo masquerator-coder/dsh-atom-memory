@@ -182,9 +182,9 @@ export class AtomMemoryController extends TypertRemoteService {
    * The panel's "view memory" modal must show the *same text the model sees*,
    * so this asks for the compact depth (`detail: false`) the session system
    * prompt is frozen from: grouped by memory type, priority-ordered, no
-   * `fact_id`. The full list with `fact_id`s stays available through the
-   * `memory_summary_detail` tool, whose whole purpose is locating a fact to
-   * edit.
+   * `fact_id`. The full list with `fact_id`s stays available through
+   * `memory_summary` with `detail: true`, whose whole purpose is locating a fact
+   * to edit.
    */
   @Remote
   async summary(args: { user: string; maxTokens?: number }): Promise<string> {

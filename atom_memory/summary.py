@@ -10,7 +10,8 @@ two depths from one implementation:
   UUIDs cost more tokens than they carry information for the model, and every
   fact stays addressable through ``recall`` and the settings editor.
 - **detail** (``detail=True``) — the full list, one bullet per fact with its
-  ``fact_id``, used by the ``memory_summary_detail`` tool and the settings modal.
+  ``fact_id``, used by the ``memory_summary`` tool with ``detail=true`` and by
+  the settings modal.
 
 Ordering blends **importance and recency** into one score (see
 :func:`_blend`): a fact's ``importance`` only counts when the extractor actually

@@ -2,6 +2,42 @@
 
 ## [Unreleased]
 
+### Changed (第二十三轮：`memory_summary` 合并两个深度；`memory_recall` 的截断提示补全调用形)
+
+**问题**：`memory_summary` 与 `memory_summary_detail` 是同一个 Python RPC 方法（`summary`）
+的两次调用，只差一个 `detail` 布尔，却注册成两个工具。模型的工具清单里多一项、两个
+`render` 完全相同 —— 是真重复。合并的**前提**是别丢掉它们唯一的实质差异：两者的
+`max_tokens` 不同（注入预算 vs `summaryTokens`）。
+
+**dsh 侧**：
+
+- `tools.ts`：`memory_summary` 新增 `detail` 参数（默认 `false`），删除
+  `memory_summary_detail` 注册。合并时保留了三条不变式，各自都是为了合并后仍然成立：
+  - `max_tokens` 按深度二选一（`detail ? deps.summaryTokens : budget()`）。统一成一个预算
+    会两头都坏：紧凑深度不再是"系统提示词此刻会冻结的那份文本"（这是它存在的全部理由），
+    完整清单则被注入预算截断，而它存在的意义正是把 `fact_id` 交出去。
+  - `detail=true` 时**不传** `overview`。`generate_summary` 在 `detail` 分支就返回、根本
+    不会读 `use_overview`，传了是死参数却读起来像承诺。
+  - `scope_context` 两个深度都传（沿用原 `memory_summary_detail` 的注释：一条规则
+    「每次读取都带上下文」胜过留一个后人才要重新推导的例外）。
+- 连带修正：`memory_replace` / `memory_get` 的 `factId` 描述、`renderWriteReceipt` 的
+  pending 提示、设置弹窗的 `summaryDesc`（中英）原先都指名 `memory_summary_detail`，
+  改为 `memory_summary detail=true` —— 否则它们指向一个已不存在的工具。
+
+**`memory_recall` 的截断提示**：原先输出「需要全文请用 memory_get factId=…」，要求模型
+自己把工具名与散文里的参数拼起来。改为完整调用形
+（`需要全文请用：memory_get factId=<id>`）。此处**保留** `memory_get` 而不做合并 ——
+`recall` 是"按查询取候选"、`get` 是按主键取一条，两者零共享实现，`get` 还是 `recall`
+截断后的下游；合并只会把两条路径塞进一个 `if`，并把 `factId` 从 `required` 降级成
+optional（凭空造出"两个参数都不传"的运行时非法态），同时让上面这句提示指向一个不存在的
+工具名。**不做**。
+
+**测试**：`tools.test.ts` 新增两例 —— `detail=true` 不传 `overview`、两深度的参数各自正确；
+`tools-outcome.test.ts` 与 `tools-scope.test.ts` 的旧 `memory_summary_detail` 调用改为
+`memory_summary` + `detail: true`。`tools-outcome.test.ts` 那两例仍用 `resolveSummaryBudget`
+把注入预算压到 800、让它与 `summaryTokens`(500) 不等 —— 这正是合并后唯一还值得钉住的差异，
+若统一成一个预算，第二例会红。
+
 ### Changed (第二十二轮：摘要不再重复工具用法)
 
 **问题**：注入的摘要里有一段 `## 要了解细节`，逐行写明「哪个工具能到达哪个深度」，并附例

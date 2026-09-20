@@ -56,7 +56,7 @@ const zh = {
   contentGroupHeader: '记忆内容',
   // 3a) summary (compact injected view)
   summaryHeader: '记忆摘要（注入视图）',
-  summaryDesc: '只读展示注入会话系统提示词的那份紧凑记忆摘要——按类型分组、按重要度排序、不含 fact_id，与模型看到的文本一致。若要拿到 fact_id 定位某条事实，请用 memory_summary_detail 工具查看完整清单。',
+  summaryDesc: '只读展示注入会话系统提示词的那份紧凑记忆摘要——按类型分组、按重要度排序、不含 fact_id，与模型看到的文本一致。若要拿到 fact_id 定位某条事实，请用 memory_summary 工具并传 detail=true 查看完整清单。',
   summaryOpen: '查看摘要',
   summaryLoading: '正在加载…',
   summaryEmpty: '暂无摘要（没有活跃事实）。',
@@ -169,7 +169,7 @@ const en: Record<keyof typeof zh, string> = {
     + ' Note: the API key is stored in plain text in the dsh settings document (not in a secret store), so exporting or sharing the configuration carries it along.',
   contentGroupHeader: 'Memory content',
   summaryHeader: 'Memory summary (as injected)',
-  summaryDesc: 'Read-only render of the compact memory summary injected into the session system prompt — grouped by type, ordered by importance, no fact_ids — i.e. exactly the text the model sees. For a full list carrying fact_ids (to locate one fact), use the memory_summary_detail tool.',
+  summaryDesc: 'Read-only render of the compact memory summary injected into the session system prompt — grouped by type, ordered by importance, no fact_ids — i.e. exactly the text the model sees. For a full list carrying fact_ids (to locate one fact), use the memory_summary tool with detail=true.',
   summaryOpen: 'View summary',
   summaryLoading: 'Loading…',
   summaryEmpty: 'No summary yet (no active facts).',

@@ -102,7 +102,7 @@ describe('scope_context reaches every scope-aware call', () => {
     expect(lastParams().scope_context).toEqual(PAYLOAD)
   })
 
-  it('rides along with memory_summary and memory_summary_detail', async () => {
+  it('rides along with memory_summary at both depths', async () => {
     const { bridge, tool, lastParams } = setup({ scopeContext: () => PAYLOAD })
     bridge.call.mockResolvedValue('digest')
 
@@ -110,7 +110,7 @@ describe('scope_context reaches every scope-aware call', () => {
     expect(lastParams()).toMatchObject({ detail: false })
     expect(lastParams().scope_context).toEqual(PAYLOAD)
 
-    await tool('memory_summary_detail').execute({}, execWithSession('s1', '/repo'))
+    await tool('memory_summary').execute({ detail: true }, execWithSession('s1', '/repo'))
     expect(lastParams()).toMatchObject({ detail: true })
     // The detail depth ignores the context in the renderer; passing it anyway
     // keeps one rule instead of an exception to remember.

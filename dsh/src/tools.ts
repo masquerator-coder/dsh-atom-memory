@@ -198,7 +198,7 @@ export function renderWriteReceipt(receipt: WriteReceipt): string {
     .join('，')
 
   if (receipt.status === 'pending') {
-    const head = '已入队（尚未落库）。稍后可用 memory_snapshot 或 memory_summary_detail 确认结果。'
+    const head = '已入队（尚未落库）。稍后可用 memory_snapshot 或 memory_summary 确认结果。'
     return shortened ? `${head}\n注意：内容过长已截断——${shortened}` : head
   }
   if (receipt.status === 'error') {
@@ -862,7 +862,7 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
     name: 'memory_replace',
     description: '用新内容替换一条已有记忆（按 fact_id 指名替换）。用于纠正写错的记忆：新内容会被抽取为事实，被指名的那条随之退役（superseded）。',
     parameters: {
-      factId: { type: 'string', required: true, description: '要被替换的记忆 fact id（可用 memory_summary_detail 获取）' },
+      factId: { type: 'string', required: true, description: '要被替换的记忆 fact id（可用 memory_summary detail=true 获取）' },
       content: { type: 'string', required: true, description: '替换后的新内容' },
       user: { type: 'string', description: '可选：归属用户 id（默认当前用户，跨会话共享）' },
     },
@@ -922,8 +922,17 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
             if (!body) return `- ${head}`
             // A shortened body is flagged *with* the way to read the rest: a
             // truncation the model cannot follow up on is just missing data.
+            //
+            // The hint spells out the whole call, not just the tool name. It
+            // used to read "需要全文请用 memory_get factId=…", which leaves the
+            // model to pair a tool with a parameter mentioned in prose; writing
+            // it as a call shape (`memory_get factId=<id>`) removes that step.
+            // `memory_get` is deliberately *not* merged into recall: recall
+            // takes a query and returns candidates, get takes a primary key and
+            // returns one fact, and get is the downstream of the truncation
+            // this very line reports.
             const tail = f.truncated
-              ? `\n    > （正文已截断，需要全文请用 memory_get factId=${f.fact_id ?? '?'}）`
+              ? `\n    > （正文已截断，需要全文请用：memory_get factId=${f.fact_id ?? '?'}）`
               : ''
             return `- ${head}\n    > ${body}${tail}`
           }).join('\n'))
@@ -961,7 +970,7 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
       '按 fact_id 读取一条记忆的完整内容（含未截断的知识正文）。'
       + 'memory_recall 为控制上下文会对单条过长的正文截断并标注，需要全文时用本工具。',
     parameters: {
-      factId: { type: 'string', required: true, description: '记忆 fact id（memory_recall / memory_summary_detail 里可获得）' },
+      factId: { type: 'string', required: true, description: '记忆 fact id（memory_recall / memory_summary detail=true 里可获得）' },
       user: { type: 'string', description: '可选：归属用户 id（默认当前用户，跨会话共享）' },
     },
     output: {
@@ -991,11 +1000,21 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
   disposers.push(ctx.tools.register(defineTool({
     name: 'memory_summary',
     description:
-      '渲染当前用户记忆的紧凑摘要（与注入系统提示词的快照同一预算、同一份渲染，但不含数据围栏）。'
-      + '摘要先给「以前做过的工作」总览，最后是按类型的明细；工具用法写在各 memory_* 工具自己的定义里，摘要不再重复。'
-      + '适合先看总览，再按需用 memory_recall 查明细；要看完整清单用 memory_summary_detail；'
+      '渲染当前用户记忆的摘要，两个深度共用一个入口。'
+      + '默认（detail=false）是紧凑摘要：与注入系统提示词的快照同一预算、同一份渲染，'
+      + '先给「以前做过的工作」总览，最后是按类型的明细，不含 fact_id。'
+      + 'detail=true 则渲染完整清单：每条含 fact_id（便于定位与编辑），'
+      + '按 summaryTokens 预算渲染，不会与注入版混淆。'
+      + '工具用法写在各 memory_* 工具自己的定义里，摘要不再重复。'
+      + '适合先看总览，再按需用 memory_recall 查明细；'
       + '要确认提示词里真正冻结的那段，用 memory_snapshot；要查记忆库近期变动，用 memory_overview action=changes。',
     parameters: {
+      detail: {
+        type: 'boolean',
+        description:
+          '默认 false：紧凑摘要，即注入会话系统提示词的那份（不含 fact_id）。'
+          + 'true：完整清单，每条含 fact_id，用于定位与编辑某条事实',
+      },
       user: { type: 'string', description: '可选：归属用户 id（默认当前用户，跨会话共享）' },
     },
     output: {
@@ -1008,16 +1027,23 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
     async execute(args, exec) {
       if (deps.isEnabled?.() === false) throw disabledError()
       const uid = args.user ?? userIdOf(exec, scope)
+      const detail = args.detail === true
       const raw = await call<string | { text?: string }>('summary', {
         user_id: uid,
-        // The injection budget, so what the model reads here is the text the
-        // session prompt would freeze at this moment.
-        max_tokens: budget(),
-        detail: false,
-        // Same head the injected snapshot uses. This tool's whole purpose is to
-        // show what the model is being told, so rendering it without the head
-        // would make the tool disagree with the prompt it claims to mirror.
-        overview: true,
+        // Two depths, two budgets. The compact depth must render at the
+        // *injection* budget or it stops being the text the session would
+        // freeze — which is this depth's entire reason to exist. The full
+        // listing is a working view for locating facts, so it gets its own
+        // (larger) budget instead of being truncated to the injected one.
+        max_tokens: detail ? deps.summaryTokens : budget(),
+        detail,
+        // Only the compact depth carries the overview head. `generate_summary`
+        // returns the detail depth before it ever consults `use_overview`, so
+        // passing it here would be a dead argument that reads like a promise.
+        ...(detail ? {} : { overview: true }),
+        // The detail depth ignores this context in the Python renderer; passing
+        // it anyway keeps one rule ("every read travels with its context")
+        // instead of an exception a later reader has to re-derive.
         ...scopeParam(deps, exec),
       })
       // Tolerate a plain-string reply from an older Python side.
@@ -1124,37 +1150,6 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
         return { text: '（无内容：记忆库为空，或注入已关闭）', frozen: existing !== undefined }
       }
       return { text, frozen: existing !== undefined }
-    },
-  })))
-
-  disposers.push(ctx.tools.register(defineTool({
-    name: 'memory_summary_detail',
-    description:
-      '渲染当前用户记忆的完整清单（每条含 fact_id，便于定位与编辑）。'
-      + '注入系统提示词的是紧凑版（按类型分组、不含 fact_id）——如需确认注入内容，用 memory_snapshot。',
-    parameters: {
-      user: { type: 'string', description: '可选：归属用户 id（默认当前用户，跨会话共享）' },
-    },
-    output: {
-      schema: { type: 'object', additionalProperties: true },
-      render(_args, value) {
-        const v = value as { text?: string }
-        return [{ type: 'text', text: v.text ?? '' }]
-      },
-    },
-    async execute(args, exec) {
-      if (deps.isEnabled?.() === false) throw disabledError()
-      const uid = args.user ?? userIdOf(exec, scope)
-      const text = await call<string>('summary', {
-        user_id: uid,
-        max_tokens: deps.summaryTokens,
-        detail: true,
-        // The detail depth ignores the context in the Python renderer; passing
-        // it anyway keeps one rule ("every read travels with its context")
-        // instead of an exception a later reader has to re-derive.
-        ...scopeParam(deps, exec),
-      })
-      return { text }
     },
   })))
 

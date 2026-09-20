@@ -166,7 +166,7 @@ describe('memory_summary budget', () => {
   it('keeps the detail view on its own, larger budget', async () => {
     const { bridge, tool } = setup({ resolveSummaryBudget: () => 800 })
     bridge.call.mockResolvedValue('# Memory detail')
-    await tool('memory_summary_detail').execute({}, execWithSession())
+    await tool('memory_summary').execute({ detail: true }, execWithSession())
     expect(bridge.call.mock.calls.at(-1)![1]!.max_tokens).toBe(500)
   })
 })

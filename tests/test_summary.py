@@ -1033,6 +1033,7 @@ def test_the_guide_is_gone_and_tool_usage_is_not_repeated():
         for leaked in (
             "memory_recall",
             "memory_summary_detail",
+            "memory_summary detail",
             "memory_get",
             "memory_scope",
             "memory_overview",

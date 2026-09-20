@@ -137,13 +137,13 @@ depths from one implementation (`summary.generate_summary`):
 | Depth | Used by | Shape |
 | --- | --- | --- |
 | `detail=False` (compact) | the session-start-**frozen system-prompt snapshot** and the settings **"view memory" dialog** | Facts grouped by memory type, ordered by a blend of importance and recency; single-valued attributes fold to `predicate: value` and repeated attributes/preferences merge onto one line; **no `fact_id`**; **every rendered line capped at 80 characters** (`_MAX_COMPACT_LINE_CHARS`, ellipsis included), with folded values clipped to 40 characters each *before* joining (`_MAX_FOLDED_VALUE_CHARS`) so one runaway value cannot hide its siblings; no document title. |
-| `detail=True` (detail) | the `memory_summary_detail` tool | One bullet per fact with its `fact_id`, plus the knowledge body on a folded sub-line. Each of `subject` / `predicate` / `object` is clipped to 120 characters (`_MAX_DETAIL_FIELD_CHARS`) and the body sub-line to 120 (`_DETAIL_CONTENT_CHARS`) — the `fact_id` and the bullet structure are never truncated, because locating a fact by id is what this depth is for. |
+| `detail=True` (detail) | the `memory_summary` tool with `detail=true` | One bullet per fact with its `fact_id`, plus the knowledge body on a folded sub-line. Each of `subject` / `predicate` / `object` is clipped to 120 characters (`_MAX_DETAIL_FIELD_CHARS`) and the body sub-line to 120 (`_DETAIL_CONTENT_CHARS`) — the `fact_id` and the bullet structure are never truncated, because locating a fact by id is what this depth is for. |
 
 Both read paths that a human inspects are therefore *the model's own view*: the
 dialog asks for the compact depth so the panel cannot drift from what the
 prompt carries. The only reason to render `detail=True` is to obtain a
 `fact_id` for locating a fact — which is precisely what the
-`memory_summary_detail` tool is for, so the dialog does not need it.
+`memory_summary` tool (with `detail=true`) is for, so the dialog does not need it.
 
 Ordering blends **importance and recency** into one score, rather than ranking by
 importance with recency only as a tie-break. `importance` is only treated as a
@@ -189,7 +189,7 @@ their byte-identical text and their KV cache.
 `fact_id` is deliberately absent from the compact depth: 19 UUIDs cost roughly
 700 tokens, more than they carry information for the model, while every fact
 stays addressable through `recall` (which returns `fact_id`), the
-`memory_summary_detail` tool, and the settings editor.
+`memory_summary` tool (with `detail=true`), and the settings editor.
 
 ### Per-line length cap
 

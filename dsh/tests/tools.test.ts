@@ -121,7 +121,7 @@ describe('memory tools user scope', () => {
     expect(rendered[0]!.text).toContain('决策规则')
   })
 
-  it('memory_stats / memory_user_md / memory_summary_detail use the fallback user scope', async () => {
+  it('memory_stats / memory_user_md / memory_summary use the fallback user scope', async () => {
     const { bridge, registered } = setup()
     bridge.call.mockResolvedValue({})
 
@@ -133,23 +133,41 @@ describe('memory tools user scope', () => {
     await userMd.execute({}, execWithSession('session-DDD'))
     expect(bridge.call.mock.calls.at(-1)![1]!.user_id).toBe('global')
 
-    const detail = registered.find((d) => d.name === 'memory_summary_detail')!
-    await detail.execute({}, execWithSession('session-DDD'))
+    const summary = registered.find((d) => d.name === 'memory_summary')!
+    await summary.execute({ detail: true }, execWithSession('session-DDD'))
     expect(bridge.call.mock.calls.at(-1)![1]!.user_id).toBe('global')
   })
 
-  it('memory_summary_detail asks for the detail depth, not the injected compact one', async () => {
+  it('memory_summary detail=true asks for the detail depth, not the injected compact one', async () => {
     const { bridge, registered } = setup()
     bridge.call.mockResolvedValue('')
 
-    const detail = registered.find((d) => d.name === 'memory_summary_detail')!
-    await detail.execute({}, execWithSession('session-DDD-2'))
+    const summary = registered.find((d) => d.name === 'memory_summary')!
+    await summary.execute({ detail: true }, execWithSession('session-DDD-2'))
 
     // The tool/settings view keeps fact_id references; only the frozen prompt
     // snapshot renders the compact digest.
     const [method, params] = bridge.call.mock.calls.at(-1) as [string, Record<string, unknown>]
     expect(method).toBe('summary')
     expect(params.detail).toBe(true)
+  })
+
+  it('memory_summary detail=true does not pass the overview head', async () => {
+    // `generate_summary` returns the detail depth before it ever consults
+    // `use_overview`, so passing it would be a dead argument that reads like a
+    // promise. The two depths stay distinguishable by their params.
+    const { bridge, registered } = setup()
+    bridge.call.mockResolvedValue('')
+
+    const summary = registered.find((d) => d.name === 'memory_summary')!
+    await summary.execute({ detail: true }, execWithSession('session-DDD-3'))
+    const detailParams = bridge.call.mock.calls.at(-1)![1] as Record<string, unknown>
+    expect(detailParams.overview).toBeUndefined()
+
+    await summary.execute({}, execWithSession('session-DDD-3'))
+    const compactParams = bridge.call.mock.calls.at(-1)![1] as Record<string, unknown>
+    expect(compactParams.overview).toBe(true)
+    expect(compactParams.detail).toBe(false)
   })
 
   it('memory_summary asks for the overview head it claims to mirror', async () => {

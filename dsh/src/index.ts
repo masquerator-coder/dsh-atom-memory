@@ -431,7 +431,7 @@ export function apply(ctx: Context, config: ConfigShape): void {
   //
   // The injected snapshot uses its own (smaller) budget and the compact render
   // depth: it is paid for on every request and is the view that must stay short
-  // and priority-ordered, unlike the full list the `memory_summary_detail` tool
+  // and priority-ordered, unlike the full list `memory_summary detail=true`
   // and the settings modal return.
   //
   // The budget is passed as a *getter*, not a value: the settings panel owns it

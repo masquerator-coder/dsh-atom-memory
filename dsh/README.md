@@ -41,7 +41,7 @@ pnpm build       # -> lib/index.mjs
 | `nudgeEnabled` | `true` | 周期微调（写路径），失败捕获的唯一重试路径 |
 | `nudgeIntervalMinutes` | `30` | 微调周期 |
 | `maxRecalledFacts` | `10` | 每次召回给模型的条数上限 |
-| `summaryTokens` | `1500` | `memory_summary_detail` 工具返回的完整清单 token 上限（设置弹窗走同一预算，但取紧凑深度） |
+| `summaryTokens` | `1500` | `memory_summary detail=true` 返回的完整清单 token 上限（设置弹窗走同一预算，但取紧凑深度） |
 | `injectedSummaryTokens` | `800` | 注入系统提示词的紧凑快照 token 上限（与上者分开：注入内容每个请求都要付费）。**仅作为初值**：运行时由设置面板的「系统提示词注入体积」滑块接管（固定挡位 300 / 800 / 1500 / 3000 / 6000 / 12000） |
 | `contextInjectionEnabled` | `true` | 会话起始冻结快照注入系统提示词 |
 | `overviewEnabled` | `true` | 空闲时用模型把记忆库写成「以前做过的工作」总览。**本插件唯一会主动消耗模型调用的开关**；关闭后注入照常，只是改为使用确定性总览。可实时编辑 |
@@ -120,10 +120,10 @@ pnpm build       # -> lib/index.mjs
 | 工具 | 说明 |
 | --- | --- |
 | `memory_add` | 显式记住原始内容（LLM-first → 长内容原文兜底 → 规则回退） |
-| `memory_summary` | 渲染**注入系统提示词的紧凑摘要**（不含 `fact_id`），**以「以前做过的工作」总览开头**，后接按类型的明细——「先看总览、再按需查明细」的入口。**不含工具用法**：那写在每个 `memory_*` 工具自己的定义里 |
+| `memory_summary` | 一个入口、两个深度。默认 `detail=false`：渲染**注入系统提示词的紧凑摘要**（不含 `fact_id`），**以「以前做过的工作」总览开头**，后接按类型的明细——「先看总览、再按需查明细」的入口。`detail=true`：渲染**完整清单**（每条含 `fact_id`，用于定位与编辑），走 `summaryTokens` 预算。**不含工具用法**：那写在每个 `memory_*` 工具自己的定义里 |
 | `memory_recall` | 语义+全文混合召回；模型可见内容含 `fact_id`、`type` **与 `content` 正文**，并前置紧凑摘要 |
 | `memory_forget` | 软删除（retract）一条事实 |
-| `memory_summary_detail` | 渲染记忆**完整清单**（每条含 `fact_id`）——注意注入系统提示词的是同一份记忆的紧凑版（不含 `fact_id`），要确认注入内容以 `memory_summary` 为准 |
+
 | `memory_user_md` | 渲染用户画像 markdown |
 | `memory_stats` | 记忆统计计数 |
 | `memory_scope` | 作用域管理面：`list`（作用域树）/ `resolve`（当前上下文解析到哪 + 待确认候选队列）/ `create` / `confirm` / `alias_add` / `merge` |
@@ -143,13 +143,13 @@ memory_summary（概览：总览段 + 紧凑明细）
       │        ├─ render 输出 fact_id / type / content 正文（知识类事实的正文即答案）
       │        └─ 前置紧凑摘要块，便于把召回结果放回整体语境
       │
-      └─▶ 需要全量清单 ──▶ memory_summary_detail（含 fact_id + 知识正文折叠行，受 token 预算截断）
+      └─▶ 需要全量清单 ──▶ memory_summary detail=true（含 fact_id + 知识正文折叠行，受 summaryTokens 截断）
 ```
 
 > **注入版 vs 完整版**：会话起始冻结进系统提示词的是**紧凑版**摘要（由 `memory_summary`
 > 渲染）——按记忆类型分组、`fact_id` 全部省略、长知识正文截断，且渲染总长度（含页脚）
 > 保证不超 `injectedSummaryTokens`。`fact_id` 仍可经 `memory_recall`、
-> `memory_summary_detail` 与设置界面取得。
+> `memory_summary detail=true` 与设置界面取得。
 >
 > **每行长度上限（保证记忆精炼）**：注入版**每一条渲染行整体**不超过
 > **80 字符**（`_MAX_COMPACT_LINE_CHARS`，`- ` 前缀、`[when]`、`predicate:` 与值都算在内，
@@ -166,7 +166,7 @@ memory_summary（概览：总览段 + 紧凑明细）
 > 落在排序最末的分组里就被丢掉。页脚会注明省略了多少条、哪些分组被整体隐藏。
 
 长文知识（`sop` / `few_shot`）的正文**被有意排除在紧凑摘要之外**（体量太大），折叠行只
-保留谓词与截断值；若要展开正文或定位 `fact_id`，可经 `memory_summary_detail` 或
+保留谓词与截断值；若要展开正文或定位 `fact_id`，可经 `memory_summary detail=true` 或
 `memory_recall` 下钻，避免"先看摘要"反而把需要下钻的内容藏起来。
 
 > **用户作用域**：所有 `memory_*` 工具的 `user_id` 统一落入 fallback 用户作用域
@@ -252,7 +252,7 @@ document > thread`，Python 侧实现见 `docs/scopes.md`）。dsh 侧只负责*
   （`SIGNAL_CACHE_MAX`，`clearScopeSignalCache()` 供测试复位），热路径上是查表而非
   遍历文件系统；采集**永不抛错**，读不到就是少一个信号。
 * **哪些调用带作用域**：`persist_candidates` / `add`（`memory_add` 的两条路径与自动
-  捕获）、`recall`、`summary`（提示词冻结与 `memory_summary_detail`）、`replace`。
+  捕获）、`recall`、`summary`（提示词冻结与 `memory_summary detail=true`）、`replace`。
   设置面板的只读读取与 `get_fact` / `stats` / `user_md` / `forget` **不带**——前者是
   全局管理视图（Python 侧也不接收该参数）。
 

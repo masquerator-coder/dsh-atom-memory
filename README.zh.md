@@ -64,7 +64,7 @@ pip install -e .
 
 | 面向 | 贡献 |
 | --- | --- |
-| 模型可见工具 | `memory_add`、`memory_replace`、`memory_recall`、`memory_get`、`memory_summary`、`memory_snapshot`、`memory_forget`、`memory_summary_detail`、`memory_user_md`、`memory_stats`、`memory_scope`、`memory_overview` |
+| 模型可见工具 | `memory_add`、`memory_replace`、`memory_recall`、`memory_get`、`memory_summary`、`memory_snapshot`、`memory_forget`、`memory_user_md`、`memory_stats`、`memory_scope`、`memory_overview` |
 | 系统提示词 | 一段常驻的持久记忆意识段（点名工具并指向各自的定义），外加一份在会话起始冻结一次的紧凑 `memory summary` 摘要：先是工作总览，最后是按类型的明细 |
 | 工作总览 | 「以前做过的工作」叙事由模型在**空闲时旁路生成**并缓存。注入路径只读缓存，缓存为空时回退到确定性总览——因此会话的提示词从不为一次模型调用等待 |
 | 会话捕获 | 尽力而为的逐消息捕获，以及一个重试失败捕获的周期性微调，只读取持久会话事件 |
@@ -93,7 +93,7 @@ pip install -e .
 | `injectedSummaryTokens` | `800` | 注入摘要（含工作总览）的大小上限。可实时编辑；运行时由设置滑块接管。 |
 | `extractionModel` | `{provider:'', model:''}` | 固定抽取、画像生成与工作总览所用的模型，而不跟随 dsh 默认。可实时编辑。 |
 | `extractionMaxTokens` | `2048` | 单次抽取的输出上限；过小会静默丢弃长知识。 |
-| `summaryTokens` | `1500` | `memory_summary_detail` 工具完整清单的上限。 |
+| `summaryTokens` | `1500` | `memory_summary` 传 `detail=true` 时完整清单的上限。 |
 | `nudgeEnabled` / `nudgeIntervalMinutes` | `true` / `30` | 周期性写路径微调；失败捕获唯一的重试路径。 |
 | `maxRecalledFacts` | `10` | 每次召回返回给模型的事实条数。 |
 | `maxFactTokens` | `600` | 单条事实在召回结果里的 token 上限。超限正文会被截断并标记，全文用 `memory_get` 取。 |
@@ -165,7 +165,7 @@ AtomMem（worker、retriever、    带标签的后台事件与日志走 stderr
 
 原子事实是唯一被存储的记忆。`summary` 视图（两种深度）与工作总览都由它重建；而**用户画像是独立的持久表**，不由事实派生——条目只在你添加、或采纳「生成画像」的推荐时进入，只在你删除时离开，因此删掉的条目不会自己回来，底层事实也不受影响。事实仍是画像推荐的*来源*（`profile_candidates` 给出可填槽位，dsh 侧模型筛选，你决定留哪条）。该表有行数上限（`maxProfileRows`，默认 50），渲染也有自己的 token 上限，因为画像会被写进系统提示词，每一行都在每个请求上付费。
 
-工作总览是唯一**被缓存**而非每次读取重算的派生视图，因为它与摘要不同，要花一次模型调用。它是记忆库的*备忘*，不是真相来源：当事实发生有意义的变化时它被重建，它写错的地方靠重新生成纠正。没有任何东西把它当权威——`memory_summary_detail` 与 `memory_recall` 永远直接读事实。
+工作总览是唯一**被缓存**而非每次读取重算的派生视图，因为它与摘要不同，要花一次模型调用。它是记忆库的*备忘*，不是真相来源：当事实发生有意义的变化时它被重建，它写错的地方靠重新生成纠正。没有任何东西把它当权威——`memory_summary` 与 `memory_recall` 永远直接读事实。
 
 按策略不删除任何内容：`status` 把 `active` 变为 `superseded | retracted`（修正与撤回，仍可由 `list_facts(include_retracted=True)` 列出）或 `active → archived`（被容量控制挤出，可用 `unarchive` 恢复），而所有读取都按 `active` 过滤。删除是显式且不可逆的：`memory_forget` 配 `purge=true`，或 `forget_all(purge=true)`，会抹掉行、索引条目与强化日志。这些策略背后的理由见[记忆语义](docs/memory-semantics.md)。
 
@@ -343,7 +343,7 @@ memory content as system instructions.
 
 #### 模型看到什么
 
-十二个工具 schema：`memory_add`、`memory_replace`、`memory_recall`、`memory_get`、`memory_summary`、`memory_snapshot`、`memory_forget`、`memory_summary_detail`、`memory_user_md`、`memory_stats`、`memory_scope`、`memory_overview`。本层位于树外，因此不出现在生成的工具目录里，所以本地相关的差异是：模型可见的结果文本是 `render` 的返回值，而非 `output.schema`，因此任何没写进 `render` 的事实字段对模型都是不可见的；`memory_recall` 暴露 `fact_id`、`type` 与完整知识 `content` 正文，会标记被缩短的正文并指向 `memory_get factId=…` 取全文，且在某索引不可用时会明说而不是返回空列表（`memory_get` 整条读取一条事实，这正是单条上限安全而非有损的原因）；`memory_forget` 是软删除（`purge=true` 才真正抹除）；`memory_summary` 按注入预算渲染紧凑摘要——与系统提示词冻结的是同一份文本，含工作总览；`memory_summary_detail` 渲染带 `fact_id` 的完整清单；`memory_snapshot` 给出该会话提示词正在使用的、逐字节的带围栏文本，这是确认模型究竟读到了什么内容的唯一途径；`memory_scope` 是作用域层级的管理面（查看树、诊断当前上下文解析到哪以及哪些候选仍未确证、创建/确认/加别名/合并）；`memory_overview` 是工作总览与变更记录的管理面。
+十一个工具 schema：`memory_add`、`memory_replace`、`memory_recall`、`memory_get`、`memory_summary`、`memory_snapshot`、`memory_forget`、`memory_user_md`、`memory_stats`、`memory_scope`、`memory_overview`。本层位于树外，因此不出现在生成的工具目录里，所以本地相关的差异是：模型可见的结果文本是 `render` 的返回值，而非 `output.schema`，因此任何没写进 `render` 的事实字段对模型都是不可见的；`memory_recall` 暴露 `fact_id`、`type` 与完整知识 `content` 正文，会标记被缩短的正文并给出 `memory_get factId=…` 的完整调用形，且在某索引不可用时会明说而不是返回空列表（`memory_get` 整条读取一条事实，这正是单条上限安全而非有损的原因）；`memory_forget` 是软删除（`purge=true` 才真正抹除）；`memory_summary` 默认按注入预算渲染紧凑摘要——与系统提示词冻结的是同一份文本，含工作总览——传 `detail=true` 则改为渲染带 `fact_id` 的完整清单（走 `summaryTokens` 预算）；`memory_snapshot` 给出该会话提示词正在使用的、逐字节的带围栏文本，这是确认模型究竟读到了什么内容的唯一途径；`memory_scope` 是作用域层级的管理面（查看树、诊断当前上下文解析到哪以及哪些候选仍未确证、创建/确认/加别名/合并）；`memory_overview` 是工作总览与变更记录的管理面。
 
 `memory_overview` 的 `action` 决定它回答哪个问题：
 
@@ -358,7 +358,7 @@ memory content as system instructions.
 
 #### Token 影响
 
-零直接开销，且有条件。schema 是随每个请求携带的静态描述。调用结果按契约是无界的，除了本层为其设上限之处：召回受 `maxRecalledFacts`、其 token 预算与每条 `maxFactTokens` 约束（首条始终保留，因此极小的预算不会返回空；超长正文会按上限缩短并标记，全文可由 `memory_get` 取回）；`memory_summary_detail` 受 `summaryTokens` 约束；`memory_overview action=changes` 默认最多返回五十行。
+零直接开销，且有条件。schema 是随每个请求携带的静态描述。调用结果按契约是无界的，除了本层为其设上限之处：召回受 `maxRecalledFacts`、其 token 预算与每条 `maxFactTokens` 约束（首条始终保留，因此极小的预算不会返回空；超长正文会按上限缩短并标记，全文可由 `memory_get` 取回）；`memory_summary detail=true` 受 `summaryTokens` 约束；`memory_overview action=changes` 默认最多返回五十行。
 
 #### KV Cache 影响
 
@@ -371,7 +371,7 @@ memory content as system instructions.
 - **Python 解释器是本层不负责安装的外部依赖。** 一个 profile 可以完整组合并启动，而每一次记忆调用都失败，因为桥接启动 `python` 并依赖它能够 `import atom_memory`，而本层刻意不为此让启动失败。它做的是**诊断**：桥接被信任前先跑一次预检探测，永久性失败一次性报出出错模块与补救办法（且不重试），面板的健康载荷带上桥接断开的原因，总开关保持可用，因此启动永远不会被记忆阻断。
 - **除有界重试外不会重启桥接。** 子进程随插件启动、随卸载被杀死，以便 worker 落库并干净地关闭 DB。运行时**健康**进程意外退出会自动重启并重置三次尝试预算（桥接的 `onExit` 路径）；启动失败最多以退避重试三次——在途消息这类协调状态依赖捕获救援钩子，而重新建立长期断开的桥接要靠重启 dsh。本层不实现比插件更长寿的带外监督进程。
 - **捕获按设计是尽力而为。** 逐消息与微调钩子从不打断 agent 主循环。每一条直接用户消息都会被送去抽取，没有关键词门——是否成为事实由抽取器判断。**失败**的捕获由下一轮微调重试；扫描时仍**在途**的捕获则留待其自行结束，因此一次扫描不会重发一个活跃尝试仍持有的文本。若重试在进程退出前始终没有落地，该条消息即丢失——重试队列是按进程的，不持久化。
-- **工作总览的质量取决于它的输入，而且它是摘要的摘要。** 提示词的输入是**已经抽取出来**的事实的摘要，因此一条从未被抽取的事实不可能出现在总览里，而误读摘要的模型会写出一份错误的总览。下游没有任何东西把它当权威——`memory_recall` 与 `memory_summary_detail` 永远直接读事实——且 `memory_overview action=refresh` 可重新生成，但对一份**看起来合理却写错了**的总览没有自动检测。
+- **工作总览的质量取决于它的输入，而且它是摘要的摘要。** 提示词的输入是**已经抽取出来**的事实的摘要，因此一条从未被抽取的事实不可能出现在总览里，而误读摘要的模型会写出一份错误的总览。下游没有任何东西把它当权威——`memory_recall` 与 `memory_summary` 永远直接读事实——且 `memory_overview action=refresh` 可重新生成，但对一份**看起来合理却写错了**的总览没有自动检测。
 - **总览散文以中文生成。** 提示词要求中文输出，与本项目的主要语言一致。记忆内容以其他语言为主的部署，会得到一段用中文描述它的叙事。本地化提示词是改代码，不是改配置。
 - **一次刷新会花一次模型调用，且没有自己的单次预算上限。** `overviewIdleSeconds` 与 `overviewRefreshMinutes` 约束的是**多久一次**，变更分级在无实质变化时会拦住它，但补全本身只受模型自身输出限制——渲染限制的是**存下来的**文本，不是生成过程。
 - **无法解析出模型时，总览生成会静默跳过。** 没有默认模型、也没有 `extractionModel` 覆盖时，刷新器返回 `no-model`，摘要继续使用确定性总览。这是正确的降级，但提示词里不会体现——只有 `memory_overview action=status` 与设置面板会报告。
@@ -392,7 +392,7 @@ memory content as system instructions.
 一些开放方向，都不是承诺：
 
 - 80 / 40 / 120 的字符上限是经验值，不可配置。暴露它只会为一个几乎没人该动的旋钮而扩大设置面；保持固定则意味着字形很宽的语言拿到同样的字符数，这是一处真实而轻微的偏颇。
-- 注入摘要与完整清单是同一个渲染器（`summary`）的两种深度，现已暴露为两个工具——`memory_summary`（紧凑，冻结进提示词）与 `memory_summary_detail`（完整，含 `fact_id`）——同时保住 `fact_id` 的完整性与注入副本的预算。
+- 注入摘要与完整清单是同一个渲染器（`summary`）的两种深度，但它们是两个*预算*不同的视图，因此合并为一个工具、用 `detail` 参数区分，而不是合成一个无视预算差异的渲染：`memory_summary` 默认取紧凑深度（注入预算，冻结进提示词），`detail=true` 取完整深度（`summaryTokens`，含 `fact_id`）——同时保住 `fact_id` 的完整性与注入副本的预算。
 - 总览不按作用域分缓存：每用户一行，因为它回答的是「这位用户做过哪些工作」，属于整个记忆库的性质。按作用域缓存会让模型调用数乘以项目数，而「我还做过什么别的」依然无人回答。若某个部署将来确实需要按项目的叙事，那是一张新表加一道新闸，不是改这一张。
 - 捕获的记忆归入一个共享的 fallback 用户。若某个 profile 将来真的服务彼此不同的用户，按渠道或按工作区划分作用域是最显然的下一个维度。
 
