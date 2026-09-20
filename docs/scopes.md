@@ -202,22 +202,27 @@ phase mismatch; only an explicit disagreement is discounted).
 
 ## 6. The injected digest
 
-The session-start snapshot is rendered as blocks instead of one flat list:
+The session-start snapshot is rendered as blocks instead of one flat list, and
+with the host's `| ` prefix and conditional folding applied:
 
 ```
-[当前项目: api · 2 条 · 决策规则 1 · 属性 1] ## 决策规则
-- 提交前跑测试
-## 属性
-- 框架: FastAPI
-:
-[客户: acme · 1 条 · 偏好 1] ## 偏好
-- 正式语气
-:
-[全局规则 · 3 条 · 决策规则 3] ## 决策规则
-...
-
--- （按行）决策规则 4 · 属性 1 · 偏好 1
+| [当前项目: api · 2 条 · 决策规则 1 · 属性 1]
+| ## 决策规则
+| - 提交前跑测试
+| ## 属性
+| - 框架: FastAPI
+| :
+| [客户: acme · 1 条 · 偏好 1] ## 偏好
+| - 正式语气
+| :
+| [全局规则 · 3 条 · 决策规则 3] ## 决策规则
+| ...
+| :
+| -- （按行）决策规则 4 · 属性 1 · 偏好 1
 ```
+
+The first block holds two sections, so its heading keeps its own line; the second
+and third hold one each, so their headings fold into the label that follows.
 
 Every line kind has a distinct **first character** — `[` heading, `#` section
 label, `-` fact, `:` separator, `-` footer — and that is a requirement rather than
@@ -231,10 +236,32 @@ and a blank line separator arrived as a bare `| `.
 The host then folds each block heading into the section label that follows it
 (`dsh/src/memory-data.ts`, `foldBlockHeadings`): those two lines describe the same
 block, and each was paying the per-line prefix cost on every request, so they
-become one line carrying both. Only that exact adjacency is folded — a heading
-whose next line is a fact or a separator is left alone — so the block above is
-what actually reaches the model, while the digest the Python half returns still
-carries the two lines separately.
+become one line carrying both. **The fold applies only when the block holds one
+section.** A heading summarises the block as a whole — `[全局规则 · 2 条 · 决策规则 1
+· 教训 1]` names both sections it contains — so gluing it to the first of several
+labels would make it claim that one section while leaving the rest unattributed:
+
+```
+| [全局规则 · 2 条 · 决策规则 1 · 教训 1] ## 决策规则   <- folded: claims only one
+| - 全局规则
+| ## 教训                                             <- floating, no attribution
+```
+
+That is the same "heading contradicts its own body" failure the rendered count
+below exists to prevent, bought for the price of one saved line — so a
+multi-section block keeps its heading on its own line:
+
+```
+| [全局规则 · 2 条 · 决策规则 1 · 教训 1]
+| ## 决策规则
+| - 全局规则
+| ## 教训
+| - 沙箱 EPERM
+```
+
+A heading whose next line is a fact or a separator is likewise left alone. The
+digest the Python half returns always carries the heading and the labels as
+separate lines; the folding is the host's rendering of it, not a change to it.
 
 * Each block heading carries the scope label, the number of lines it **actually
   renders**, and the type breakdown of those lines. The count is derived from the

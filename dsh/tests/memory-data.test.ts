@@ -126,6 +126,74 @@ describe('block heading folding', () => {
     expect(body(block)).toEqual(['| ## 属性', '| - 职业: 工程师'])
   })
 
+  it('leaves a heading alone when the block holds more than one section', () => {
+    // The real scoped digest renders one label per surviving section, so a
+    // multi-section block is the common case, not an edge case. Folding the
+    // heading into the *first* label would make it claim that section alone
+    // (`决策规则 1 · 教训 1` is the block's own breakdown) and orphan the rest:
+    //
+    //   | [全局规则 · 2 条 · 决策规则 1 · 教训 1] ## 决策规则
+    //   | - 全局规则
+    //   | ## 教训              <- floating under a heading that excluded it
+    //
+    // Keeping the heading on its own line costs one `| ` prefix and is the only
+    // rendering in which the heading describes what is under it.
+    const block = renderMemoryDataBlock(
+      '[全局规则 · 2 条 · 决策规则 1 · 教训 1]\n## 决策规则\n- 全局规则\n## 教训\n- 沙箱 EPERM',
+    )
+    expect(body(block)).toEqual([
+      '| [全局规则 · 2 条 · 决策规则 1 · 教训 1]',
+      '| ## 决策规则',
+      '| - 全局规则',
+      '| ## 教训',
+      '| - 沙箱 EPERM',
+    ])
+  })
+
+  it('still folds when the block holds exactly one section', () => {
+    // The counterpart of the case above, and what keeps this a *conditional*
+    // fold rather than a removal: one section per block still saves the line.
+    const block = renderMemoryDataBlock(
+      '[当前项目: api · 1 条 · 决策规则 1]\n## 决策规则\n- 提交前跑测试\n:\n-- （按行）决策规则 1',
+    )
+    expect(body(block)).toEqual([
+      '| [当前项目: api · 1 条 · 决策规则 1] ## 决策规则',
+      '| - 提交前跑测试',
+      '| :',
+      '| -- （按行）决策规则 1',
+    ])
+  })
+
+  it('folds each block independently when a digest holds several', () => {
+    // A digest is a sequence of blocks separated by `:`. One block's section
+    // count says nothing about the next one's, so the lookahead must stop at the
+    // separator: otherwise the first block's facts would be scanned as if they
+    // belonged to the second, and both decisions would be wrong.
+    const block = renderMemoryDataBlock(
+      [
+        '[当前项目: api · 1 条 · 决策规则 1]',
+        '## 决策规则',
+        '- 提交前跑测试',
+        ':',
+        '[全局规则 · 2 条 · 决策规则 1 · 教训 1]',
+        '## 决策规则',
+        '- 全局规则',
+        '## 教训',
+        '- 沙箱 EPERM',
+      ].join('\n'),
+    )
+    expect(body(block)).toEqual([
+      '| [当前项目: api · 1 条 · 决策规则 1] ## 决策规则',
+      '| - 提交前跑测试',
+      '| :',
+      '| [全局规则 · 2 条 · 决策规则 1 · 教训 1]',
+      '| ## 决策规则',
+      '| - 全局规则',
+      '| ## 教训',
+      '| - 沙箱 EPERM',
+    ])
+  })
+
   it('does not fold a label that a hostile value forged', () => {
     // A stored value cannot manufacture a heading: `sanitizeMemoryText` strips
     // the fence markers, and a line that merely *starts* like a heading must
@@ -143,7 +211,7 @@ describe('the Python/TypeScript digest contract', () => {
    * test guards a cross-language contract, and a missing interpreter is an
    * environment problem, not a regression in the code under test.
    */
-  const pythonDigest = (): string | null => {
+  const pythonDigest = (multiSection = false): string | null => {
     const script = [
       'import sys, os, tempfile',
       'sys.path.insert(0, os.path.abspath(os.path.join(os.getcwd(), "..")))',
@@ -163,6 +231,14 @@ describe('the Python/TypeScript digest contract', () => {
       '    conn.execute("INSERT INTO fact_scope(fact_id,scope_id,priority) VALUES (?,?,0)", (fid,scope_id))',
       'add(p, "决定", "提交前跑测试", "decision_rule")',
       'add(1, "规则", "全局规则", "decision_rule")',
+      // A second section in the same block: this is what makes the block's own
+      // breakdown name more than one section, and what the fold must respect.
+      ...(multiSection
+        ? [
+            'add(1, "教训", "沙箱 EPERM", "lesson")',
+            'add(p, "教训", "别用 write 覆盖", "lesson")',
+          ]
+        : []),
       'ctx = {"signals": {"git_remote": "git@github.com:acme/api.git"}}',
       'sys.stdout.write(generate_summary(conn, "u", 400, detail=False, scope_context=ctx, config=cfg))',
     ].join('\n')
@@ -178,6 +254,7 @@ describe('the Python/TypeScript digest contract', () => {
   }
 
   const digest = pythonDigest()
+  const multi = pythonDigest(true)
   const maybe = digest === null ? it.skip : it
 
   maybe('folds the real scoped digest and keeps every line fenced', () => {
@@ -196,16 +273,47 @@ describe('the Python/TypeScript digest contract', () => {
     expect(lines.every(l => l.startsWith('| '))).toBe(true)
     expect(lines.every(l => l !== '| ')).toBe(true)
 
-    // The renderer's own shape: a block heading is always followed by its label
-    // before the fold, so after the fold no heading may sit next to a label.
+    // A folded heading names exactly the one section under it, so a heading that
+    // absorbed a label must not be followed by another label: that would mean it
+    // was glued to a section it does not describe.
     expect(
-      lines.some((l, i) => l.startsWith('| [') && lines[i + 1]?.startsWith('| ## ')),
+      lines.some(
+        (l, i) =>
+          l.startsWith('| [') &&
+          l.includes('## ') &&
+          lines[i + 1]?.startsWith('| ## '),
+      ),
     ).toBe(false)
 
     // At least one fold happened, and the hierarchy survived it.
     expect(lines.some(l => l.startsWith('| [') && l.includes('## '))).toBe(true)
     const kinds = new Set(lines.map(l => l.slice(2, 3)))
     expect(kinds.size).toBeGreaterThanOrEqual(3)
+  })
+
+  maybe('keeps a multi-section block heading on its own line', () => {
+    // The shape that regressed: one block holding two sections. Its heading names
+    // both (`决策规则 1 · 教训 1`), so folding it into the first label would make
+    // it claim that section alone and leave the second floating unattributed.
+    expect(multi!.trim().length).toBeGreaterThan(0)
+
+    const lines = renderMemoryDataBlock(multi!)
+      .split(`${MEMORY_BLOCK_BEGIN}\n`)[1]!
+      .split(`\n${MEMORY_BLOCK_END}`)[0]!
+      .split('\n')
+
+    expect(lines.every(l => l.startsWith('| '))).toBe(true)
+
+    // The block really does hold two sections — otherwise this test would pass
+    // against the old folding rule and guard nothing.
+    const headings = lines.filter(l => l.startsWith('| ['))
+    expect(headings.length).toBeGreaterThan(0)
+    expect(lines.filter(l => l.startsWith('| ## ')).length).toBeGreaterThanOrEqual(2)
+
+    // No heading swallowed a label, and every label sits under a heading that
+    // was not rewritten to exclude it.
+    expect(lines.some(l => l.startsWith('| [') && l.includes('## '))).toBe(false)
+    expect(headings.every(h => !h.includes('## '))).toBe(true)
   })
 
   maybe('injects fewer lines than the digest it was handed', () => {

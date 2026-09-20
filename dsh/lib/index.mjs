@@ -246,28 +246,73 @@ let _initProto;function _applyDecs(e,t,n,r,o,i){var a,c,u,s,f,l,p,d=Symbol.metad
 * @param line - A line of memory content.
 * @returns The line, prefixed with {@link MEMORY_LINE_PREFIX}.
 */function fenceMemoryLine(line){return`| ${line.replace(/\u0000/gu,"")}`;}/** Prefix of a scope-block heading line (`[当前项目: api · 2 条 · 决策规则 1]`). */const BLOCK_HEADING_OPEN="[";/** Prefix of a section label line inside a block (`## 决策规则`). */const SECTION_LABEL_OPEN="## ";/**
-* Fold a block heading into the section label that follows it.
+* The separator the Python half puts between a block and the next one, and
+* before the footer (`atom_memory/summary.py`'s `_BLOCK_SEPARATOR`).
 *
-* The scoped digest arrives as a heading line followed by a label line:
+* A single colon rather than a blank line, because the host prefixes every line
+* including blank ones, so a blank separator would arrive as `| ` — a line that
+* looks like content carrying nothing.
+*/const BLOCK_SEPARATOR=":";/**
+* Whether a line is a scope-block heading (`[当前项目: api · 2 条 · 决策规则 1]`).
 *
-* ```
-* [当前项目: api · 2 条 · 决策规则 1]
-* ## 决策规则
-* ```
+* @param line - The line to test.
+* @returns `true` when the line is a block heading.
+*/function isBlockHeading(line){return line!==void 0&&line.startsWith(BLOCK_HEADING_OPEN)&&line.endsWith("]");}/**
+* Whether another section label belongs to the block headed at `index`.
 *
-* Two lines that describe the same thing, each paying the per-line cost of the
-* `| ` prefix on every request of every session. Folding them into one keeps the
-* hierarchy and drops a line: `[当前项目: api · 2 条] ## 决策规则`.
-*
-* Only that exact adjacency is folded — a heading whose next line is a fact, a
-* separator or another heading is left alone, because there the two lines are not
-* describing the same thing. This is a rendering of the digest the Python half
-* produced, not a re-parse of it: nothing else about the layout is touched, and a
-* digest in the flat (single-section) shape passes through untouched.
+* A block's body is a run of labels and facts that ends at the next block
+* heading, at the separator, or at the end of the digest. So "does this heading
+* cover more than one section?" is "does a label appear after the one at
+* `index + 1`, before the block ends?" — the scan therefore starts *past* that
+* first label, or it would count the label it is about to fold as a second one.
 *
 * @param lines - The sanitised digest lines.
-* @returns The lines with every heading/label pair merged.
-*/function foldBlockHeadings(lines){const out=[];for(let i=0;i<lines.length;i+=1){const line=lines[i];const next=lines[i+1];if(line.startsWith(BLOCK_HEADING_OPEN)&&line.endsWith("]")&&next?.startsWith(SECTION_LABEL_OPEN)){out.push(`${line} ${next}`);i+=1;continue;}out.push(line);}return out;}/**
+* @param index - Index of the heading line, whose first label is at `index + 1`.
+* @returns `true` when a further section label follows inside the same block.
+*/function hasSecondSection(lines,index){for(let i=index+2;i<lines.length;i+=1){const line=lines[i];if(isBlockHeading(line)||line===BLOCK_SEPARATOR)return false;if(line.startsWith(SECTION_LABEL_OPEN))return true;}return false;}/**
+* Fold a block heading into the section label that follows it, **when and only
+* when the two describe the same thing**.
+*
+* The scoped digest arrives as a heading line followed by label lines:
+*
+* ```
+* [当前项目: api · 1 条 · 决策规则 1]
+* ## 决策规则
+* - 提交前跑测试
+* ```
+*
+* Both lines describe one block, and each pays the per-line cost of the `| `
+* prefix on every request of every session, so folding them keeps the hierarchy
+* and drops a line: `[当前项目: api · 1 条 · 决策规则 1] ## 决策规则`.
+*
+* **Why the fold is conditional.** A heading states a breakdown over the block's
+* whole rendered selection, so it is only equivalent to the label that follows it
+* when the block holds *exactly one* section (see {@link hasSecondSection}).
+* Gluing it to the first of several labels re-attributes every other section to
+* nothing:
+*
+* ```
+* | [全局规则 · 2 条 · 决策规则 1 · 教训 1] ## 决策规则   <- heading claims both
+* | - 全局规则
+* | ## 教训                                             <- orphaned: no attribution
+* ```
+*
+* That is worse than the line it saved — the heading now appears to describe
+* `决策规则` alone while a bare `教训` label floats under it, which is the exact
+* "block heading contradicts its own body" defect the Python half's
+* `_render_block_heading` works to prevent. A multi-section block therefore keeps
+* its heading on its own line; the one line the fold would save is not worth a
+* heading that lies.
+*
+* A heading whose next line is a fact, a separator or another heading is likewise
+* left alone, because there it is not heading a label at all. This is a rendering
+* of the digest the Python half produced, not a re-parse of it: nothing else about
+* the layout is touched, and a digest in the flat (single-section) shape passes
+* through untouched.
+*
+* @param lines - The sanitised digest lines.
+* @returns The lines with every foldable heading/label pair merged.
+*/function foldBlockHeadings(lines){const out=[];for(let i=0;i<lines.length;i+=1){const line=lines[i];const label=lines[i+1];if(isBlockHeading(line)&&label?.startsWith(SECTION_LABEL_OPEN)&&!hasSecondSection(lines,i)){out.push(`${line} ${label}`);i+=1;continue;}out.push(line);}return out;}/**
 * Render a memory digest as a fenced, line-prefixed data block.
 *
 * @param digest - The compact memory digest (already rendered by the Python half).
