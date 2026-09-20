@@ -25,7 +25,6 @@
         llmExtractionEnabled: true
         nudgeEnabled: true
         nudgeIntervalMinutes: 30
-        preCompressionCapture: true
         autostart: true
         scopeEnabled: true
 

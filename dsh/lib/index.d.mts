@@ -39,8 +39,6 @@ interface Config {
   nudgeEnabled?: boolean;
   /** Minutes between periodic nudge sweeps. */
   nudgeIntervalMinutes?: number;
-  /** Whether the pre-compression rescue hook is enabled. */
-  preCompressionCapture?: boolean;
   /** Max facts surfaced to the model per recall tool call. */
   maxRecalledFacts?: number;
   /** Estimated token cap for returned summary. */

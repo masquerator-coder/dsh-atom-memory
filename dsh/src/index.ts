@@ -437,14 +437,13 @@ export function apply(ctx: Context, config: ConfigShape): void {
   })
   for (const d of disposers) ctx.effect(() => d)
 
-  // Durable capture hooks (per-message, pre-compression, periodic nudge).
+  // Durable capture hooks (per-message, periodic nudge).
   registerCapture(
     { ctx, capture, maxRecent: 20 },
     {
       // A getter: the panel's switch stops capture immediately rather than at
       // the next reload.
       captureEnabled: () => runtime.get().captureEnabled,
-      preCompressionCapture: config.preCompressionCapture !== false,
       nudgeEnabled: config.nudgeEnabled !== false,
       nudgeIntervalMs: (config.nudgeIntervalMinutes ?? 30) * 60_000,
     },

@@ -45,8 +45,6 @@ export interface Config {
   nudgeEnabled?: boolean
   /** Minutes between periodic nudge sweeps. */
   nudgeIntervalMinutes?: number
-  /** Whether the pre-compression rescue hook is enabled. */
-  preCompressionCapture?: boolean
   /** Max facts surfaced to the model per recall tool call. */
   maxRecalledFacts?: number
   /** Estimated token cap for returned summary. */
@@ -200,7 +198,6 @@ export const Config: z<Config> = z.object({
   extractionMaxTokens: z.number().default(2048),
   nudgeEnabled: z.boolean().default(true),
   nudgeIntervalMinutes: z.number().default(30),
-  preCompressionCapture: z.boolean().default(true),
   maxRecalledFacts: z.number().default(10),
   summaryTokens: z.number().default(1500),
   injectedSummaryTokens: z.number().default(DEFAULT_INJECTED_SUMMARY_TOKENS),

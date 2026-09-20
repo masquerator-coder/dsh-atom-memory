@@ -9,13 +9,12 @@
  *     immediately. Every direct user message is captured; whether it becomes
  *     a fact is decided downstream by the LLM extractor (or rule fallback),
  *     not by a brittle keyword gate.
- *  2. **Pre-compression rescue** — when the context window is about to be
- *     compacted (`llm/stream` with `purpose: 'compaction'`), the session's
- *     recent not-yet-stored user messages are re-scanned and saved *before*
- *     compression so key facts survive the fold. The hook always calls
- *     `next()` — compression is never blocked.
- *  3. **Periodic nudge** — a timer periodically re-scans recent direct user
- *     messages so facts the LLM was too busy to save are not lost.
+ *  2. **Periodic nudge** — a timer periodically re-scans recent direct user
+ *     messages so facts the LLM was too busy to save are not lost. This is the
+ *     *only* retry path: a pre-compression hook used to sit alongside it, but
+ *     both went through the same `sweep`, so it rescued exactly the same
+ *     entries and added no coverage — only a second trigger for a set the
+ *     nudge already reaches.
  *
  * The per-session "recent messages" buffer is fed only from durable
  * `user/message` session events (which dsh logs and can replay), so the memory
@@ -33,7 +32,6 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
-import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { sessionCwdOf } from './scope.ts'
 
 interface MessageEntry {
@@ -66,7 +64,6 @@ export interface CaptureDeps {
 export interface CaptureOptions {
   /** Whether capture runs at all, resolved at each hook invocation. */
   captureEnabled: () => boolean
-  preCompressionCapture: boolean
   nudgeEnabled: boolean
   /** Nudge sweep period in ms. */
   nudgeIntervalMs: number
@@ -111,8 +108,12 @@ export function registerCapture(deps: CaptureDeps, opts: CaptureOptions): (() =>
    * capture is still in-flight (neither succeeded nor failed) is skipped so a
    * rescue cannot duplicate it, and an already-``captured`` one is skipped too.
    * Each entry is marked ``captured`` *before* the retry is awaited so two
-   * concurrent sweeps (pre-compression + nudge) cannot double-send the same
-   * text.
+   * concurrent sweeps cannot double-send the same text.
+   *
+   * A message that is still in flight when a sweep runs is therefore *not*
+   * rescued by that sweep. It is not lost either: the in-flight capture settles
+   * on its own, and only a definitive failure leaves the entry retriable for a
+   * later sweep.
    */
   const sweep = async (sessionId: string): Promise<void> => {
     if (!enabled()) return
@@ -152,22 +153,6 @@ export function registerCapture(deps: CaptureDeps, opts: CaptureOptions): (() =>
     )
   }))
 
-  // -- pre-compression rescue (llm/stream waterfall) -------------------------
-  if (opts.preCompressionCapture) {
-    disposers.push(ctx.on('llm/stream', async function* (options: GenerateOptions, next) {
-      if (options.purpose === 'compaction' && options.sessionId && enabled()) {
-        // Rescue not-yet-stored messages before the compaction request leaves.
-        // Never blocks the request itself.
-        try {
-          await sweep(String(options.sessionId))
-        } catch {
-          /* best-effort */
-        }
-      }
-      yield* await next()
-    }))
-  }
-
   // -- periodic nudge (timer, best-effort) -----------------------------------
   if (opts.nudgeEnabled) {
     const timer = setInterval(() => {
@@ -183,7 +168,3 @@ export function registerCapture(deps: CaptureDeps, opts: CaptureOptions): (() =>
 
   return disposers
 }
-
-// Re-export the StreamChunk type so the waterfall page's return type stays
-// coherent for callers that import from here.
-export type { StreamChunk }

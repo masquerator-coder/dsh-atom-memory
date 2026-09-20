@@ -2,6 +2,42 @@
 
 ## [Unreleased]
 
+### Removed (第二十轮：删掉从未生效的「压缩前抢救」)
+
+**问题**：`preCompressionCapture` 钩在 `llm/stream` 上、以 `purpose === 'compaction'`
+为触发条件，看起来是"压缩前把还没落库的消息抢救下来"。实际上它调用的 `sweep` 只重试
+`failed === true` 的条目（`entry.captured || !entry.failed → continue`），而 `failed`
+仅在立即捕获**抛异常**时才置位。真实采集是异步 LLM 抽取，压缩触发时消息绝大多数正处于
+**在途**（to succeed 也 to fail 都没发生），于是被逐个跳过 —— 从外面看就是"功能没起作用"。
+
+实测（会话 `session-c86f0203`，读 `session.v3.jsonl.zstd` 与活库只读查询）：
+
+- `compaction/start` 18:35:31、`compaction/end` 18:39:11；
+- 该会话 5 条候选的落库时间分别为 18:12:34、18:17:30、18:29:39（压缩前）与 18:47:36、19:03:47（压缩后）；
+- **压缩前那 3 条全部已经是 `skipped`**（正常落库后的终态），压缩时刻不存在任何 `failed` 条目 —— 钩子一次都没救到东西；
+- 全库 82 `skipped` / 71 `applied`，`reject_kind` 基本为 `None`，佐证失败态罕见。
+
+**为什么是删而不是修**：`sweep` 由三条路径共用，「压缩前」与「周期微调」救的是
+**同一个集合**，只是触发时机不同 —— 探针已验证两条路径的救援次数完全相同，它们不是互补机制。
+
+**dsh 侧**：
+
+- `capture.ts`：删掉 `llm/stream` 钩子、`CaptureOptions.preCompressionCapture`、
+  `GenerateOptions`/`StreamChunk` 的导入与 `StreamChunk` 重导出；模块头注释与 `sweep`
+  文档同步改写（原文描述的行为已成谎言）。
+- `config.ts` / `index.ts`：删掉 `preCompressionCapture` 字段、默认值与传参。
+- `cordis.patch.yml`：删掉随层发布的 `preCompressionCapture: true`。
+- 测试：删掉只覆盖 `failed` 分支的 rescue 测试；新增两条 —— 「失败后在微调扫描中获救」
+  与「在途条目不被重发」，并断言 `llm/stream` 上不再注册任何处理器。
+
+**兼容性**：`schemastery` 对未知键是**透传而非拒绝**（实测 `z.object` 接受多余字段），
+因此已有 `settings.yaml` / profile 里残留的 `preCompressionCapture` 不会导致加载失败。
+
+**已知边界（保留的取舍）**：重试队列 `recent` 是**按进程的内存 Map**，只覆盖本进程见过的
+session。进程退出后未及重试的失败条目不会被任何路径再碰到。DSH 未提供枚举历史 session 的
+能力（`ctx.sessions.list()` 只返回 live session，`SessionStore` 明确不负责持久化），
+故此项是有意接受的窄窗口。
+
 ### Fixed (第十九轮：待办被当成单值属性，写入即覆盖 / 同批即丢弃)
 
 **问题**：写入侧决定"一个键能不能有多条事实"的唯一权威是

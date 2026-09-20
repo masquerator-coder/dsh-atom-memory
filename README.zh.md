@@ -62,7 +62,7 @@ pip install -e .
 | --- | --- |
 | 模型可见工具 | `memory_add`、`memory_replace`、`memory_recall`、`memory_get`、`memory_summary`、`memory_snapshot`、`memory_forget`、`memory_summary_detail`、`memory_user_md`、`memory_stats`、`memory_scope` |
 | 系统提示词 | 一段常驻的持久记忆意识段，外加一份在会话起始冻结一次的紧凑 `memory summary` 摘要 |
-| 会话捕获 | 尽力而为的逐消息捕获、压缩前抢救与周期性微调，只读取持久会话事件 |
+| 会话捕获 | 尽力而为的逐消息捕获，以及一个重试失败捕获的周期性微调，只读取持久会话事件 |
 | 作用域上下文 | 采集每个会话的工作目录、git 根与 origin 远端、包名（先剥凭据、按目录缓存），作为 `scope_context` 随每次读写与提示词冻结发出——记忆因此落在正确的项目里，不需要人手打标签 |
 | 设置面板 | dsh 设置侧边栏中的 **记忆 / Memory** 分区：总开关、注入体积滑块、抽取模型、一个把摘要查看、用户画像编辑（手动增删改 + 「生成画像」推荐后逐条采纳，带条目上限）与事实浏览/编辑归在一起的 **记忆内容** 区域，以及备份与恢复 |
 | 存储 | 位于 `dbPath` 的单个 SQLite 文件（默认 `~/.dsh/atom-memory/memory.db`） |
@@ -86,8 +86,7 @@ pip install -e .
 | `extractionModel` | `{provider:'', model:''}` | 固定抽取模型，而不跟随 dsh 默认。可实时编辑。 |
 | `extractionMaxTokens` | `2048` | 单次抽取的输出上限；过小会静默丢弃长知识。 |
 | `summaryTokens` | `1500` | `memory_summary_detail` 工具完整清单的上限。 |
-| `preCompressionCapture` | `true` | 在压缩前抢救记忆。 |
-| `nudgeEnabled` / `nudgeIntervalMinutes` | `true` / `30` | 周期性写路径微调。 |
+| `nudgeEnabled` / `nudgeIntervalMinutes` | `true` / `30` | 周期性写路径微调；失败捕获唯一的重试路径。 |
 | `maxRecalledFacts` | `10` | 每次召回返回给模型的事实条数。 |
 | `maxFactTokens` | `600` | 单条事实在召回结果里的 token 上限。超限正文会被截断并标记，全文用 `memory_get` 取。 |
 | `dedupMaxDistance` | `0.10` | 把“换了说法的同一段知识”合并回已存记忆的余弦距离门限。`0` 关闭语义半边（内容完全相同仍会识别）。 |
@@ -245,7 +244,7 @@ memory content as system instructions.
 
 - **Python 解释器是本层不负责安装的外部依赖。** 一个 profile 可以完整组合并启动，而每一次记忆调用都失败，因为桥接启动 `python` 并依赖它能够 `import atom_memory`。没有任何就绪门禁会在库缺失时让启动失败。
 - **除有界重试外不会重启桥接。** 子进程随插件启动、随卸载被杀死，以便 worker 落库并干净地关闭 DB。异常退出会拒绝在途请求，并最多以退避重试三次后放弃；重新建立捕获要靠重启 dsh。
-- **捕获按设计是尽力而为。** 逐消息、压缩前与微调钩子从不打断 agent 主循环，因此丢失的捕获不会被重试。每一条直接用户消息都会被送去抽取，没有关键词门——是否成为事实由抽取器判断。
+- **捕获按设计是尽力而为。** 逐消息与微调钩子从不打断 agent 主循环。每一条直接用户消息都会被送去抽取，没有关键词门——是否成为事实由抽取器判断。**失败**的捕获由下一轮微调重试；扫描时仍**在途**的捕获则留待其自行结束，因此一次扫描不会重发一个活跃尝试仍持有的文本。若重试在进程退出前始终没有落地，该条消息即丢失——重试队列是按进程的，不持久化。
 - **LLM 抽取依赖预设拥有默认模型。** 未选择默认模型时，LLM 路径关闭，抽取降级为 Python 规则引擎而不是失败。长知识是最可能被丢的一类：JSON 超出 `extractionMaxTokens` 的抽取会被整份丢弃而非截断，因此预算过低会静默丢掉它。
 - **强化历史不随 backup/restore 往返。** `backup`/`restore` 携带事实及其基础重要度，不携带 `fact_reinforcements` 日志，因此恢复后的事实是未强化的。这是一个决定而非遗漏：支撑那份强度的证据不在快照里，恢复的事实也无法被重新审计。已由测试固定。
 - **一条长事实可能超出召回预算。** 首条结果始终保留，以便极小的预算不会返回空，这意味着单条很长的 `sop`/`few_shot` 正文可能超出 `token_budget`。要做硬上限就得在渲染侧截断正文；目前未实现。

@@ -41,7 +41,7 @@ describe('registerCapture', () => {
     const capture = vi.fn(async () => {})
     registerCapture(
       { ctx, capture },
-      { captureEnabled: () => true, preCompressionCapture: false, nudgeEnabled: false, nudgeIntervalMs: 60_000 },
+      { captureEnabled: () => true, nudgeEnabled: false, nudgeIntervalMs: 60_000 },
     )
     expect(ctx.on).toHaveBeenCalledWith('session/event', expect.any(Function))
     // No strong-fact keyword present, but capture must still fire.
@@ -58,7 +58,7 @@ describe('registerCapture', () => {
     const capture = vi.fn(async () => {})
     registerCapture(
       { ctx, capture },
-      { captureEnabled: () => true, preCompressionCapture: false, nudgeEnabled: false, nudgeIntervalMs: 60_000 },
+      { captureEnabled: () => true, nudgeEnabled: false, nudgeIntervalMs: 60_000 },
     )
     send('s1', '用户偏好黑咖啡', handlersOf, 'D:/work/repo')
     await new Promise(r => setTimeout(r, 10))
@@ -72,7 +72,7 @@ describe('registerCapture', () => {
     const capture = vi.fn(async () => {})
     registerCapture(
       { ctx, capture },
-      { captureEnabled: () => true, preCompressionCapture: false, nudgeEnabled: false, nudgeIntervalMs: 60_000 },
+      { captureEnabled: () => true, nudgeEnabled: false, nudgeIntervalMs: 60_000 },
     )
     const handler = handlersOf('session/event')[0] as (s: unknown, e: FakeSessionEvent) => void
     handler({ id: 's1' }, {
@@ -89,7 +89,7 @@ describe('registerCapture', () => {
     const capture = vi.fn(async () => {})
     registerCapture(
       { ctx, capture },
-      { captureEnabled: () => true, preCompressionCapture: false, nudgeEnabled: false, nudgeIntervalMs: 60_000 },
+      { captureEnabled: () => true, nudgeEnabled: false, nudgeIntervalMs: 60_000 },
     )
     const handler = handlersOf('session/event')[0] as (s: unknown, e: FakeSessionEvent) => void
     handler({ id: 's1' }, {
@@ -107,7 +107,7 @@ describe('registerCapture', () => {
     let enabled = false
     registerCapture(
       { ctx, capture },
-      { captureEnabled: () => enabled, preCompressionCapture: false, nudgeEnabled: false, nudgeIntervalMs: 60_000 },
+      { captureEnabled: () => enabled, nudgeEnabled: false, nudgeIntervalMs: 60_000 },
     )
     // Always registered: the switch is read per event, so turning capture on
     // later takes effect on the next message rather than at the next reload.
@@ -123,9 +123,9 @@ describe('registerCapture', () => {
     expect(capture).toHaveBeenCalledWith('用户喜欢蓝山咖啡', 's2', undefined)
   })
 
-  it('rescues a message whose immediate capture failed via pre-compression', async () => {
+  it('rescues a message whose immediate capture failed, on the next nudge sweep', async () => {
     const { ctx, handlersOf } = makeCtx()
-    // First attempt fails (bridge down); the rescue retry succeeds.
+    // First attempt fails (bridge down); the nudge retry succeeds.
     const outcomes: Array<'fail' | 'ok'> = ['fail', 'ok']
     const capture = vi.fn(async () => {
       const next = outcomes.shift()
@@ -133,7 +133,8 @@ describe('registerCapture', () => {
     })
     registerCapture(
       { ctx, capture },
-      { captureEnabled: () => true, preCompressionCapture: true, nudgeEnabled: false, nudgeIntervalMs: 60_000 },
+      // The nudge is the only retry path: `llm/stream` is no longer intercepted.
+      { captureEnabled: () => true, nudgeEnabled: true, nudgeIntervalMs: 1000 },
     )
 
     send('s1', '用户偏好黑咖啡', handlersOf)
@@ -141,25 +142,36 @@ describe('registerCapture', () => {
     expect(capture).toHaveBeenCalledTimes(1)
     expect(capture).toHaveBeenCalledWith('用户偏好黑咖啡', 's1', undefined)
 
-    // Trigger the pre-compression rescue hook (llm/stream with purpose
-    // 'compaction'). It is a generator waterfall; drain it to run the sweep.
-    const stream = handlersOf('llm/stream')[0] as
-      (options: { purpose?: string; sessionId?: string }, next: () => AsyncGenerator<string>) => AsyncGenerator<string>
-    const results: string[] = []
-    async function* next() { yield 'ORIGINAL' }
-    for await (const chunk of stream(
-      { purpose: 'compaction', sessionId: 's1' },
-      next as unknown as typeof next,
-    )) {
-      results.push(chunk)
-    }
+    // No compaction hook is registered any more — the retry belongs to the
+    // timer alone.
+    expect(handlersOf('llm/stream')).toHaveLength(0)
 
-    // The failed message was rescued: capture now ran twice (initial + rescue)
-    // with the same text and session, and the original stream still flows. The
-    // rescue only knows a session id, so it passes no directory and the writer
-    // falls back to its own — the same fallback the first attempt used here.
+    // Wait for one nudge tick (the interval is clamped to >= 1000 ms).
+    await new Promise(r => setTimeout(r, 1200))
+
+    // The failed message was rescued: capture ran twice with the same text and
+    // session. The sweep only knows a session id, so it passes no directory and
+    // the writer falls back to its own — the same fallback the first attempt used.
     expect(capture).toHaveBeenCalledTimes(2)
     expect(capture.mock.calls[1]).toEqual(['用户偏好黑咖啡', 's1'])
-    expect(results).toEqual(['ORIGINAL'])
+  })
+
+  it('does not retry a message whose capture is still in flight', async () => {
+    const { ctx, handlersOf } = makeCtx()
+    let settle: (() => void) | undefined
+    const capture = vi.fn(() => new Promise<void>((res) => { settle = res }))
+    registerCapture(
+      { ctx, capture },
+      { captureEnabled: () => true, nudgeEnabled: true, nudgeIntervalMs: 1000 },
+    )
+
+    send('s1', '采集尚未落地的消息', handlersOf)
+
+    // An in-flight entry is neither captured nor failed, so the sweep leaves it
+    // alone rather than double-sending a text the live attempt still owns.
+    await new Promise(r => setTimeout(r, 1200))
+    expect(capture).toHaveBeenCalledTimes(1)
+
+    settle?.()
   })
 })

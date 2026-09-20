@@ -10,8 +10,8 @@ DeepSeek Harness，通过 NDJSON stdio 桥接，暴露 `memory_*` 工具、LLM-f
 - **LLM-first**：默认用 dsh 当前预设的第一个模型（`agentDefaultModel`
   `currentSelection()`）调用 `ctx.llm` 抽取，类型化候选交给 Python 持久化；
   LLM 不可用/为空时回退到 Python 规则抽取 —— 绝不静默丢弃。
-- **捕获钩子**：per-message 捕获、压缩前抢救（pre-compression rescue）、
-  周期性微调（periodic nudge），只读 durable 会话事件。
+- **捕获钩子**：per-message 捕获与周期性微调（periodic nudge），只读 durable
+  会话事件。微调是失败捕获唯一的重试路径。
 - **生命周期**：子进程与插件绑定，卸载时优雅 stop 落库并 kill。
 
 ## 安装与挂载
@@ -38,8 +38,7 @@ pnpm build       # -> lib/index.mjs
 | `captureEnabled` | `true` | per-message 捕获 |
 | `llmExtractionEnabled` | `true` | 启用以 dsh 默认模型作 LLM-first 抽取 |
 | `extractionMaxTokens` | `2048` | 单次抽取的输出 token 上限（需装下知识正文，过小会静默丢长知识） |
-| `preCompressionCapture` | `true` | 压缩前抢救 |
-| `nudgeEnabled` | `true` | 周期微调（写路径） |
+| `nudgeEnabled` | `true` | 周期微调（写路径），失败捕获的唯一重试路径 |
 | `nudgeIntervalMinutes` | `30` | 微调周期 |
 | `maxRecalledFacts` | `10` | 每次召回给模型的条数上限 |
 | `summaryTokens` | `1500` | `memory_summary_detail` 工具返回的完整清单 token 上限（设置弹窗走同一预算，但取紧凑深度） |
@@ -255,8 +254,9 @@ instructions.`）：工具指引只写在 awareness 段，两段是相邻注入�
   无上限重生（最多 3 次后退避）。
 - **LLM 默认模型**：抽取使用 `agentDefaultModel.currentSelection()`；若当前预设
   无默认模型，则 LLM 路径关闭，退化为纯规则抽取。
-- **捕获钩子**：per-message/压缩前/定期微调钩子是 best-effort（不会打断主线循环）；
-  每条直接用户消息都送 LLM 抽取，是否成事实由抽取器判断（无关键词门）。
+- **捕获钩子**：per-message/定期微调钩子是 best-effort（不会打断主线循环）；
+  每条直接用户消息都送 LLM 抽取，是否成事实由抽取器判断（无关键词门）。**失败**的
+  捕获由下一轮微调重试；扫描时仍在途的捕获留待其自行结束，不会被重发。
   `user/message` 等事件来自 dsh 的 durable 会话日志，可重放。
 - **单条超预算**：召回预算的首条保留策略意味着**单条**长知识仍可能超过
   `token_budget`（上例中预算 100 却返回了 ~2100 tokens 的一条）。需要硬上限时
