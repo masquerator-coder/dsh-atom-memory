@@ -9,6 +9,7 @@
 #  commits, so the record could not have verified anything. Re-recorded again after
 #  the scope round, which edited both sides together. Re-recorded after the
 #  cardinality round, which added one configuration row and one known limitation
-#  to both sides.)
-README.md: cbe73134f16612773fa504a98744a44e4de86e1e
-README.zh.md: 9704a213baad4803c69a865c6b5365e24dffd435
+#  to both sides. Re-recorded after the diagrams round, which added an
+#  "Architecture diagrams" section to both sides.)
+README.md: d34cbd9ea802457151c558f0bd531caa989f163e
+README.zh.md: d2e57c02e39986d58bf533eb6983020a8e2f4c46

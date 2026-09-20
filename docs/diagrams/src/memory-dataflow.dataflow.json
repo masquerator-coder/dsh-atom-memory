@@ -1,0 +1,113 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "dsh-atom-memory 数据流程",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "animation": "trace",
+    "viewBox": [1080, 612],
+    "views": [
+      {
+        "id": "write-flow",
+        "label": "写入与抽取",
+        "focus": ["session", "extract", "candidates", "validate", "scope_res", "embed", "facts"],
+        "note": "一条用户消息从捕获到落库为原子记忆。"
+      },
+      {
+        "id": "read-flow",
+        "label": "检索与注入",
+        "focus": ["query", "indexes", "rrf", "digest", "fence"],
+        "note": "查询经双索引融合与重排后回到系统提示词。"
+      },
+      {
+        "id": "derive-flow",
+        "label": "派生视图",
+        "focus": ["facts", "digest", "synth", "cache"],
+        "note": "同一批事实如何派生出工作综述。"
+      }
+    ]
+  },
+  "stages": [
+    { "label": "采集与抽取" },
+    { "label": "裁决与向量化" },
+    { "label": "索引" },
+    { "label": "存储" },
+    { "label": "派生与投递" }
+  ],
+  "nodes": [
+    { "id": "session", "type": "external", "label": "用户消息", "sublabel": "会话事件", "stage": 0, "row": 0, "tag": "原文", "width": 120 },
+    { "id": "extract", "type": "backend", "label": "LLM 抽取", "sublabel": "dsh 默认模型", "stage": 0, "row": 2, "tag": "LLM 优先，规则兜底", "width": 120 },
+    { "id": "query", "type": "external", "label": "检索查询", "sublabel": "memory_recall 入参", "stage": 0, "row": 3, "tag": "名词短语最佳", "width": 120 },
+
+    { "id": "candidates", "type": "messagebus", "label": "typed candidates", "sublabel": "SPO · 类型 · 置信度", "stage": 1, "row": 0, "tag": "跨进程载荷", "width": 120 },
+    { "id": "validate", "type": "backend", "label": "校验与裁决", "sublabel": "重复 · 冲突 · 退化", "stage": 1, "row": 1, "tag": "决策先于写入", "width": 120 },
+    { "id": "scope_res", "type": "backend", "label": "作用域归属", "sublabel": "scope 树 + 主题词表", "stage": 1, "row": 2, "tag": "绑定同事务", "width": 120 },
+    { "id": "embed", "type": "backend", "label": "向量化", "sublabel": "FastEmbed 本地推理", "stage": 1, "row": 3, "tag": "512 维", "width": 120 },
+
+    { "id": "queue", "type": "messagebus", "label": "task_queue", "sublabel": "task_type extract", "stage": 2, "row": 0, "tag": "带租约认领", "width": 120 },
+    { "id": "indexes", "type": "database", "label": "FTS5 ⊕ vec0", "sublabel": "jieba 分词 · 余弦 KNN", "stage": 2, "row": 3, "tag": "两条独立索引", "width": 120 },
+
+    { "id": "facts", "type": "database", "label": "facts 表", "sublabel": "SPO + 指纹 + 状态", "stage": 3, "row": 0, "tag": "唯一权威事实", "width": 120 },
+    { "id": "profile", "type": "database", "label": "user_profile", "sublabel": "用户独占的表", "stage": 3, "row": 1, "tag": "不随后续写入复活", "width": 120 },
+    { "id": "rrf", "type": "backend", "label": "RRF 融合重排", "sublabel": "0.4 + 0.2 + 0.2 + 0.2", "stage": 3, "row": 3, "tag": "作用域项另行叠加", "width": 120 },
+
+    { "id": "digest", "type": "backend", "label": "摘要渲染", "sublabel": "summary.py 两档", "stage": 4, "row": 0, "tag": "硬性 token 上限", "width": 120 },
+    { "id": "fence", "type": "security", "label": "数据围栏", "sublabel": "逐行前缀 · 剥不可见字符", "stage": 4, "row": 1, "tag": "数据非指令", "width": 120 },
+    { "id": "cache", "type": "database", "label": "memory_overview", "sublabel": "每用户一行 + 指纹", "stage": 4, "row": 2, "tag": "下次会话生效", "width": 120 },
+    { "id": "synth", "type": "backend", "label": "综述合成", "sublabel": "空闲时一次模型调用", "stage": 4, "row": 3, "tag": "宿主侧不判定", "width": 120 }
+  ],
+  "flows": [
+    { "from": "session", "to": "candidates", "label": "抽取结果", "labelAt": [255, 96], "classification": "LLM 优先，规则兜底", "variant": "emphasis", "route": "straight" },
+    { "from": "query", "to": "indexes", "label": "查询向量 + 关键词", "classification": "作用域过滤", "variant": "emphasis", "route": "bottom-channel", "channelY": 690, "labelAt": [420, 708] },
+
+    { "from": "candidates", "to": "validate", "label": "候选事实", "labelDy": 42, "classification": "待裁决", "variant": "emphasis", "route": "straight" },
+    { "from": "validate", "to": "scope_res", "label": "作用域与主题", "labelDy": 42, "classification": "未知名归最近祖先", "variant": "emphasis", "route": "straight" },
+    { "from": "scope_res", "to": "embed", "label": "可写入候选", "labelDy": 42, "classification": "指纹查重之后", "variant": "emphasis", "route": "straight" },
+
+    { "from": "validate", "to": "queue", "label": "认领任务", "classification": "租约超时可回收", "variant": "emphasis", "route": "vertical-channel" },
+    { "from": "embed", "to": "indexes", "label": "事实向量 + 全文", "labelAt": [585, 350], "classification": "双路候选", "variant": "emphasis", "route": "vertical-channel", "width": 2.4 },
+
+    { "from": "queue", "to": "facts", "label": "任务落库", "classification": "单事务写入", "variant": "emphasis", "route": "straight", "width": 2.4 },
+    { "from": "facts", "to": "profile", "label": "仅 semantic 投影", "labelDy": 42, "classification": "画像表用户自有", "variant": "dashed", "route": "straight" },
+    { "from": "indexes", "to": "rrf", "label": "双路排名", "classification": "RRF 融合", "variant": "emphasis", "route": "straight" },
+
+    { "from": "facts", "to": "digest", "label": "活跃事实", "classification": "按类型分节", "variant": "emphasis", "route": "straight" },
+    { "from": "digest", "to": "fence", "label": "紧凑摘要", "labelDy": 42, "classification": "预算裁剪之后", "variant": "emphasis", "route": "straight", "width": 2.4 },
+    { "from": "rrf", "to": "synth", "label": "检索命中", "classification": "证据进入综述", "variant": "dashed", "route": "straight" },
+    { "from": "synth", "to": "cache", "label": "overview_put", "labelAt": [730, 562], "classification": "写入前剥标题行", "variant": "emphasis", "route": "straight" },
+    { "from": "cache", "to": "fence", "label": "下次会话读取", "labelAt": [730, 380], "classification": "本会话不受影响", "variant": "emphasis", "route": "straight" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "唯一权威与派生视图",
+      "items": [
+        "原子事实是唯一被存储的记忆单位",
+        "摘要与工作综述都由事实重建，不单独存储",
+        "用户画像是独立的表，不从事实反推",
+        "任何视图读错都可重建，事实本身不受影响"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "写入的原子性",
+      "items": [
+        "事实行、全文索引、向量落在同一个事务",
+        "嵌入在事务开启前算好，避免长事务",
+        "中断只可能整体失败，不会留下半条记忆",
+        "内容重复时强化原有事实，而不是新增一行"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "检索与投递的边界",
+      "items": [
+        "相关性按理论上限归一，不按本次候选集归一",
+        "距离上限是唯一能断言「都不相关」的信号",
+        "超长事实被截断时一定标记并指向全文",
+        "注入文本逐行加前缀，存储内容无法变成提示词结构"
+      ]
+    }
+  ]
+}

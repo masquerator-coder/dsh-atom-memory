@@ -117,6 +117,16 @@ Deploy-time fields are declared in [`dsh/cordis.patch.yml`](dsh/cordis.patch.yml
 <details>
 <summary>Implementation internals — click to expand</summary>
 
+### Architecture diagrams
+
+Three explorable diagrams, each a self-contained HTML file that opens in a browser with no build step — dark/light themes, pan and zoom, search, relationship tracing, and PNG/JPEG/WebP/SVG export. All three are rendered from editable JSON specs in [`docs/diagrams/src/`](docs/diagrams/src/) and pass the `showcase` quality profile at 9/9 checks with 0 errors and 0 warnings.
+
+- [`docs/diagrams/memory-dataflow.html`](docs/diagrams/memory-dataflow.html) — **data flow**: the write path (message → LLM extraction → typed candidates → validation → scope and topic → embedding → `facts` in one transaction), the read path (query hits full-text and vector indexes together, fused by RRF), and the derivation path (facts → work units → overview → the cache the next session reads). Five stages, each node cited to real code.
+- [`docs/diagrams/system-architecture.html`](docs/diagrams/system-architecture.html) — **functional structure**: what each half owns, the two process-boundary regions, and the modules on either side.
+- [`docs/diagrams/class-structure.html`](docs/diagrams/class-structure.html) — **class and module structure**: the core classes, the two orthogonal dimensions (`ScopeStore` for context, `DomainStore` for topic), and the classes that sit on the cross-process boundary.
+
+The architecture and class diagrams carry per-node source citations verified against the pinned revision. See [`docs/diagrams/README.md`](docs/diagrams/README.md) for how to regenerate them.
+
 ### The patch document
 
 `cordis.patch.yml` is **insert-only**: the base layer has no row of id `atom-memory`, so the layer inserts

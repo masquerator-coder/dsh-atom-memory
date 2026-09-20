@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "dsh-atom-memory 类与模块结构",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "animation": "trace",
+    "viewBox": [1280, 700],
+    "repository": {
+      "url": "https://github.com/masquerator-coder/dsh-atom-memory",
+      "revision": "ff6c78f80aa00e05c88d4e787ff45fc6bdbdc065"
+    },
+    "views": [
+      {
+        "id": "python-core",
+        "label": "Python 核心类",
+        "focus": ["atommem", "worker", "validator", "scope_store", "retriever", "models", "store"],
+        "note": "记忆库的核心类与它们持有的数据模型。"
+      },
+      {
+        "id": "python-support",
+        "label": "支撑与派生",
+        "focus": ["domain_store", "summarizer", "overview", "reinforce", "config", "store"],
+        "note": "主题词表、派生视图与复用衰减曲线。"
+      },
+      {
+        "id": "bridge-side",
+        "label": "dsh 宿主侧",
+        "focus": ["plugin", "bridge", "tools", "runtime", "controller", "scope_ctx"],
+        "note": "插件装配、桥接与工具注册的类结构。"
+      }
+    ]
+  },
+  "layout": {
+    "mode": "grid",
+    "origin": [40, 92],
+    "cols": 6,
+    "gapX": 34,
+    "gapY": 86,
+    "cellW": 166,
+    "cellH": 64
+  },
+  "components": [
+    { "id": "config", "type": "backend", "label": "MemConfig", "sublabel": "全部权重与开关", "row": 0, "col": 0, "tag": "dataclass", "sources": [{ "path": "atom_memory/config.py" }] },
+    { "id": "models", "type": "backend", "label": "FactCandidate", "sublabel": "models.py 数据类", "row": 0, "col": 1, "tag": "跨层传输", "sources": [{ "path": "atom_memory/models.py", "line": 82 }] },
+    { "id": "atommem", "type": "backend", "label": "AtomMem", "sublabel": "api.py 门面类", "row": 0, "col": 2, "tag": "唯一聚合根", "sources": [{ "path": "atom_memory/api.py", "line": 72 }] },
+    { "id": "worker", "type": "backend", "label": "Worker", "sublabel": "worker.py 消费循环", "row": 0, "col": 3, "tag": "写入编排", "sources": [{ "path": "atom_memory/worker.py", "line": 231 }] },
+    { "id": "validator", "type": "backend", "label": "validator", "sublabel": "重复 · 冲突 · 退化", "row": 0, "col": 4, "tag": "纯函数模块", "sources": [{ "path": "atom_memory/validator.py" }] },
+    { "id": "sanitize", "type": "security", "label": "sanitize", "sublabel": "入库清洗", "row": 0, "col": 5, "tag": "独立于渲染层", "sources": [{ "path": "atom_memory/sanitize.py" }] },
+
+    { "id": "retriever", "type": "backend", "label": "Retriever", "sublabel": "retriever.py 检索", "row": 1, "col": 0, "tag": "读写分离", "sources": [{ "path": "atom_memory/retriever.py", "line": 172 }] },
+    { "id": "scopeview", "type": "backend", "label": "ScopeView", "sublabel": "按查询预计算邻域", "row": 1, "col": 1, "tag": "不按事实重算", "sources": [{ "path": "atom_memory/scope.py", "line": 1975 }] },
+    { "id": "scope_store", "type": "backend", "label": "ScopeStore", "sublabel": "scope.py 作用域树", "row": 1, "col": 2, "tag": "作用域维度", "sources": [{ "path": "atom_memory/scope.py", "line": 427 }] },
+    { "id": "domain_store", "type": "backend", "label": "DomainStore", "sublabel": "domain.py 主题词表", "row": 1, "col": 3, "tag": "主题维度", "sources": [{ "path": "atom_memory/domain.py", "line": 385 }] },
+    { "id": "reinforce", "type": "backend", "label": "ReinforceCurve", "sublabel": "复用与衰减曲线", "row": 1, "col": 4, "tag": "状态与读数分离", "sources": [{ "path": "atom_memory/reinforce.py" }] },
+    { "id": "store", "type": "database", "label": "SQLite 单文件", "sublabel": "facts · scope · domain", "row": 1, "col": 5, "tag": "WAL", "sources": [{ "path": "atom_memory/db.py" }] },
+
+    { "id": "summarizer", "type": "backend", "label": "summary", "sublabel": "摘要派生视图", "row": 2, "col": 0, "tag": "纯函数", "sources": [{ "path": "atom_memory/summary.py", "line": 284 }] },
+    { "id": "overview", "type": "backend", "label": "overview", "sublabel": "综述与变更分级", "row": 2, "col": 1, "tag": "纯函数", "sources": [{ "path": "atom_memory/overview.py", "line": 159 }] },
+    { "id": "profile", "type": "backend", "label": "profile", "sublabel": "用户画像表", "row": 2, "col": 2, "tag": "用户自有", "sources": [{ "path": "atom_memory/profile.py" }] },
+    { "id": "plugin", "type": "frontend", "label": "dsh-atom-memory", "sublabel": "Cordis 插件", "row": 2, "col": 3, "tag": "装配", "sources": [{ "path": "dsh/src/index.ts", "line": 234 }] },
+    { "id": "bridge", "type": "frontend", "label": "PythonBridge", "sublabel": "子进程与 NDJSON", "row": 2, "col": 4, "tag": "接口可注入", "sources": [{ "path": "dsh/src/bridge.ts", "line": 106 }] },
+    { "id": "rpc", "type": "messagebus", "label": "RpcServer", "sublabel": "rpc.py 协议层", "row": 2, "col": 5, "tag": "进程边界", "sources": [{ "path": "atom_memory/rpc.py", "line": 144 }] },
+
+    { "id": "runtime", "type": "frontend", "label": "LiveRuntime", "sublabel": "即时开关", "row": 3, "col": 0, "tag": "getter 而非值", "sources": [{ "path": "dsh/src/runtime.ts" }] },
+    { "id": "controller", "type": "frontend", "label": "MemoryController", "sublabel": "面板数据通道", "row": 3, "col": 1, "tag": "远程调用", "sources": [{ "path": "dsh/src/controller.ts" }] },
+    { "id": "tools", "type": "frontend", "label": "registerMemoryTools", "sublabel": "memory_* 注册", "row": 3, "col": 2, "tag": "注册函数", "sources": [{ "path": "dsh/src/tools.ts", "line": 776 }] },
+    { "id": "scope_ctx", "type": "frontend", "label": "scope", "sublabel": "上下文信号采集", "row": 3, "col": 3, "tag": "纯函数", "sources": [{ "path": "dsh/src/scope.ts" }] },
+    { "id": "frozen", "type": "frontend", "label": "FrozenSnapshot", "sublabel": "会话内冻结文本", "row": 3, "col": 4, "tag": "字节稳定", "sources": [{ "path": "dsh/src/context.ts", "line": 114 }] },
+    { "id": "fencing", "type": "security", "label": "围栏渲染器", "sublabel": "围栏与逐行前缀", "row": 3, "col": 5, "tag": "数据非指令", "sources": [{ "path": "dsh/src/memory-data.ts", "line": 168 }] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "Python 库：领域模型与派生视图", "wraps": ["config", "models", "atommem", "worker", "validator", "sanitize", "retriever", "scopeview", "scope_store", "domain_store", "reinforce", "store", "summarizer", "overview", "profile", "rpc"], "pad": 14 },
+    { "kind": "region", "label": "dsh 宿主侧：装配与传输", "wraps": ["plugin", "bridge", "runtime", "controller", "tools", "scope_ctx", "frozen", "fencing"], "pad": 14 }
+  ],
+  "connections": [
+    { "from": "config", "to": "models", "variant": "dashed" },
+    { "from": "models", "to": "atommem", "label": "持有", "variant": "emphasis" },
+    { "from": "atommem", "to": "worker", "label": "持有", "variant": "emphasis" },
+    { "from": "worker", "to": "validator", "label": "调用", "variant": "emphasis" },
+    { "from": "validator", "to": "sanitize", "variant": "dashed" },
+
+    { "from": "retriever", "to": "scopeview", "label": "构造", "variant": "emphasis" },
+    { "from": "scopeview", "to": "scope_store", "variant": "dashed" },
+    { "from": "scope_store", "to": "domain_store", "label": "正交维度", "variant": "emphasis" },
+    { "from": "domain_store", "to": "reinforce", "variant": "dashed" },
+    { "from": "reinforce", "to": "store", "label": "读写", "variant": "emphasis", "width": 2.4 },
+
+    { "from": "summarizer", "to": "overview", "variant": "dashed" },
+    { "from": "overview", "to": "profile", "variant": "dashed" },
+    { "from": "profile", "to": "plugin", "variant": "dashed" },
+    { "from": "plugin", "to": "bridge", "label": "持有", "variant": "emphasis" },
+    { "from": "bridge", "to": "rpc", "label": "NDJSON", "variant": "emphasis", "width": 2.6 },
+
+    { "from": "runtime", "to": "controller", "variant": "dashed" },
+    { "from": "controller", "to": "tools", "variant": "dashed" },
+    { "from": "tools", "to": "scope_ctx", "label": "取上下文", "variant": "emphasis" },
+    { "from": "scope_ctx", "to": "frozen", "label": "冻结读取", "variant": "emphasis" },
+    { "from": "frozen", "to": "fencing", "label": "注入文本", "variant": "emphasis" }
+  ],
+  "cards": [
+    {
+      "dot": "violet",
+      "title": "类的关系而非继承",
+      "items": [
+        "全库几乎没有继承，只有组合与纯函数模块",
+        "AtomMem 是唯一聚合根，持有 worker / retriever / embedder",
+        "决策逻辑独立成无状态函数，便于单独测试",
+        "配置对象贯穿始终，权重不散落在各处"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "两个正交维度各有其类",
+      "items": [
+        "ScopeStore 管作用域树，回答「在什么上下文」",
+        "DomainStore 管主题词表，回答「关于什么」",
+        "一个事实只有一个主作用域，但可有多个主题",
+        "ScopeView 每查询构造一次，避免逐条重算"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "跨进程边界上的类",
+      "items": [
+        "RpcServer 是 Python 侧的协议实现，不继承业务类",
+        "PythonBridge 是宿主侧传输层，持零模型可见状态",
+        "进程环境剥离密钥后再传给子进程",
+        "Python 异常在桥接层映射为可诊断的错误对象"
+      ]
+    }
+  ]
+}

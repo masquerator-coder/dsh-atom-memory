@@ -117,6 +117,16 @@ pip install -e .
 <details>
 <summary>实现细节——点击展开</summary>
 
+### 架构图
+
+三张可交互的图，每张都是单文件 HTML，双击即可在浏览器打开、无需构建步骤——自带深/浅色主题、缩放平移、搜索、关系追踪，以及 PNG / JPEG / WebP / SVG 导出。三张图都由 [`docs/diagrams/src/`](docs/diagrams/src/) 下可编辑的 JSON 规格渲染而来，并全部通过 `showcase` 质量档的 9/9 检查项，0 error、0 warning。
+
+- [`docs/diagrams/memory-dataflow.html`](docs/diagrams/memory-dataflow.html) —— **数据流程图**：写入路径（消息 → LLM 抽取 → typed candidates → 校验裁决 → 作用域与主题 → 向量化 → `facts` 单事务落库）、读取路径（查询同时打全文与向量两条索引，由 RRF 融合）、派生路径（事实 → 工作单元 → 综述 → 下次会话读取的缓存）。五条泳道，每个节点都标注了对应代码。
+- [`docs/diagrams/system-architecture.html`](docs/diagrams/system-architecture.html) —— **系统功能结构图**：两侧各自的职责、两条进程边界区域，以及两侧的模块划分。
+- [`docs/diagrams/class-structure.html`](docs/diagrams/class-structure.html) —— **类与模块结构图**：核心类、两个正交维度（`ScopeStore` 管上下文、`DomainStore` 管主题），以及跨进程边界上的类。
+
+系统功能结构图与类图带逐节点的源码引用，已对照固定 revision 核对。重新生成的方法见 [`docs/diagrams/README.md`](docs/diagrams/README.md)。
+
 ### 补丁文档
 
 `cordis.patch.yml` 是 **insert-only**（只插入）：基础层没有 id 为 `atom-memory` 的条目，因此该层插入

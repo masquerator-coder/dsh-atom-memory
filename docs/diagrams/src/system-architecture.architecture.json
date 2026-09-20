@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "dsh-atom-memory 系统功能结构",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "animation": "trace",
+    "viewBox": [1200, 660],
+    "repository": {
+      "url": "https://github.com/masquerator-coder/dsh-atom-memory",
+      "revision": "ff6c78f80aa00e05c88d4e787ff45fc6bdbdc065"
+    },
+    "views": [
+      {
+        "id": "write-path",
+        "label": "写入路径",
+        "focus": ["session", "capture", "plugin", "llmextract", "bridge", "rpc", "worker", "store"],
+        "note": "一条对话消息如何变成原子记忆。"
+      },
+      {
+        "id": "read-path",
+        "label": "读取与注入",
+        "focus": ["session", "tools", "injection", "bridge", "rpc", "summarizer", "store"],
+        "note": "记忆如何回到系统提示词与工具结果。"
+      },
+      {
+        "id": "panel-path",
+        "label": "面板与开关",
+        "focus": ["panel", "settings", "runtime", "controller", "plugin", "bridge"],
+        "note": "面板开关如何即时作用于运行中的插件。"
+      }
+    ]
+  },
+  "components": [
+    { "id": "session", "type": "external", "label": "dsh 会话", "sublabel": "用户消息 · 工具调用", "pos": [30, 268], "size": [128, 60], "tag": "会话事件", "sources": [{ "path": "dsh/src/capture.ts", "line": 159 }] },
+    { "id": "plugin", "type": "backend", "label": "dsh-atom-memory", "sublabel": "Cordis 插件装配", "pos": [216, 268], "size": [136, 60], "tag": "apply()", "sources": [{ "path": "dsh/src/index.ts", "line": 234 }] },
+    { "id": "capture", "type": "backend", "label": "capture.ts", "sublabel": "逐条捕获 + 补扫", "pos": [400, 268], "size": [128, 60], "tag": "尽力而为", "sources": [{ "path": "dsh/src/capture.ts", "line": 104 }] },
+    { "id": "llmextract", "type": "backend", "label": "llm-extractor.ts", "sublabel": "抽取 · 画像 · 综述", "pos": [584, 268], "size": [136, 60], "tag": "dsh 默认模型", "sources": [{ "path": "dsh/src/llm-extractor.ts" }] },
+    { "id": "bridge", "type": "messagebus", "label": "PythonBridge", "sublabel": "NDJSON + 子进程", "pos": [768, 268], "size": [130, 60], "tag": "进程隔离", "sources": [{ "path": "dsh/src/bridge.ts", "line": 106 }] },
+    { "id": "rpc", "type": "backend", "label": "atom_memory.rpc", "sublabel": "NDJSON 服务端", "pos": [952, 268], "size": [130, 60], "tag": "每行一请求", "sources": [{ "path": "atom_memory/rpc.py", "line": 144 }] },
+    { "id": "store", "type": "database", "label": "SQLite 记忆库", "sublabel": "facts · scope · domain", "pos": [952, 452], "size": [130, 60], "tag": "单文件 WAL", "sources": [{ "path": "atom_memory/migrations/001_init.sql", "line": 5 }] },
+
+    { "id": "panel", "type": "frontend", "label": "设置面板", "sublabel": "记忆 / Memory 分区", "pos": [30, 92], "size": [128, 60], "tag": "浏览器", "sources": [{ "path": "dsh/src/client/MemorySettingsSection.tsx" }] },
+    { "id": "settings", "type": "frontend", "label": "settings 命名空间", "sublabel": "atom-memory", "pos": [216, 92], "size": [136, 60], "tag": "七项实时配置", "sources": [{ "path": "dsh/src/index.ts", "line": 507 }] },
+    { "id": "runtime", "type": "frontend", "label": "LiveRuntime", "sublabel": "开关与注入预算", "pos": [400, 92], "size": [128, 60], "tag": "每个事件重读", "sources": [{ "path": "dsh/src/runtime.ts" }] },
+    { "id": "controller", "type": "messagebus", "label": "Remote 控制器", "sublabel": "面板数据通道", "pos": [584, 92], "size": [136, 60], "tag": "面板入口", "sources": [{ "path": "dsh/src/controller.ts" }] },
+
+    { "id": "injection", "type": "backend", "label": "context.ts", "sublabel": "意识段 + 冻结快照", "pos": [30, 448], "size": [128, 60], "tag": "会话内字节稳定", "sources": [{ "path": "dsh/src/context.ts", "line": 63 }] },
+    { "id": "tools", "type": "backend", "label": "tools.ts", "sublabel": "memory_* 十三个工具", "pos": [216, 448], "size": [136, 60], "tag": "模型可见", "sources": [{ "path": "dsh/src/tools.ts", "line": 776 }] },
+    { "id": "scope_ctx", "type": "backend", "label": "scope.ts", "sublabel": "cwd · git 根 · remote", "pos": [400, 448], "size": [128, 60], "tag": "scope_context", "sources": [{ "path": "dsh/src/scope.ts" }] },
+    { "id": "fencing", "type": "security", "label": "memory-data.ts", "sublabel": "围栏 + 逐行前缀", "pos": [584, 448], "size": [136, 60], "tag": "数据非指令", "sources": [{ "path": "dsh/src/memory-data.ts", "line": 168 }] },
+
+    { "id": "summarizer", "type": "backend", "label": "summary.py", "sublabel": "两档摘要渲染", "pos": [768, 448], "size": [130, 60], "tag": "硬性 token 上限", "sources": [{ "path": "atom_memory/summary.py", "line": 284 }] },
+    { "id": "worker", "type": "backend", "label": "Worker", "sublabel": "任务队列消费", "pos": [768, 92], "size": [130, 60], "tag": "任务租约", "sources": [{ "path": "atom_memory/worker.py", "line": 231 }] },
+    { "id": "validator", "type": "backend", "label": "validator.py", "sublabel": "重复 · 冲突 · 退化", "pos": [952, 92], "size": [130, 60], "tag": "写入前裁决", "sources": [{ "path": "atom_memory/validator.py" }] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "dsh 宿主侧（Node 进程）", "wraps": ["panel", "settings", "runtime", "controller", "session", "plugin", "capture", "llmextract", "injection", "tools", "scope_ctx", "fencing", "bridge"], "pad": 14 },
+    { "kind": "region", "label": "Python 库侧（独立子进程）", "wraps": ["worker", "validator", "rpc", "summarizer", "store"], "pad": 14 }
+  ],
+  "connections": [
+    { "from": "session", "to": "plugin", "label": "会话事件", "variant": "emphasis" },
+    { "from": "plugin", "to": "capture", "variant": "dashed" },
+    { "from": "capture", "to": "llmextract", "label": "文本", "variant": "emphasis" },
+    { "from": "llmextract", "to": "bridge", "label": "persist_candidates / add", "labelAt": [744, 342], "variant": "emphasis", "width": 2.4 },
+    { "from": "bridge", "to": "rpc", "label": "NDJSON", "variant": "emphasis", "width": 2.6 },
+    { "from": "rpc", "to": "store", "label": "读写", "labelAt": [1017, 342], "variant": "emphasis" },
+    { "from": "worker", "to": "validator", "label": "调用", "variant": "emphasis" },
+
+    { "from": "panel", "to": "settings", "label": "配置写入" },
+    { "from": "settings", "to": "runtime", "label": "生效" },
+    { "from": "runtime", "to": "controller", "label": "读取" },
+    { "from": "controller", "to": "plugin", "label": "面板操作", "variant": "emphasis", "fromSide": "bottom", "toSide": "top", "via": [[652, 200], [284, 200]] },
+
+    { "from": "injection", "to": "tools", "variant": "dashed" },
+    { "from": "tools", "to": "scope_ctx", "variant": "dashed" },
+    { "from": "scope_ctx", "to": "fencing", "label": "冻结快照", "variant": "emphasis" },
+    { "from": "fencing", "to": "summarizer", "label": "摘要渲染", "variant": "emphasis" },
+    { "from": "summarizer", "to": "bridge", "label": "summary 读取", "variant": "emphasis", "width": 2.4 },
+
+    { "from": "plugin", "to": "injection", "label": "注册", "labelDx": -46, "variant": "dashed" },
+    { "from": "plugin", "to": "tools", "label": "注册", "labelAt": [318, 420], "variant": "dashed" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "两侧职责",
+      "items": [
+        "dsh 侧只做装配、抽取、注入与调度",
+        "Python 侧拥有全部记忆策略与存储",
+        "两侧以 NDJSON 行协议通信，一行一请求",
+        "插件不修改 dsh 源码，也从不 import Python"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "策略归属",
+      "items": [
+        "写入裁决在 validator.py，不在宿主",
+        "是否重写综述由 should_refresh 判定",
+        "摘要裁剪在 summary.py，硬性 token 上限",
+        "宿主只提供模型与调度，不下第二份判断"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "进程边界带来什么",
+      "items": [
+        "记忆库卡死或崩溃不会带走 agent 主循环",
+        "Python 库保持无框架依赖，可独立安装",
+        "子进程随插件卸载被回收，worker 刷盘后关库",
+        "桥接不可用时只降级为「无记忆」，不阻塞会话"
+      ]
+    }
+  ]
+}

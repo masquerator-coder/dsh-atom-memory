@@ -26,6 +26,11 @@ htmlcov/
 # Generated architecture-diagram artifacts (archify skill output)
 archify/
 
+# archify visual-check sidecars — evidence from the browser pass, not deliverables
+*.visual-check.json
+*.visual-check.html
+*.visual-check.*.png
+
 # Stray agent session transcripts (must never be committed)
 session.v3.jsonl
 *.jsonl.zstd
