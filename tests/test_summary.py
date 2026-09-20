@@ -963,8 +963,9 @@ def test_selecting_a_large_render_is_not_quadratic():
 # The compact depth used to be nothing but a type-grouped fact list, which
 # answered the wrong question: a model could read every attribute it held and
 # still not know what had been worked on. These tests pin the replacement — an
-# overview section, a lookup guide, and the old digest demoted to a reference
-# section that only renders while the budget allows.
+# overview section, and the old digest demoted to a reference section that only
+# renders while the budget allows. There is no tool-usage section: the tool
+# definitions already carry that, and these tests pin its absence.
 
 
 def _overview_md(conn, max_tokens=600, overview=None, scope_context=None):
@@ -975,16 +976,15 @@ def _overview_md(conn, max_tokens=600, overview=None, scope_context=None):
     )
 
 
-def test_the_head_leads_with_the_work_overview_then_the_guide():
-    """Order is the contract: what was done, then how to look it up."""
+def test_the_head_leads_with_the_work_overview():
+    """The head is the overview, and nothing else: no tool-usage section above it."""
     conn = connect_for_tests()
     try:
         _insert_fact(conn, "f1", "决定", "先回滚再排查", memory_type="decision_rule")
         md = _overview_md(conn)
 
         assert _COMPACT_LABEL_MARKER + "以前做过的工作" in md
-        assert _COMPACT_LABEL_MARKER + "要了解细节" in md
-        assert md.index("以前做过的工作") < md.index("要了解细节")
+        assert _COMPACT_LABEL_MARKER + "要了解细节" not in md
     finally:
         conn.close()
 
@@ -1012,52 +1012,58 @@ def test_without_a_cache_the_overview_is_derived_not_omitted():
     try:
         _insert_fact(conn, "f1", "决定", "先回滚再排查", memory_type="decision_rule")
         md = _overview_md(conn, max_tokens=400)
-        head = md.split(_COMPACT_LABEL_MARKER + "要了解细节")[0]
+        head = md.split(_COMPACT_LABEL_MARKER + "以前做过的工作")[-1]
         assert "决定" in head or "条" in head, head
     finally:
         conn.close()
 
 
-def test_the_guide_names_the_tools_that_reach_the_detail():
-    """The failure this section fixes: knowing memory exists, not how to reach it."""
+def test_the_guide_is_gone_and_tool_usage_is_not_repeated():
+    """Tool usage lives in the tool definitions, not in the injected snapshot.
+
+    The ``memory_*`` schemas already state what each tool does and how to call it,
+    and the system prompt's awareness note points the model at them. Repeating
+    that here spent the same sentences twice on every request of every session.
+    """
     conn = connect_for_tests()
     try:
         _insert_fact(conn, "f1", "职业", "工程师")
         md = _overview_md(conn)
-        for tool in ("memory_recall", "memory_summary_detail", "memory_get"):
-            assert tool in md, tool
+        assert _COMPACT_LABEL_MARKER + "要了解细节" not in md
+        for leaked in (
+            "memory_recall",
+            "memory_summary_detail",
+            "memory_get",
+            "memory_scope",
+            "memory_overview",
+            "action=",
+            "factId=",
+        ):
+            assert leaked not in md, leaked
     finally:
         conn.close()
 
 
-def test_the_guide_examples_come_from_this_store():
-    """A concrete query the model can copy beats a template with a blank in it."""
+def test_the_overview_survives_a_tight_budget_without_the_guide_to_shrink():
+    """The guide used to be the pick-up-the-slack section; now the overview is.
+
+    Removing it must not reintroduce the failure the head was built to fix: at a
+    mid budget the artifact still leads with what was worked on rather than
+    dropping to a bare fact list.
+    """
     conn = connect_for_tests()
     try:
         store = ScopeStore(conn, MemConfig())
         scope_id = store.create("project", "dsh-atom-memory", parent_id=1, confidence=1.0)
-        _insert_fact(conn, "f1", "决定", "x", memory_type="decision_rule")
+        _insert_fact(conn, "f1", "决定", "先回滚再排查", memory_type="decision_rule")
         conn.execute(
             "INSERT INTO fact_scope(fact_id, scope_id, priority) VALUES ('f1', ?, 0)",
             (scope_id,),
         )
         conn.commit()
-        md = _overview_md(conn)
-        assert "dsh-atom-memory" in md
-        assert "memory_recall「dsh-atom-memory" in md
-    finally:
-        conn.close()
-
-
-def test_the_guide_omits_examples_when_the_store_has_no_labels():
-    """A dangling '记忆检索「」' is worse than no example at all."""
-    conn = connect_for_tests()
-    try:
-        # Global-only facts: no project label exists to build an example from.
-        _insert_fact(conn, "f1", "决定", "x", memory_type="decision_rule")
-        md = _overview_md(conn)
-        assert "「」" not in md
-        assert "memory_recall「" not in md
+        for budget in (60, 100, 200, 400):
+            md = _overview_md(conn, max_tokens=budget)
+            assert "以前做过的工作" in md, budget
     finally:
         conn.close()
 
@@ -1089,8 +1095,60 @@ def test_the_overview_survives_a_budget_that_kills_the_detail():
         conn.close()
 
 
-def test_the_guide_gives_up_its_examples_before_the_overview():
-    """Examples are a convenience; the overview is the payload."""
+def test_a_squeezed_head_drops_whole_bullets_not_half_a_line():
+    """Degradation keeps the structure: fewer bullets, never a severed one.
+
+    Clipping the body as one string would flatten the bullet list onto a single
+    line (``_clip`` normalises whitespace) and then cut it mid-sentence, which
+    loses the structure *and* costs more tokens. Whole bullets in order are what
+    stays useful: the first names the biggest work unit, so one bullet still
+    answers "what has been worked on".
+
+    The overview has to be multi-line for this to mean anything — the
+    deterministic fallback for a one-project store renders a single bullet, which
+    both implementations output identically. So this drives the cached (prose)
+    path, which is the realistic one anyway.
+    """
+    conn = connect_for_tests()
+    try:
+        _insert_fact(conn, "f1", "决定", "先回滚再排查", memory_type="decision_rule")
+        overview = "\n".join(
+            f"- 工作单元{i}：推进了第 {i} 项内容，包含若干决定与教训" for i in range(6)
+        )
+
+        seen: list[int] = []
+        for budget in (400, 300, 200, 120, 80, 50, 30):
+            md = _overview_md(conn, max_tokens=budget, overview=overview)
+            assert estimate_tokens(md) <= budget, (budget, estimate_tokens(md))
+            if "以前做过的工作" not in md:
+                continue
+            head = md.split("\n## ", 1)[0]
+            body_lines = [l for l in head.splitlines()[1:] if l.strip()]
+            seen.append(len(body_lines))
+            # Every surviving bullet is whole: a clipped one would end in the
+            # ellipsis `_clip` appends.
+            assert not any(l.endswith("…") for l in body_lines), (budget, body_lines)
+            # And it is still a bullet list, not one flattened paragraph.
+            assert all(l.startswith("- ") for l in body_lines), (budget, body_lines)
+
+        # The head survives whole at the roomy end and shrinks as the budget does,
+        # rather than vanishing at the first squeeze.
+        assert seen, "the head never rendered at any budget"
+        assert seen[0] == 6, seen
+        assert seen == sorted(seen, reverse=True), seen
+        assert len(set(seen)) > 1, f"the head never actually degraded: {seen}"
+    finally:
+        conn.close()
+
+
+def test_the_overview_outlives_the_detail_when_the_budget_tightens():
+    """The overview is the payload; the reference digest is what gives way.
+
+    This used to be phrased as "the guide gives up its examples first", because
+    the guide was the disposable section. With the guide gone the same property
+    has to hold against the only remaining competitor: at a tight budget the head
+    survives whole and the detail digest is what shortens or disappears.
+    """
     conn = connect_for_tests()
     try:
         store = ScopeStore(conn, MemConfig())
@@ -1105,9 +1163,12 @@ def test_the_guide_gives_up_its_examples_before_the_overview():
 
         roomy = _overview_md(conn, max_tokens=400)
         tight = _overview_md(conn, max_tokens=90)
-        assert "- 例：" in roomy
-        assert "- 例：" not in tight
+
+        assert "以前做过的工作" in roomy
         assert "以前做过的工作" in tight
+        # The detail digest is the section that pays: fewer of its lines survive
+        # a tight budget than a roomy one.
+        assert roomy.count("\n") > tight.count("\n")
     finally:
         conn.close()
 

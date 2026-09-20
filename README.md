@@ -1,5 +1,5 @@
 ---
-description: "The dsh profile layer that adds durable long-term memory backed by the pure-Python atom_memory store — memory_* tools, best-effort session capture, a session-start digest that leads with a model-written work overview and a lookup guide, and a Memory section in the dsh settings panel — for users adding persistent memory to a profile."
+description: "The dsh profile layer that adds durable long-term memory backed by the pure-Python atom_memory store — memory_* tools, best-effort session capture, a session-start digest that leads with a model-written work overview, and a Memory section in the dsh settings panel — for users adding persistent memory to a profile."
 kind: "package-bundle"
 ---
 
@@ -65,7 +65,7 @@ Leave `pythonBin` empty to use `python` on `PATH`, or point it at a virtualenv i
 | Surface | Contribution |
 | --- | --- |
 | Model-facing tools | `memory_add`, `memory_replace`, `memory_recall`, `memory_get`, `memory_summary`, `memory_snapshot`, `memory_forget`, `memory_summary_detail`, `memory_user_md`, `memory_stats`, `memory_scope`, `memory_overview` |
-| System prompt | A persistent-memory awareness section (always registered) plus a compact `memory summary` digest frozen once at session start: work overview, then lookup guide, then the type-grouped detail |
+| System prompt | A persistent-memory awareness section (always registered) plus a compact `memory summary` digest frozen once at session start: the work overview, then the type-grouped detail |
 | Work overview | The "what has been worked on" narrative is written by a model **out of band**, during idle time, and cached. The injection path only reads the cache, and falls back to a deterministic overview when it is empty — so a session's prompt never waits on a model call |
 | Session capture | Best-effort per-message capture and a periodic nudge that retries what failed, reading only durable session events |
 | Scope context | Each session's working directory, git root and origin remote, and declared package name are collected (credential-stripped, cached per directory) and sent as `scope_context` on every read, write and prompt freeze, so memory lands in the right project without hand-tagging |
@@ -208,15 +208,16 @@ The host serves `exports["./client"]` **verbatim** as a browser bundle — it do
 
 #### What the model sees
 
-A section registered while the plugin is mounted, before and independent of any memory content. It names the primary tools, states the saving policy, and carries the data-not-instructions guard. Its text is resolved at each prompt assembly and is empty — so it drops out of the system prompt — while the memory master switch (`enabled`) is off: a disabled plugin leaves no memory trace.
+A section registered while the plugin is mounted, before and independent of any memory content. It names the tool family, **points at each tool's own definition** (the usage lives in the schemas, not here), states the saving policy, and carries the data-not-instructions guard. Its text is resolved at each prompt assembly and is empty — so it drops out of the system prompt — while the memory master switch (`enabled`) is off: a disabled plugin leaves no memory trace.
 
 ##### Verbatim awareness text
 
 ```markdown
-You have persistent long-term memory. Use memory_summary for a compact
-overview of what has already been worked on and how to look up the detail,
-memory_recall to retrieve specific facts, memory_add to store memory, and
-memory_forget to delete memory. Save any
+You have persistent long-term memory, exposed as the memory_* tools. Each
+tool's own definition states what it does and how to call it — read the tool
+you need rather than relying on this note. In short: memory_add stores a fact,
+memory_recall retrieves facts, memory_summary reads what has been worked on,
+and memory_forget deletes. Save any
 preference or decision the user states explicitly. Whenever you are working
 through any content or performing any task and come across long-lived, reusable
 work facts — such as decisions, workflows, lessons learned, preferences,
@@ -238,13 +239,14 @@ Prefix-stable. The text never varies with store content, session, or settings, s
 
 #### What the model sees
 
-A compact `memory summary` digest, rendered once per session at freeze time and spliced directly after the awareness section. It has three sections, in this order:
+A compact `memory summary` digest, rendered once per session at freeze time and spliced directly after the awareness section. It has two sections, in this order:
 
 1. **`## 以前做过的工作`** — the work overview: what has been worked on, grouped by work unit.
-2. **`## 要了解细节`** — the lookup guide: which tool reaches which depth, with a couple of concrete example queries built from this store's own work-unit labels.
-3. **the type-grouped detail** — the active facts by memory type, ordered by a blend of importance and recency, single-valued attributes folded to `predicate: value`, no `fact_id`, every line length-capped.
+2. **the type-grouped detail** — the active facts by memory type, ordered by a blend of importance and recency, single-valued attributes folded to `predicate: value`, no `fact_id`, every line length-capped.
 
-The third section is what the digest *used* to be in its entirety; it survives because it is the only place the raw shape of the store is visible, but it is now the section that yields first under budget pressure. Under a tight budget the order of surrender is: detail, then the guide's example line, then the guide's tool lines, and **the overview last** — a session that read the guide but no overview would know it has memory while knowing nothing about what was done, which is the exact failure the restructure exists to remove.
+**There is deliberately no tool-usage section.** There used to be a `## 要了解细节` one, listing which tool reaches which depth. It is gone: each `memory_*` tool's **own definition** already states its purpose and parameters, and the awareness section points at those definitions, so repeating it here paid for the same sentences twice on every request of every session — in the section that has to be given up first when the budget is tight. Tool usage is in the context either way (the tool schemas); the digest does not need a copy.
+
+The second section is what the digest *used* to be in its entirety; it survives because it is the only place the raw shape of the store is visible, but it is now the section that yields first under budget pressure: the detail is trimmed first, and **the overview last**. When the overview itself is squeezed it sheds **whole bullets** from the end rather than truncating a line — a severed list loses both the structure and more tokens than the same text kept as lines. A session that cannot read an overview would know it has memory while knowing nothing about what was done, which is the exact failure the restructure exists to remove.
 
 The block is introduced by a stable two-line header owned by this package:
 
@@ -291,24 +293,18 @@ Before — grouped by type, facts only:
 -- （按行）决策规则 2 · 教训 2 · 流程 1 · 属性 1
 ```
 
-After — an overview by work unit, then how to look up the detail:
+After — an overview by work unit, then the type-grouped detail (tool usage is no longer repeated; see "What the model sees" above):
 
 ```markdown
 ## 以前做过的工作
 - dsh-atom-memory：完成了记忆基数缺陷的分层修复（A+B+C），沉淀了沙箱测试与构建产物的两条经验；构建流程已固定。
 - dsh-im-gateway：定下 CMCC 通道只需 apiKey 的接入方式；确认 IM 通道不承担命令分发。
-- 当前仍在推进记忆摘要改造：摘要改为先给工作总览，再给查询指路。
-## 要了解细节
-- 细节检索：memory_recall（名词短语最佳）；全文用 memory_get factId=…
-- 完整清单：memory_summary_detail（含 fact_id，用于定位与编辑）
-- 相关范围：memory_scope action=list / resolve
-- 近期变动：memory_overview action=changes
-- 例：memory_recall「dsh-atom-memory 决定」、memory_recall「dsh-atom-memory 待办」
+- 当前仍在推进记忆摘要改造：摘要改为先给工作总览，工具用法不再重复。
 ## 决策规则
 - …（明细；预算不够时整段让位）
 ```
 
-The prose is generated in Chinese, because that is the language the overview prompt asks for; the sections and the guide are fixed text owned by the renderer.
+The prose is generated in Chinese, because that is the language the overview prompt asks for; the section headings are fixed text owned by the renderer.
 
 #### How it is generated, and why out of band
 

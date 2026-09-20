@@ -48,10 +48,11 @@ const AWARENESS_SECTION = 'atom-memory-awareness'
 /** Section name of the injected frozen snapshot (also the dedup marker). */
 const SNAPSHOT_SECTION = 'atom-memory-snapshot'
 
-const AWARENESS_TEXT = `You have persistent long-term memory. Use memory_summary for a compact
-overview of what has already been worked on and how to look up the detail,
-memory_recall to retrieve specific facts, memory_add to store memory, and
-memory_forget to delete memory. Save any
+const AWARENESS_TEXT = `You have persistent long-term memory, exposed as the memory_* tools. Each
+tool's own definition states what it does and how to call it — read the tool
+you need rather than relying on this note. In short: memory_add stores a fact,
+memory_recall retrieves facts, memory_summary reads what has been worked on,
+and memory_forget deletes. Save any
 preference or decision the user states explicitly. Whenever you are working
 through any content or performing any task and come across long-lived, reusable
 work facts — such as decisions, workflows, lessons learned, preferences,

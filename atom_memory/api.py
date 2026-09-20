@@ -680,8 +680,8 @@ class AtomMem:
                 to the out-of-band job, not to a render that runs while a session
                 prompt is being frozen.
             use_overview: Whether the compact depth leads with the work overview
-                and the lookup guide. Defaults to ``False`` so existing callers
-                are byte-for-byte unchanged.
+                instead of the type-grouped digest alone. Defaults to ``False``
+                so existing callers are byte-for-byte unchanged.
 
         Returns:
             A markdown string.

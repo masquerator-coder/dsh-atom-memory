@@ -758,8 +758,13 @@ export function renderRefreshOutcome(outcome: string): string {
  * from returning the first's digest, which would make the two tools
  * indistinguishable to the model.
  *
+ * The head ends where the reference detail begins. That boundary used to be the
+ * `## 要了解细节` lookup guide, which sat between them; the guide is gone (tool
+ * usage lives in the tool schemas), so the head now runs to the detail digest's
+ * first section label.
+ *
  * @param text - A compact render with the overview head enabled.
- * @returns The overview section onward, up to the lookup guide.
+ * @returns The overview section, up to the reference detail.
  */
 export function overviewHeadOf(text: string): string {
   const start = text.indexOf('## 以前做过的工作')
@@ -768,8 +773,12 @@ export function overviewHeadOf(text: string): string {
     // than returning the digest under a heading that would misdescribe it.
     return text.trim() === '' ? '（无）' : text
   }
-  const guideAt = text.indexOf('## 要了解细节', start)
-  return (guideAt < 0 ? text.slice(start) : text.slice(start, guideAt)).trim()
+  // The detail digest renders one `## <section>` label per memory type; the head
+  // carries its own label (`## 以前做过的工作`) and no other. So the first
+  // section label *after* the head's own line is where the detail starts.
+  const rest = text.slice(start)
+  const nextLabel = rest.indexOf('\n## ', '## 以前做过的工作'.length)
+  return (nextLabel < 0 ? rest : rest.slice(0, nextLabel)).trim()
 }
 
 /** Register all memory tools and return their disposers. */
@@ -983,7 +992,7 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
     name: 'memory_summary',
     description:
       '渲染当前用户记忆的紧凑摘要（与注入系统提示词的快照同一预算、同一份渲染，但不含数据围栏）。'
-      + '摘要先给「以前做过的工作」总览，再给「要了解细节」的查询指路，最后是按类型的明细。'
+      + '摘要先给「以前做过的工作」总览，最后是按类型的明细；工具用法写在各 memory_* 工具自己的定义里，摘要不再重复。'
       + '适合先看总览，再按需用 memory_recall 查明细；要看完整清单用 memory_summary_detail；'
       + '要确认提示词里真正冻结的那段，用 memory_snapshot；要查记忆库近期变动，用 memory_overview action=changes。',
     parameters: {

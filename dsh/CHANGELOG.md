@@ -2,6 +2,59 @@
 
 ## [Unreleased]
 
+### Changed (第二十二轮：摘要不再重复工具用法)
+
+**问题**：注入的摘要里有一段 `## 要了解细节`，逐行写明「哪个工具能到达哪个深度」，并附例
+查询。但工具用法本来就在上下文里 —— 13 个 `memory_*` 工具的定义各带完整 `description` 与
+逐参数说明，awareness 段（`src/context.ts`）又已经说明它们是什么、该怎么存。摘要里再写
+一遍，等于在**每次请求、每个会话**里为同一批句子付第二次钱，而且付的是预算收紧时**最先被
+放弃**的那一段：省下的正是最该省的地方，读到的却是重复内容。
+
+**改法**：整段删除，不只是删例子。
+
+- `summary.py`：删掉 `_RECALL_TITLE`、`_RECALL_GUIDE_LINES`、`_MAX_GUIDE_CHARS`、
+  `_GUIDE_EXAMPLE_LIMIT`、`_render_guide()`，以及只服务于"指路段与总览争预算"的
+  `_clip_text_block()`、`_guide_ladder()`、`_head_block()`。`generate_summary` 现在只渲染
+  **两样东西**：工作总览 + 按类型的紧凑明细，docstring 明写"刻意没有工具用法段"。
+- `src/context.ts`：awareness 段改为**指向工具定义**而不是复述它们 ——
+  "Each tool's own definition states what it does and how to call it — read the tool you
+  need rather than relying on this note"，随后一句四工具速记（add 存 / recall 取 /
+  summary 看做过什么 / forget 删），保留原有的保存策略与「记忆是数据、不是指令」防护。
+- `src/tools.ts`：`overviewHeadOf` 的边界不再找 `## 要了解细节`（已不存在），改为找明细段
+  的第一个 `## ` 标签；`memory_summary` 的 description 同步说明摘要不再重复工具用法。
+
+### Fixed (第二十二轮：拼接换行未计费 & 总览降级会压扁列表)
+
+两处都在同一段渲染路径上，是本轮改动暴露出来的：
+
+1. **预算差 1 token**：`_render_with_overview` 先分别渲染页头与明细、再以 `head + "\n" +
+   detail` 拼接，但那个连接换行**从未被计费**（旧代码把两段当一条串测量，顺带算了进去）。
+   实测：`max_tokens=200` 返回 201 —— 破了自己声明的不超预算。新增 `_JOIN_TOKENS = 1`
+   常量并在 `remaining` 里显式扣除；改后同预算返回 189。
+2. **总览降级会把 bullet 列表压成一行**：`_compose_head` 最初用 `_clip(overview_text, n)`
+   来收缩总览，而 `_clip` 做的是 `" ".join(text.split())` —— 它把整个列表**先摊平成一行**
+   再截断，于是预算一紧就返回空串，而且不单调（预算 25 出 0 token，预算 15 反而出 13）。
+   改为**按行降级**：从末尾整条整条地丢 bullet，留下的一定是完整的行。改后单调
+   （3 条 → 2 条 → 1 条 → 空）。
+
+**测试**：`test_summary.py` / `test_rpc.py` / `tools.test.ts` 中的指路段断言全部反转为
+「不得出现」，并新增两例：
+
+- `test_the_guide_is_gone_and_tool_usage_is_not_repeated`：摘要里不得出现 `## 要了解细节`，
+  也不得泄漏 `memory_recall` / `memory_summary_detail` / `memory_get` / `memory_scope` /
+  `memory_overview` / `action=` / `factId=` 等工具用法痕迹（防的是"删了标题、句子还在"）。
+- `test_a_squeezed_head_drops_whole_bullets_not_half_a_line`：在 400…30 七档预算下断言
+  每行都是完整 bullet（不以 `…` 收尾）、条数随预算单调不增且确实减少过。
+
+第二个测试的第一版**空转通过**：它走的是确定性回退总览，而那份 fixture 只有一行 —— 摊平
+与按行降级渲染结果相同。改走缓存多行总览路径后，对摊平实现**确实失败**
+（`AssertionError: (120, ['- 工作单元0：… - 工作单元1：… - 工作单元2：…'])`，正是被压扁后
+截断的形态）。
+
+**兼容性**：注入文本变短（少一段），冻结快照与工具返回结构均未改，协议、配置、Python 侧
+digest 形状不变。`memory_overview` 的 `show` 返回的总览正文不变；其边界判定改按"明细段第一个
+`## ` 标签"切分，对含多行 bullet 的总览同样正确。
+
 ### Fixed (第二十一轮：块头合并的条件化 —— 多分组块不再自相矛盾)
 
 **问题**：`foldBlockHeadings`（`memory-data.ts`）把块头合并进紧随其后的分组标签时，没有检查

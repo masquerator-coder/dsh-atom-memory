@@ -337,7 +337,7 @@ def test_overview_put_then_read_back_through_summary(proc, tmp_path):
     assert status["should_refresh"] is True
     assert status["refresh_reason"] == "not_cached"
 
-    prose = "- 完成了记忆摘要改造：摘要先给工作总览，再给查询指路。"
+    prose = "- 完成了记忆摘要改造：摘要改为先给工作总览，工具用法不再重复。"
     _send(p, next_rid + 1, "overview_put", {
         "user_id": "u1", "text": prose, "facts_count": 1,
     })
@@ -352,7 +352,8 @@ def test_overview_put_then_read_back_through_summary(proc, tmp_path):
     assert meta["overview"]["cached"] is True
     assert prose in meta["text"]
     assert "以前做过的工作" in meta["text"]
-    assert "要了解细节" in meta["text"]
+    # Tool usage is not repeated here: the tool schemas carry it.
+    assert "要了解细节" not in meta["text"]
 
 
 def test_overview_put_refuses_empty_text(proc, tmp_path):
@@ -392,7 +393,7 @@ def test_the_head_degrades_when_nothing_is_cached(proc, tmp_path):
     meta = _recv(p)["result"]
     assert meta["overview"]["cached"] is False
     assert "以前做过的工作" in meta["text"]
-    assert "要了解细节" in meta["text"]
+    assert "要了解细节" not in meta["text"]
 
 
 def test_changes_lists_what_the_store_did(proc, tmp_path):

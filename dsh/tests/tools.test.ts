@@ -156,7 +156,7 @@ describe('memory tools user scope', () => {
     // The tool's stated purpose is "show what the model is being told". A render
     // without the head would make it disagree with the prompt it mirrors.
     const { bridge, registered } = setup()
-    bridge.call.mockResolvedValue('## 以前做过的工作\n- 做过 A\n## 要了解细节\n- memory_recall')
+    bridge.call.mockResolvedValue('## 以前做过的工作\n- 做过 A\n## 决策规则\n- 一条规则')
     const summary = registered.find((d) => d.name === 'memory_summary')!
     const result = (await summary.execute({}, execWithSession('s1'))) as any
     const params = bridge.call.mock.calls.at(-1)![1] as Record<string, unknown>
@@ -332,22 +332,42 @@ describe('memory_overview tool', () => {
       text: [
         '## 以前做过的工作',
         '- 做过 A 和 B',
-        '## 要了解细节',
-        '- memory_recall …',
         '## 决策规则',
         '- 一条规则',
       ].join('\n'),
     })
     const result = (await tool.execute({}, execWithSession('s1'))) as any
     expect(result.text).toContain('以前做过的工作')
-    // The guide and the digest belong to `memory_summary`; repeating them would
-    // make the two tools indistinguishable to the model.
+    expect(result.text).toContain('做过 A 和 B')
+    // The digest belongs to `memory_summary`; repeating it would make the two
+    // tools indistinguishable to the model. The head ends at the detail's first
+    // section label.
     expect(result.text).not.toContain('决策规则')
-    expect(result.text).not.toContain('要了解细节')
 
     const params = bridge.call.mock.calls.at(-1)![1] as Record<string, unknown>
     expect(params.overview).toBe(true)
     expect(params.detail).toBe(false)
+  })
+
+  it('show does not mistake a multi-line overview for the digest', async () => {
+    // The head is model-written prose and may itself carry `#`-prefixed lines or
+    // blank lines; only a `## ` label *after* the head's own line starts the
+    // detail, so multi-line prose must survive whole.
+    const { bridge, tool } = setupOverview()
+    bridge.call.mockResolvedValue({
+      text: [
+        '## 以前做过的工作',
+        '- 第一项',
+        '',
+        '- 第二项',
+        '## 教训',
+        '- 一条教训',
+      ].join('\n'),
+    })
+    const result = (await tool.execute({}, execWithSession('s1'))) as any
+    expect(result.text).toContain('第一项')
+    expect(result.text).toContain('第二项')
+    expect(result.text).not.toContain('教训')
   })
 
   it('show falls back to the whole text when there is no head', async () => {
