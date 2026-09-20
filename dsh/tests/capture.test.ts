@@ -174,4 +174,69 @@ describe('registerCapture', () => {
 
     settle?.()
   })
+
+  // -- the overview refresher's trigger --------------------------------------
+  //
+  // `afterPersist` is how the out-of-band overview synthesis learns that the
+  // store may have changed. It is a listener on the write path, so the two
+  // properties that matter are that it fires for *every* settled write and that
+  // it can never damage the write it is listening to.
+
+  it('notifies after a successful capture', async () => {
+    const { ctx, handlersOf } = makeCtx()
+    const capture = vi.fn(async () => {})
+    const afterPersist = vi.fn()
+    registerCapture(
+      { ctx, capture, afterPersist },
+      { captureEnabled: () => true, nudgeEnabled: false, nudgeIntervalMs: 60_000 },
+    )
+    send('s1', '用户偏好黑咖啡', handlersOf)
+    await new Promise(r => setTimeout(r, 10))
+    expect(afterPersist).toHaveBeenCalledWith('s1', true)
+  })
+
+  it('notifies after a failed capture too', async () => {
+    // A failure is followed by a rescue retry, which settles here as well — so
+    // reporting only successes would still see every landed write, but a
+    // failure-only notification would be indistinguishable from silence.
+    const { ctx, handlersOf } = makeCtx()
+    const capture = vi.fn(async () => { throw new Error('bridge down') })
+    const afterPersist = vi.fn()
+    registerCapture(
+      { ctx, capture, afterPersist },
+      { captureEnabled: () => true, nudgeEnabled: false, nudgeIntervalMs: 60_000 },
+    )
+    send('s1', '一条会失败的消息', handlersOf)
+    await new Promise(r => setTimeout(r, 10))
+    expect(afterPersist).toHaveBeenCalledWith('s1', false)
+  })
+
+  it('survives a throwing afterPersist hook', async () => {
+    // A bug in the listener must not turn a successful memory write into a
+    // rejected capture promise, which would mark the entry retriable and
+    // re-send a message that was in fact stored.
+    const { ctx, handlersOf } = makeCtx()
+    const capture = vi.fn(async () => {})
+    const afterPersist = vi.fn(() => { throw new Error('listener bug') })
+    registerCapture(
+      { ctx, capture, afterPersist },
+      { captureEnabled: () => true, nudgeEnabled: false, nudgeIntervalMs: 60_000 },
+    )
+    send('s1', '用户偏好黑咖啡', handlersOf)
+    await new Promise(r => setTimeout(r, 10))
+    expect(capture).toHaveBeenCalledTimes(1)
+    expect(afterPersist).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not require an afterPersist hook', async () => {
+    const { ctx, handlersOf } = makeCtx()
+    const capture = vi.fn(async () => {})
+    registerCapture(
+      { ctx, capture },
+      { captureEnabled: () => true, nudgeEnabled: false, nudgeIntervalMs: 60_000 },
+    )
+    send('s1', '用户偏好黑咖啡', handlersOf)
+    await new Promise(r => setTimeout(r, 10))
+    expect(capture).toHaveBeenCalledTimes(1)
+  })
 })

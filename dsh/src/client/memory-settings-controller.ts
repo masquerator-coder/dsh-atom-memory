@@ -25,6 +25,14 @@ export interface MemorySettingsSection {
   contextInjectionEnabled: boolean
   /** Estimated-token budget for the memory summary snapshot injected into the prompt. */
   injectedSummaryTokens: number
+  /**
+   * Whether the out-of-band work-overview synthesis runs.
+   *
+   * The only switch here that spends model calls on the user's behalf without
+   * being asked to, so it is worth surfacing separately: turning it off leaves
+   * injection intact (the snapshot falls back to the deterministic overview).
+   */
+  overviewEnabled: boolean
   extractionModel?: {
     provider?: string
     model?: string
@@ -85,6 +93,17 @@ export interface MemorySettingsFace {
    * panel and the Host agree on the bounds; the Host clamps again on the way in.
    */
   setInjectedSummaryTokens: (tokens: number) => Promise<void>
+  /** Turn the out-of-band work-overview synthesis on or off. */
+  setOverviewEnabled: (enabled: boolean) => Promise<void>
+  /**
+   * Ask the store to regenerate the work overview now.
+   *
+   * Returns the refresher's outcome token (e.g. `refreshed`, `throttled`,
+   * `no-change:up_to_date`) which the panel renders through `overviewRefreshDone`;
+   * the token is deliberately not translated here, because the panel owns the
+   * wording and the host owns the vocabulary.
+   */
+  refreshOverview: () => Promise<string>
   setExtractionModel: (provider: string, model: string) => Promise<void>
   /** Write the whole extraction-model override (provider/model/baseURL/protocol/apiKey). */
   setExtractionModelOverride: (override: NonNullable<MemorySettingsSection['extractionModel']>) => Promise<void>
@@ -183,6 +202,8 @@ interface RemoteAtomMemory {
   generateProfile(args: { user: string }): Promise<WireResult<ProfileSuggestionResult>>
   backup(args: { user: string }): Promise<WireResult<Record<string, unknown>>>
   restore(args: { user: string; payload: Record<string, unknown> }): Promise<WireResult<{ facts_written: number; profile_written: number }>>
+  /** Regenerate the work overview; resolves to the refresher's outcome token. */
+  refreshOverview(args: { user: string }): Promise<WireResult<string>>
 }
 
 /** Unwrap a `WireResult` to its `.value`, throwing on a failed call. */
@@ -208,6 +229,7 @@ export class MemorySettingsController {
       llmExtractionEnabled: true,
       contextInjectionEnabled: true,
       injectedSummaryTokens: DEFAULT_INJECTED_SUMMARY_TOKENS,
+      overviewEnabled: true,
       extractionModel: undefined,
     },
     data: { facts: [], profile: [] },
@@ -229,6 +251,18 @@ export class MemorySettingsController {
       setEnabled: (enabled) => this.scope.set('enabled', enabled),
       setInjectedSummaryTokens: (tokens) =>
         this.scope.set('injectedSummaryTokens', clampInjectedSummaryTokens(tokens)),
+      setOverviewEnabled: (enabled) => this.scope.set('overviewEnabled', enabled),
+      refreshOverview: async () => {
+        const outcome = unwrap(await this.r().refreshOverview({ user: USER }))
+        // Regeneration changes what the summary modal renders, so drop the
+        // cached text: otherwise the panel keeps showing the old overview and
+        // reads as "the button did nothing".
+        this.store.set({
+          ...this.store.getSnapshot(),
+          data: { ...this.store.getSnapshot().data, summary: undefined },
+        })
+        return outcome
+      },
       setExtractionModel: (provider, model) =>
         this.scope.set('extractionModel', { provider, model }),
       setExtractionModelOverride: (override) =>
@@ -438,6 +472,7 @@ function defaulted(value: MemorySettingsSection): MemorySettingsSection {
     llmExtractionEnabled: value.llmExtractionEnabled ?? true,
     contextInjectionEnabled: value.contextInjectionEnabled ?? true,
     injectedSummaryTokens: clampInjectedSummaryTokens(value.injectedSummaryTokens),
+    overviewEnabled: value.overviewEnabled ?? true,
     extractionModel: value.extractionModel,
   }
 }

@@ -47,6 +47,7 @@ import { registerMemoryTools } from './tools.ts'
 import { registerMemoryContext } from './context.ts'
 import { registerCapture } from './capture.ts'
 import { buildLlmCompleter, buildLlmExtractor, type ExtractFn } from './llm-extractor.ts'
+import { createOverviewRefresher, OVERVIEW_COMPLETION_TOKENS } from './overview.ts'
 import { checkPythonSide, type PreflightResult } from './preflight.ts'
 import {
   scopeContextForCwd,
@@ -152,6 +153,7 @@ function seedRuntime(config: ConfigShape): LiveRuntime {
     captureEnabled: config.captureEnabled !== false,
     llmExtractionEnabled: config.llmExtractionEnabled !== false,
     contextInjectionEnabled: config.contextInjectionEnabled !== false,
+    overviewEnabled: config.overviewEnabled !== false,
     injectedSummaryTokens: config.injectedSummaryTokens,
     extractionModel: config.extractionModel,
   })
@@ -341,12 +343,44 @@ export function apply(ctx: Context, config: ConfigShape): void {
     label: 'profile synthesis',
   })
 
+  // Work-overview synthesis runs out of band: it is triggered by a write and
+  // executes after a quiet window, never while a prompt is being frozen. It
+  // shares the extraction model for the same reason profile synthesis does —
+  // it is the same "turn memory into prose" job — and is likewise governed by
+  // the master switch rather than `llmExtractionEnabled`, which is about
+  // automatic capture.
+  const synthesizeOverview = buildLlmCompleter(ctx, {
+    maxTokens: OVERVIEW_COMPLETION_TOKENS,
+    modelOverride: () => runtime.get().extractionModel,
+    enabled: () => runtime.isEnabled(),
+    label: 'overview synthesis',
+  })
+  const overview = createOverviewRefresher({
+    bridge,
+    completer: () => synthesizeOverview,
+    userScope: FALLBACK_SCOPE,
+    enabled: () => runtime.isEnabled() && runtime.get().overviewEnabled,
+    isReady: () => state.value,
+    idleMs: (config.overviewIdleSeconds ?? 90) * 1000,
+    minIntervalMs: (config.overviewRefreshMinutes ?? 15) * 60_000,
+    scopeContext: () => scopeContextOf(),
+    log: (message) => ctx.logger(message),
+  })
+  ctx.effect(() => () => overview.dispose())
+
   // The panel's data operations (features 3-5) are served to the browser over
   // the Remote gateway; registration is reversible with the controller. The
   // gateway protocol is optional — if this deployment lacks it, features 3-5
   // are simply unavailable in the browser and the plugin degrades gracefully.
   try {
-    new AtomMemoryController(ctx, bridge, runtime, () => state.error, synthesizeProfile)
+    new AtomMemoryController(
+    ctx,
+    bridge,
+    runtime,
+    () => state.error,
+    synthesizeProfile,
+    () => overview.refreshNow(),
+  )
   } catch (err) {
     ctx.logger(`[atom-memory] remote controller unavailable (${(err as Error)?.message ?? err})`)
   }
@@ -434,12 +468,24 @@ export function apply(ctx: Context, config: ConfigShape): void {
     writeAckTimeoutMs: config.writeAckTimeoutMs ?? 0,
     snapshot,
     scopeContext: scopeContextOf,
+    // The tool path is the one place a refresh may run *now*: the user asked for
+    // it, so the debounce and the minimum gap are bypassed — but not the
+    // changelog gate, which is what stops a pointless model call.
+    refreshOverview: () => overview.refreshNow(),
   })
   for (const d of disposers) ctx.effect(() => d)
 
   // Durable capture hooks (per-message, periodic nudge).
   registerCapture(
-    { ctx, capture, maxRecent: 20 },
+    {
+      ctx,
+      capture,
+      maxRecent: 20,
+      // Every write pushes the overview's refresh deadline out, so a working
+      // session costs at most one synthesis per idle window instead of one per
+      // message. Not awaited and not erroring: see `CaptureDeps.afterPersist`.
+      afterPersist: () => overview.noteActivity(),
+    },
     {
       // A getter: the panel's switch stops capture immediately rather than at
       // the next reload.
@@ -505,6 +551,7 @@ const LiveSettingsSchema: z<LiveRuntime> = z.object({
   captureEnabled: z.boolean().default(true),
   llmExtractionEnabled: z.boolean().default(true),
   contextInjectionEnabled: z.boolean().default(true),
+  overviewEnabled: z.boolean().default(true),
   injectedSummaryTokens: z.number().default(DEFAULT_INJECTED_SUMMARY_TOKENS),
   extractionModel: z.object({
     provider: z.string().default(''),

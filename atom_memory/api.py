@@ -654,6 +654,8 @@ class AtomMem:
         max_tokens: int = 1500,
         detail: bool = True,
         scope_context: Optional[dict] = None,
+        overview: Optional[str] = None,
+        use_overview: bool = False,
     ) -> str:
         """Render the user's ``summary`` derived view.
 
@@ -662,17 +664,24 @@ class AtomMem:
             max_tokens: Estimated token cap for the rendered text, footer
                 included.
             detail: ``True`` (the default) lists every active fact with its
-                ``fact_id``. ``False`` renders the compact, type-grouped digest
-                the dsh host freezes into the session system prompt — no
-                ``fact_id`` (the UUIDs cost more tokens than they carry
-                information for the model) and priority-ordered rather than
-                recency-ordered.
+                ``fact_id``. ``False`` renders the compact digest the dsh host
+                freezes into the session system prompt — no ``fact_id`` (the UUIDs
+                cost more tokens than they carry information for the model) and
+                priority-ordered rather than recency-ordered.
             scope_context: The session context payload. With it, the compact
                 depth is rendered as scope blocks (current scope, its ancestors,
                 its phases, the global rules, the condition-matching rules) so
                 the model can tell a project's rule from the company-wide one.
                 The detail depth ignores it: that view exists to locate and edit
                 facts, so it lists everything.
+            overview: Cached work-overview text to lead the compact depth with.
+                ``None`` renders the deterministic fallback instead. This method
+                never *generates* an overview — that is a model call and belongs
+                to the out-of-band job, not to a render that runs while a session
+                prompt is being frozen.
+            use_overview: Whether the compact depth leads with the work overview
+                and the lookup guide. Defaults to ``False`` so existing callers
+                are byte-for-byte unchanged.
 
         Returns:
             A markdown string.
@@ -682,6 +691,7 @@ class AtomMem:
         return generate_summary(
             self.db, user_id, max_tokens, detail,
             scope_context=scope_context, config=self.config,
+            overview=overview, use_overview=use_overview,
         )
 
     async def user_md(self, user_id: str, max_tokens: int = 800) -> str:

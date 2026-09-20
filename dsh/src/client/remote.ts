@@ -100,5 +100,8 @@ export const ATOM_MEMORY_REMOTE: TypertRemoteContribution = {
     jsonArgsMethod('getRuntime', false),
     jsonArgsMethod('health', false),
     jsonArgsMethod('unarchive', true),
+    jsonArgsMethod('changes', true),
+    jsonArgsMethod('overviewStatus', true),
+    jsonArgsMethod('refreshOverview', true),
   ],
 }

@@ -55,6 +55,7 @@ from .db import index_orphans, now_ms, record_event
 from .domain import DomainAssignment, DomainStore
 from .fingerprint import BODY_IDENTIFIED_TYPES, content_fingerprint
 from .models import (
+    TYPE_SEMANTIC,
     FactCandidate,
     NEUTRAL_SCORE,
     default_importance,
@@ -521,6 +522,46 @@ class Worker:
         # Sleep the backoff *outside* the claim loop by yielding to the loop.
         await asyncio.sleep(delay)
 
+    def _record_written(
+        self,
+        candidate: FactCandidate,
+        fact_id: str,
+        resolution: ScopeResolution,
+    ) -> None:
+        """Record one *successfully written* fact in the changelog.
+
+        The audit log recorded every refusal and every reorganisation but not the
+        plain fact that the store grew: ``fact_rejected`` / ``fact_superseded`` /
+        ``fact_deduplicated`` all fire, while the ordinary path
+        (:meth:`_persist_fact` returning a fresh row) wrote nothing. That hole
+        matters now because the work overview is refreshed from a changelog read,
+        and "was anything new added" is precisely the question it could not
+        answer — a store that only ever grew looked unchanged.
+
+        Only the *shape* of the change is recorded, not the text: the overview
+        job needs to know whether what arrived is a durable decision worth
+        narrating or a detail that leaves the overview intact, and it reads that
+        from ``type``. Duplicating the object here would also put memory content
+        into a second table that nothing prunes per-fact.
+
+        Args:
+            candidate: The candidate that was persisted.
+            fact_id: The id of the row that was written.
+            resolution: The scope the batch was filed under.
+        """
+        record_event(
+            self.conn,
+            "fact_written",
+            {
+                "fact_id": fact_id,
+                "type": getattr(candidate, "type", None) or TYPE_SEMANTIC,
+                "predicate": candidate.predicate,
+                "subject": candidate.subject,
+                "scope_id": resolution.scope_id,
+            },
+            user_id=candidate.user_id,
+        )
+
     def _log_dead(self, task_id: str, exc: Exception) -> None:
         """Mark a dead task, log an alarm and record an event."""
         logger.error("Task %s permanently failed (dead): %s", task_id, exc)
@@ -720,6 +761,7 @@ class Worker:
                 outcome["truncated"].extend(result.truncated_fields)
             new_ids.append(persisted.fact_id)
             outcome["written"].append(persisted.fact_id)
+            self._record_written(candidate, persisted.fact_id, resolution)
             self._link_cross_scope(
                 candidate, persisted.fact_id, resolution.scope_id, visible_ids, outcome
             )

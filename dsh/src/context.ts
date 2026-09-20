@@ -49,8 +49,9 @@ const AWARENESS_SECTION = 'atom-memory-awareness'
 const SNAPSHOT_SECTION = 'atom-memory-snapshot'
 
 const AWARENESS_TEXT = `You have persistent long-term memory. Use memory_summary for a compact
-overview of what is already known, memory_recall to retrieve specific facts,
-memory_add to store memory, and memory_forget to delete memory. Save any
+overview of what has already been worked on and how to look up the detail,
+memory_recall to retrieve specific facts, memory_add to store memory, and
+memory_forget to delete memory. Save any
 preference or decision the user states explicitly. Whenever you are working
 through any content or performing any task and come across long-lived, reusable
 work facts — such as decisions, workflows, lessons learned, preferences,
@@ -172,10 +173,14 @@ export function registerMemoryContext(deps: MemoryContextDeps): FrozenSnapshotHa
         // Resolved here, at the moment of freezing: a budget changed in the
         // settings panel applies to every session that has not frozen yet.
         max_tokens: deps.resolveMaxTokens(),
-        // Compact depth: the injected view is grouped by memory type and drops
+        // Compact depth: the injected view leads with a work overview and drops
         // the fact_id UUIDs, which cost more tokens than they carry information
         // for the model. The tool/settings view keeps the detail depth.
         detail: false,
+        // Lead with what has been worked on, plus how to reach the detail. This
+        // only *reads* the overview cache — the synthesis runs out of band (see
+        // overview.ts), so freezing stays a single RPC with no model call in it.
+        overview: true,
         // Also ask how many active facts there are. An empty store must inject
         // *nothing* — a "(0 facts)" footer on every request of every session is
         // pure cost, and the awareness section already tells the model that the

@@ -106,6 +106,7 @@ window.__ModuleLoader__.load({
 					llmExtractionEnabled: true,
 					contextInjectionEnabled: true,
 					injectedSummaryTokens: 800,
+					overviewEnabled: true,
 					extractionModel: void 0
 				},
 				data: {
@@ -126,6 +127,18 @@ window.__ModuleLoader__.load({
 					hooks: { memorySettings: this.store },
 					setEnabled: (enabled) => this.scope.set("enabled", enabled),
 					setInjectedSummaryTokens: (tokens) => this.scope.set("injectedSummaryTokens", clampInjectedSummaryTokens(tokens)),
+					setOverviewEnabled: (enabled) => this.scope.set("overviewEnabled", enabled),
+					refreshOverview: async () => {
+						const outcome = unwrap(await this.r().refreshOverview({ user: USER }));
+						this.store.set({
+							...this.store.getSnapshot(),
+							data: {
+								...this.store.getSnapshot().data,
+								summary: void 0
+							}
+						});
+						return outcome;
+					},
 					setExtractionModel: (provider, model) => this.scope.set("extractionModel", {
 						provider,
 						model
@@ -341,6 +354,7 @@ window.__ModuleLoader__.load({
 				llmExtractionEnabled: value.llmExtractionEnabled ?? true,
 				contextInjectionEnabled: value.contextInjectionEnabled ?? true,
 				injectedSummaryTokens: clampInjectedSummaryTokens(value.injectedSummaryTokens),
+				overviewEnabled: value.overviewEnabled ?? true,
 				extractionModel: value.extractionModel
 			};
 		}
@@ -361,6 +375,21 @@ window.__ModuleLoader__.load({
 				injectSliderHint: "拖动滑块在固定挡位之间切换：{rungs} tokens。",
 				injectOffGrid: "当前 {tokens} tokens 不在挡位梯上（来自旧的自定义值或插件配置）；拖动滑块即切到最接近的固定挡位。",
 				injectHint: "当前 {tokens} tokens。预算越紧，越优先保留最重要且最新的记忆，被舍弃的条目由页脚注明；预算只影响注入系统提示词的快照，且仅对之后的新会话生效。",
+				overviewHeader: "工作总览后台生成",
+				overviewDesc: "在空闲时用模型把记忆库总结成「以前做过的工作」总览，下次新会话注入时生效。这是本插件唯一会主动消耗模型调用的开关；关闭后注入照常，只是改为使用规则生成的确定性总览。",
+				overviewRefresh: "立即重新生成",
+				overviewRefreshing: "生成中…",
+				overviewRefreshDone: "结果：{outcome}",
+				overviewStatusLoading: "正在读取总览状态…",
+				overviewOutcomeRefreshed: "已重新生成并写入缓存（下个会话生效）。",
+				overviewOutcomeThrottled: "距上次生成太近，已跳过；稍后再试。",
+				overviewOutcomeNoModel: "未配置可用模型，无法生成。",
+				overviewOutcomeNothing: "记忆库暂无可叙述的内容。",
+				overviewOutcomeEmpty: "模型没有产出内容，缓存保持不变。",
+				overviewOutcomeSkipped: "总览后台生成未启用，或记忆功能已关闭。",
+				overviewOutcomeError: "生成失败（详见日志），缓存保持不变。",
+				overviewOutcomeNoChange: "仅细节变化，无需重新生成。",
+				overviewOutcomeNoChangeReason: "无需重新生成（{reason}）。",
 				modelHeader: "LLM 抽取模型",
 				modelFollowDefault: "跟随 dsh 默认模型",
 				modelManual: "手动指定模型",
@@ -453,6 +482,21 @@ window.__ModuleLoader__.load({
 				injectSliderHint: "Drag the slider across the fixed gears: {rungs} tokens.",
 				injectOffGrid: "The current {tokens} tokens is off the gear ladder (set by the old custom field or the plugin composition); moving the slider snaps it to the nearest fixed gear.",
 				injectHint: "Currently {tokens} tokens. The budget is a cap, not a target: while the stored memory is smaller, nothing is dropped and a larger gear costs nothing extra. The tighter the budget, the more it keeps the most important and most recent memory, with the footer naming what was left out. It only affects the snapshot injected into the system prompt, and only from the next new session — sessions already frozen keep their text, so the KV cache stays valid.",
+				overviewHeader: "Out-of-band work overview",
+				overviewDesc: "Summarise the memory store into a \"what has been worked on\" overview during idle time, picked up by the next new session. This is the only switch in this plugin that spends model calls on its own; with it off, injection still works and simply uses the deterministic overview instead.",
+				overviewRefresh: "Regenerate now",
+				overviewRefreshing: "Generating…",
+				overviewRefreshDone: "Outcome: {outcome}",
+				overviewStatusLoading: "Reading overview status…",
+				overviewOutcomeRefreshed: "Regenerated and cached (applies to the next session).",
+				overviewOutcomeThrottled: "Too soon since the last generation; skipped — try again later.",
+				overviewOutcomeNoModel: "No usable model is configured, so nothing could be generated.",
+				overviewOutcomeNothing: "There is nothing in the memory store to narrate yet.",
+				overviewOutcomeEmpty: "The model produced no text; the cache is unchanged.",
+				overviewOutcomeSkipped: "Background overview generation is off, or memory is disabled.",
+				overviewOutcomeError: "Generation failed (see the logs); the cache is unchanged.",
+				overviewOutcomeNoChange: "Only detail-level changes — no regeneration needed.",
+				overviewOutcomeNoChangeReason: "No regeneration needed ({reason}).",
 				modelHeader: "LLM extraction model",
 				modelFollowDefault: "Follow the dsh default model",
 				modelManual: "Specify a model manually",
@@ -701,6 +745,35 @@ window.__ModuleLoader__.load({
 		};
 		/** DOM id of the injection-budget slider (its `<label>` points at it). */
 		const BUDGET_SLIDER_ID = "atom-memory-inject-budget";
+		/**
+		* Render a refresh outcome token as words.
+		*
+		* The Host returns a token rather than a sentence because the vocabulary belongs
+		* there (the same tokens are what the model sees from `memory_overview
+		* action=refresh`); this maps them for a human reading the panel.
+		*
+		* @param t - The section's translate function.
+		* @param outcome - The token, or `error:<message>` from a failed call.
+		* @returns A sentence for the panel.
+		*/
+		function renderOutcomeText(t, outcome) {
+			if (outcome.startsWith("error:")) return outcome.slice(6);
+			const key = {
+				refreshed: "overviewOutcomeRefreshed",
+				throttled: "overviewOutcomeThrottled",
+				"no-model": "overviewOutcomeNoModel",
+				"nothing-to-narrate": "overviewOutcomeNothing",
+				"empty-generation": "overviewOutcomeEmpty",
+				skipped: "overviewOutcomeSkipped",
+				error: "overviewOutcomeError"
+			}[outcome];
+			if (key !== void 0) return t(key);
+			if (outcome.startsWith("no-change:")) {
+				const reason = outcome.slice(10);
+				return reason === "up_to_date" ? t("overviewOutcomeNoChange") : t("overviewOutcomeNoChangeReason", { reason });
+			}
+			return outcome;
+		}
 		/** Monotonic source of client-side draft-row identities. */
 		let draftSeq = 0;
 		/** @returns a fresh, process-unique draft-row identity. */
@@ -753,6 +826,7 @@ window.__ModuleLoader__.load({
 			const state = props.useMemorySettings((snapshot) => snapshot);
 			const [status, setStatus] = (0, react.useState)();
 			const [phase, setPhase] = (0, react.useState)("idle");
+			const [overviewRefresh, setOverviewRefresh] = (0, react.useState)("idle");
 			const [modal, setModal] = (0, react.useState)();
 			const [summaryBusy, setSummaryBusy] = (0, react.useState)(false);
 			const [summaryError, setSummaryError] = (0, react.useState)();
@@ -864,6 +938,47 @@ window.__ModuleLoader__.load({
 							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
 								className: css.hint,
 								children: t("injectHint", { tokens: String(tokens) })
+							})
+						]
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("fieldset", {
+						className: css.block,
+						disabled: !state.available,
+						children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("legend", { children: t("overviewHeader") }),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
+								className: css.switchRow,
+								children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+									className: css.switch,
+									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+										type: "checkbox",
+										className: css.switchInput,
+										checked: state.section.overviewEnabled,
+										onChange: (e) => {
+											props.setOverviewEnabled(e.currentTarget.checked);
+										}
+									}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+										className: css.switchTrack,
+										"aria-hidden": "true",
+										children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { className: css.switchThumb })
+									})]
+								}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: t("overviewDesc") })]
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+								className: css.actions,
+								children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+									type: "button",
+									className: css.btn,
+									disabled: !state.available || overviewRefresh === "busy",
+									onClick: () => {
+										setOverviewRefresh("busy");
+										props.refreshOverview().then((outcome) => setOverviewRefresh(outcome)).catch((err) => setOverviewRefresh(`error:${err?.message ?? String(err)}`));
+									},
+									children: overviewRefresh === "busy" ? t("overviewRefreshing") : t("overviewRefresh")
+								}), overviewRefresh !== "idle" && overviewRefresh !== "busy" ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+									className: css.hint,
+									children: t("overviewRefreshDone", { outcome: renderOutcomeText(t, overviewRefresh) })
+								}) : null]
 							})
 						]
 					}),
@@ -1601,7 +1716,10 @@ window.__ModuleLoader__.load({
 				jsonArgsMethod("restore", true),
 				jsonArgsMethod("getRuntime", false),
 				jsonArgsMethod("health", false),
-				jsonArgsMethod("unarchive", true)
+				jsonArgsMethod("unarchive", true),
+				jsonArgsMethod("changes", true),
+				jsonArgsMethod("overviewStatus", true),
+				jsonArgsMethod("refreshOverview", true)
 			]
 		};
 		//#endregion

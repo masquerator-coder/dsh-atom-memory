@@ -52,6 +52,7 @@ import asyncio
 import collections
 import json
 import logging
+import sqlite3
 import sys
 import uuid
 from typing import Any, Dict, Optional
@@ -227,6 +228,19 @@ class RpcServer:
             return await self._forget_all(params)
         if method == "persist_candidates":
             return await self._persist_candidates(params)
+        # The work-overview surface. These are not `AtomMem` proxy methods: they
+        # compose `overview` helpers over the live connection, because the
+        # overview's cache and changelog are store infrastructure rather than
+        # memory operations, and they must stay reachable even from a caller that
+        # only holds a connection.
+        if method == "overview_skeleton":
+            return await self._overview_skeleton(params)
+        if method == "overview_put":
+            return await self._overview_put(params)
+        if method == "overview_status":
+            return await self._overview_status(params)
+        if method == "changes":
+            return await self._changes(params)
 
         attr = _METHODS.get(method)
         if attr is None:
@@ -373,13 +387,39 @@ class RpcServer:
 
         ``scope_context`` selects the scope-blocked rendering (current scope,
         ancestors, phases, global rules, condition rules) for the compact depth.
+
+        ``overview`` prepends the work-overview head (what has been worked on,
+        plus how to look up the detail) to the compact depth. It reads the
+        *cached* overview only — this method never generates one, because it runs
+        while a session's prompt is being frozen and a model call there would put
+        a completion in front of every first request. When nothing is cached the
+        head degrades to the deterministic render (see
+        :mod:`~atom_memory.overview`); the out-of-band job
+        (``dsh/src/overview.ts``) is what fills the cache.
+
+        The default is ``False`` so a caller that predates this keeps its exact
+        previous output, and an older dsh against a newer library simply never
+        asks for the head.
         """
         user_id = params["user_id"]
+        use_overview = bool(params.get("overview", False))
+        cached: Optional[str] = None
+        if use_overview and self.mem.db is not None:
+            from .overview import read_overview
+
+            # Read without a fingerprint: the head is a memo of what has been
+            # worked on, and a slightly dated one is far better than none. The
+            # fingerprint decides whether to *regenerate* (see `should_refresh`),
+            # which is the job of the out-of-band path, not of the freeze.
+            cached = read_overview(self.mem.db, user_id)
+
         text = await self.mem.summary(
             user_id,
             max_tokens=int(params.get("max_tokens", 1500)),
             detail=bool(params.get("detail", False)),
             scope_context=params.get("scope_context"),
+            overview=cached,
+            use_overview=use_overview,
         )
         if not params.get("include_meta"):
             return text
@@ -387,7 +427,110 @@ class RpcServer:
             "SELECT COUNT(*) AS n FROM facts WHERE user_id = ? AND status = 'active'",
             (user_id,),
         ).fetchone()
-        return {"text": text, "facts": int(row["n"] if row is not None else 0)}
+        return {
+            "text": text,
+            "facts": int(row["n"] if row is not None else 0),
+            "overview": {
+                "cached": cached is not None,
+            },
+        }
+
+    # -- the work-overview surface -------------------------------------------
+
+    def _overview_db(self) -> sqlite3.Connection:
+        """Return the live connection, or raise the standard not-started error."""
+        if not self._started or self.mem is None or self.mem.db is None:
+            raise _RpcError("not started; call start first")
+        return self.mem.db
+
+    async def _overview_skeleton(self, params: dict) -> dict:
+        """Return the deterministic aggregation an overview is written from.
+
+        The out-of-band job calls this, hands the result to a model, and stores
+        the prose with :meth:`_overview_put`. Splitting it out means the *inputs*
+        to the overview are computed in Python — where the facts, scopes and
+        topics are — while the prose is written where the model lives.
+
+        Params: ``user_id``, optional ``scope_context``, ``max_units``,
+        ``budget_chars``.
+        """
+        from .overview import build_overview_skeleton
+
+        conn = self._overview_db()
+        return build_overview_skeleton(
+            conn,
+            params["user_id"],
+            scope_context=params.get("scope_context"),
+            config=self.mem.config,
+            max_units=int(params.get("max_units", 8)),
+            budget_chars=int(params.get("budget_chars", 4000)),
+        )
+
+    async def _overview_put(self, params: dict) -> dict:
+        """Store a generated overview in the cache.
+
+        Params: ``user_id``, ``text``, optional ``fingerprint`` (recomputed when
+        omitted, so a caller cannot poison the cache with a digest that does not
+        describe the store), ``facts_count``, ``source``.
+        """
+        from .overview import overview_fingerprint, write_overview
+
+        conn = self._overview_db()
+        user_id = params["user_id"]
+        text = str(params.get("text") or "")
+        if not text.strip():
+            raise _RpcError("overview_put requires non-empty text")
+        fingerprint = str(
+            params.get("fingerprint") or overview_fingerprint(conn, user_id)
+        )
+        write_overview(
+            conn,
+            user_id,
+            text,
+            fingerprint,
+            facts_count=int(params.get("facts_count", 0)),
+            source=str(params.get("source") or "llm"),
+        )
+        return {"stored": True, "fingerprint": fingerprint}
+
+    async def _overview_status(self, params: dict) -> dict:
+        """Report the overview cache's state and whether it is worth refreshing.
+
+        The out-of-band job's decision point: it asks this first and only spends
+        a model call when the answer says the change was structural.
+
+        Params: ``user_id``, optional ``min_level`` (default ``structural``).
+        """
+        from .overview import LEVEL_STRUCTURAL, overview_status, should_refresh
+
+        conn = self._overview_db()
+        user_id = params["user_id"]
+        status = overview_status(conn, user_id)
+        should, reason = should_refresh(
+            conn, user_id, min_level=str(params.get("min_level") or LEVEL_STRUCTURAL)
+        )
+        status["should_refresh"] = should
+        status["refresh_reason"] = reason
+        return status
+
+    async def _changes(self, params: dict) -> dict:
+        """List recent memory changes — what the store did lately, newest first.
+
+        The human-facing half of the changelog (the other half is
+        :meth:`_overview_status`'s staleness decision), exposed so "what changed
+        in my memory" is answerable without reading the database.
+
+        Params: ``user_id``, optional ``since_ms``, ``limit``.
+        """
+        from .overview import recent_changes, change_level
+
+        conn = self._overview_db()
+        user_id = params["user_id"]
+        since_ms = int(params.get("since_ms", 0))
+        changes = recent_changes(
+            conn, user_id, since_ms=since_ms, limit=int(params.get("limit", 50))
+        )
+        return {"changes": changes, "level": change_level(conn, user_id, since_ms)}
 
     async def _persist_candidates(self, params: dict) -> dict:
         """Persist pre-extracted candidates (from the dsh-side LLM extractor).

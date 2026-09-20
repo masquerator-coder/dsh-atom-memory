@@ -44,6 +44,9 @@ pnpm build       # -> lib/index.mjs
 | `summaryTokens` | `1500` | `memory_summary_detail` 工具返回的完整清单 token 上限（设置弹窗走同一预算，但取紧凑深度） |
 | `injectedSummaryTokens` | `800` | 注入系统提示词的紧凑快照 token 上限（与上者分开：注入内容每个请求都要付费）。**仅作为初值**：运行时由设置面板的「系统提示词注入体积」滑块接管（固定挡位 300 / 800 / 1500 / 3000 / 6000 / 12000） |
 | `contextInjectionEnabled` | `true` | 会话起始冻结快照注入系统提示词 |
+| `overviewEnabled` | `true` | 空闲时用模型把记忆库写成「以前做过的工作」总览。**本插件唯一会主动消耗模型调用的开关**；关闭后注入照常，只是改为使用确定性总览。可实时编辑 |
+| `overviewIdleSeconds` | `90` | 一次记忆写入后等待多久（静默窗口）才尝试刷新总览。每次写入都把期限往后推，因此一阵连续活动只花一次生成 |
+| `overviewRefreshMinutes` | `15` | 两次总览刷新之间的最短间隔。变更记录的分级已经能挡掉「刷了也没区别」的刷新，这一项挡的是「反复刷」；`0` 取消下限 |
 | `maxProfileRows` | `50` | 用户画像表的条目上限（0 = 不限）。画像会写进系统提示词，每条都在每个请求上付费，这是那笔开销的硬上限；超限时**拒绝新增**并回报当前数量与上限（改动已有条目仍允许），不会静默淘汰最旧的一条 |
 | `rpcTimeoutMs` | `30000` | 单次 RPC 超时 |
 | `multiValuedPredicates` | `[]` | 额外声明为**多值**的谓词（部署期）：同一键下的不同取值是各自独立的事实，而不是互相覆盖。谓词由抽取器自由生成，内置集合不可能穷举（`待办` / `任务` / `拥有项目` / `教学课程` 这类一对多关系曾被当成单值：旧条目被 `newer_assertion` 覆盖、同一批里的其余条目以 `batch_duplicate` 直接丢弃）；这里加一行即可止血，无需改代码。留空则**不发送该参数**，与引入它之前逐字节一致 |
@@ -117,13 +120,14 @@ pnpm build       # -> lib/index.mjs
 | 工具 | 说明 |
 | --- | --- |
 | `memory_add` | 显式记住原始内容（LLM-first → 长内容原文兜底 → 规则回退） |
-| `memory_summary` | 渲染**注入系统提示词的紧凑摘要**（按类型分组、不含 `fact_id`），「先看摘要、再查明细」入口 |
+| `memory_summary` | 渲染**注入系统提示词的紧凑摘要**（不含 `fact_id`），**以「以前做过的工作」总览开头、后接「要了解细节」的查询指路**，最后才是按类型的明细——「先看总览、再按需查明细」的入口 |
 | `memory_recall` | 语义+全文混合召回；模型可见内容含 `fact_id`、`type` **与 `content` 正文**，并前置紧凑摘要 |
 | `memory_forget` | 软删除（retract）一条事实 |
-| `memory_summary_detail` | 渲染记忆**完整清单**（每条含 `fact_id`）——注意注入系统提示词的是同一份记忆的紧凑版（按类型分组、不含 `fact_id`），要确认注入内容以 `memory_summary` 为准 |
+| `memory_summary_detail` | 渲染记忆**完整清单**（每条含 `fact_id`）——注意注入系统提示词的是同一份记忆的紧凑版（不含 `fact_id`），要确认注入内容以 `memory_summary` 为准 |
 | `memory_user_md` | 渲染用户画像 markdown |
 | `memory_stats` | 记忆统计计数 |
 | `memory_scope` | 作用域管理面：`list`（作用域树）/ `resolve`（当前上下文解析到哪 + 待确认候选队列）/ `create` / `confirm` / `alias_add` / `merge` |
+| `memory_overview` | 工作总览与变更记录管理面：`show`（默认，只返回总览正文，不含其后的指路段与明细段——那两段归 `memory_summary`）/ `status`（缓存状态 + 是否值得重新生成）/ `changes`（近期记忆变动，按时间倒序，回答「记忆库最近有什么变化」）/ `refresh`（立刻重新生成，会调用一次模型，仅在用户明确要求时用） |
 
 > **注意：模型只读 `output.render` 的返回值**（`ToolResult.content` 才是 model-facing），
 > `output.schema` 仅用于校验/类型。因此事实的任何字段若未写进 `render`，对模型就是不可见的。
@@ -131,7 +135,9 @@ pnpm build       # -> lib/index.mjs
 ### 查询（下钻）链路
 
 ```
-memory_summary（概览：紧凑注入摘要）
+memory_summary（概览：总览段 + 指路段 + 紧凑明细）
+      │
+      ├─▶ 想知道「以前做过哪些工作」──▶ 读总览段（模型旁路生成，见下）
       │
       ├─▶ 需要具体事实 ──▶ memory_recall(query)
       │        ├─ render 输出 fact_id / type / content 正文（知识类事实的正文即答案）
@@ -167,6 +173,51 @@ memory_summary（概览：紧凑注入摘要）
 > （`global`），与写入侧（capture / LLM-first）保持一致，因此记忆能在会话间
 > 共享与检索；当前会话 id 仅作为 `session_id` 记录归属溯源。调用方可通过可选的
 > `user` 参数显式指定其他用户作用域。
+
+### 工作总览（旁路生成）
+
+注入的紧凑摘要以「以前做过的工作」开头，再给「要了解细节」的查询指路。这两段是
+`summary.py` 的渲染结构，而总览的**正文**由模型写；关键设计是它**不在冻结提示词的
+路径上写**。
+
+冻结发生在每个会话的首次装配。若在那里调用模型，就等于在每个会话的首个请求前插一次
+补全，而且冻下来的前缀会取决于「它恰好什么时候被装配」——首请求变慢，KV cache 的复用
+也不再可预测。因此总览提前写、在安静时写（`src/overview.ts`）：
+
+```
+记忆写入完成
+   │  capture.ts 的 afterPersist 钩子（不 await、抛错也吞掉）
+   ▼
+noteActivity()  ── 去抖计时器（overviewIdleSeconds，默认 90s）
+   │              每次写入把期限往后推 ⇒ 一阵活动只花一次生成
+   ▼
+overview_status ──▶ should_refresh?  ── 否 ──▶ 什么都不做（不花模型调用）
+   │ 是
+   ▼
+overview_skeleton ──▶ 模型写成散文 ──▶ overview_put（写回缓存）
+   │
+   ▼
+下个会话冻结时读到它（当前会话不受影响）
+```
+
+四条不变式：
+
+* **从不阻塞**：`noteActivity()` 立即返回，实际工作在一个分离的 promise 里；失败只记
+  一次日志。捕获路径不因为「摘要没写成」而失败或变慢。
+* **判定的权威在 Python**：要不要重新生成由 `should_refresh` 回答（变更记录在那里），
+  dsh 侧不重新实现这套判断——第二份实现就是第二个需要同步的东西。
+* **细节变化不重新生成**：变更按**语义**分级（`none` < `detail` < `structural` <
+  `reset`）。改一条属性的取值属 `detail`，不触发重写；只有新工作单元、新的
+  决策/教训/流程/待办、退役才属 `structural`。
+* **两道闸各管一件事**：`overviewRefreshMinutes` 挡「反复刷」，变更分级挡「刷了也没
+  区别」。写工具的 `refresh` 绕过前者（用户明确要求），但不绕过后者。
+
+变更记录复用已有的 `events` 表（不新建表）。它本来就存在且被约 21 条策略路径调用过，
+唯独**成功写入事实**这条什么都不发——而这个洞恰好就是刷新触发器需要的信号，所以补上
+了 `fact_written`（迁移 `atom_memory/migrations/013_init.sql` 只为它补索引）。
+
+未跑过后台任务的部署、或首次会话在任务触发前就启动时，缓存为空——这时回退到
+**确定性总览**（Python 直接从同一份聚合渲染，不需要模型）。缓存为空不是错误。
 
 ### 作用域（scope）
 

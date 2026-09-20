@@ -15,6 +15,15 @@
 # it to false to keep every call scope-blind. The explicit `scopeOrg` /
 # `scopeClient` / `scopeProject` / `scopeSeries` / `scopePhase` tags are unset
 # here (empty = not sent); set the ones this deployment serves.
+#
+# `overviewEnabled` (default true) lets the plugin summarise the store into a
+# "what has been worked on" overview during idle time. It is the only setting
+# here that spends model calls without the user asking for anything, so it is
+# worth knowing about: with it off, the injected snapshot is unchanged and simply
+# leads with the deterministic overview instead of a model-written one.
+# `overviewIdleSeconds` is the quiet window after a write before a refresh is
+# attempted, and `overviewRefreshMinutes` is the floor between two refreshes
+# (0 removes the floor).
 - insert:
     - id: atom-memory
       name: dsh-atom-memory
@@ -27,5 +36,8 @@
         nudgeIntervalMinutes: 30
         autostart: true
         scopeEnabled: true
+        overviewEnabled: true
+        overviewIdleSeconds: 90
+        overviewRefreshMinutes: 15
 
 

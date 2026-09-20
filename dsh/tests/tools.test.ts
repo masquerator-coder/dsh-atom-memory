@@ -152,6 +152,26 @@ describe('memory tools user scope', () => {
     expect(params.detail).toBe(true)
   })
 
+  it('memory_summary asks for the overview head it claims to mirror', async () => {
+    // The tool's stated purpose is "show what the model is being told". A render
+    // without the head would make it disagree with the prompt it mirrors.
+    const { bridge, registered } = setup()
+    bridge.call.mockResolvedValue('## 以前做过的工作\n- 做过 A\n## 要了解细节\n- memory_recall')
+    const summary = registered.find((d) => d.name === 'memory_summary')!
+    const result = (await summary.execute({}, execWithSession('s1'))) as any
+    const params = bridge.call.mock.calls.at(-1)![1] as Record<string, unknown>
+    expect(params.overview).toBe(true)
+    expect(result.text).toContain('以前做过的工作')
+  })
+
+  it('memory_summary tolerates a plain-string reply from an older Python side', async () => {
+    const { bridge, registered } = setup()
+    bridge.call.mockResolvedValue('旧版纯字符串')
+    const summary = registered.find((d) => d.name === 'memory_summary')!
+    const result = (await summary.execute({}, execWithSession('s1'))) as any
+    expect(result.text).toBe('旧版纯字符串')
+  })
+
   it('an explicit user argument overrides the fallback scope', async () => {
     const { bridge, registered } = setup()
     const recall = registered.find((d) => d.name === 'memory_recall')!
@@ -271,5 +291,178 @@ describe('memory_add raw knowledge fallback', () => {
 
     const [method] = bridge.call.mock.calls.at(-1) as [string, Record<string, unknown>]
     expect(method).toBe('add')
+  })
+})
+
+// ---- memory_overview ---------------------------------------------------------
+//
+// The user-facing half of the changelog. Two things are worth pinning here:
+// that `show` returns the overview *head* and not the digest `memory_summary`
+// already returns, and that a refresh is never attempted when the deployment has
+// no refresher wired — appearing to work is worse than refusing.
+
+describe('memory_overview tool', () => {
+  function setupOverview(extra: Record<string, unknown> = {}) {
+    const bridge = { call: vi.fn() }
+    const registered: ToolDefinition[] = []
+    const tools = {
+      register: (def: ToolDefinition) => {
+        registered.push(def)
+        return () => {}
+      },
+    }
+    registerMemoryTools({
+      ctx: { tools } as any,
+      bridge: bridge as any,
+      fallbackScope: 'global',
+      maxRecalledFacts: 10,
+      summaryTokens: 500,
+      ...extra,
+    } as any)
+    return { bridge, registered, tool: registered.find(d => d.name === 'memory_overview')! }
+  }
+
+  it('is registered', () => {
+    expect(setupOverview().tool).toBeTruthy()
+  })
+
+  it('show returns only the overview head, not the digest', async () => {
+    const { bridge, tool } = setupOverview()
+    bridge.call.mockResolvedValue({
+      text: [
+        '## 以前做过的工作',
+        '- 做过 A 和 B',
+        '## 要了解细节',
+        '- memory_recall …',
+        '## 决策规则',
+        '- 一条规则',
+      ].join('\n'),
+    })
+    const result = (await tool.execute({}, execWithSession('s1'))) as any
+    expect(result.text).toContain('以前做过的工作')
+    // The guide and the digest belong to `memory_summary`; repeating them would
+    // make the two tools indistinguishable to the model.
+    expect(result.text).not.toContain('决策规则')
+    expect(result.text).not.toContain('要了解细节')
+
+    const params = bridge.call.mock.calls.at(-1)![1] as Record<string, unknown>
+    expect(params.overview).toBe(true)
+    expect(params.detail).toBe(false)
+  })
+
+  it('show falls back to the whole text when there is no head', async () => {
+    // An empty store, or an older Python side: say what there is rather than
+    // returning an empty string under a heading that would misdescribe it.
+    const { bridge, tool } = setupOverview()
+    bridge.call.mockResolvedValue('## 决策规则\n- 一条规则')
+    const result = (await tool.execute({}, execWithSession('s1'))) as any
+    expect(result.text).toContain('决策规则')
+  })
+
+  it('status reports the cache state and the refresh verdict', async () => {
+    const { bridge, tool } = setupOverview()
+    bridge.call.mockResolvedValue({
+      cached: false,
+      stale: true,
+      should_refresh: false,
+      refresh_reason: 'no_facts',
+    })
+    const result = (await tool.execute({ action: 'status' }, execWithSession('s1'))) as any
+    expect(result.text).toContain('尚无缓存')
+    expect(result.text).toContain('记忆库为空')
+    expect(bridge.call.mock.calls.at(-1)![0]).toBe('overview_status')
+  })
+
+  it('changes renders the changelog with readable labels', async () => {
+    const { bridge, tool } = setupOverview()
+    bridge.call.mockResolvedValue({
+      changes: [
+        { type: 'fact_written', created_at: Date.UTC(2026, 1, 5, 3, 4), detail: { predicate: '决定', type: 'decision_rule' } },
+        { type: 'fact_superseded', created_at: 0, detail: {} },
+      ],
+      level: 'structural',
+    })
+    const result = (await tool.execute({ action: 'changes' }, execWithSession('s1'))) as any
+    expect(result.text).toContain('变动级别：structural')
+    expect(result.text).toContain('写入')
+    expect(result.text).toContain('决定')
+    expect(result.text).toContain('替换')
+    expect(result.text).toContain('?')  // the zero timestamp
+  })
+
+  it('changes says so when nothing happened', async () => {
+    const { bridge, tool } = setupOverview()
+    bridge.call.mockResolvedValue({ changes: [] })
+    const result = (await tool.execute({ action: 'changes' }, execWithSession('s1'))) as any
+    expect(result.text).toContain('没有记忆变动')
+  })
+
+  it('changes forwards since/limit only when they parse', async () => {
+    const { bridge, tool } = setupOverview()
+    bridge.call.mockResolvedValue({ changes: [] })
+    await tool.execute({ action: 'changes', since: '1234', limit: '5' }, execWithSession('s1'))
+    let params = bridge.call.mock.calls.at(-1)![1] as Record<string, unknown>
+    expect(params.since_ms).toBe(1234)
+    expect(params.limit).toBe(5)
+
+    await tool.execute({ action: 'changes', since: 'nonsense' }, execWithSession('s1'))
+    params = bridge.call.mock.calls.at(-1)![1] as Record<string, unknown>
+    expect(params).not.toHaveProperty('since_ms')
+  })
+
+  it('refresh calls the wired refresher exactly once', async () => {
+    const refreshOverview = vi.fn(async () => 'refreshed')
+    const { tool } = setupOverview({ refreshOverview })
+    const result = (await tool.execute({ action: 'refresh' }, execWithSession('s1'))) as any
+    expect(refreshOverview).toHaveBeenCalledTimes(1)
+    expect(result.text).toContain('已重新生成')
+  })
+
+  it('refresh refuses honestly when no refresher is wired', async () => {
+    const { tool } = setupOverview()
+    const result = (await tool.execute({ action: 'refresh' }, execWithSession('s1'))) as any
+    expect(result.text).toContain('未启用')
+  })
+
+  it('refresh translates every outcome token', async () => {
+    for (const [outcome, needle] of [
+      ['throttled', '太近'],
+      ['no-model', '未配置可用模型'],
+      ['nothing-to-narrate', '暂无可叙述'],
+      ['empty-generation', '没有产出内容'],
+      ['skipped', '未启用'],
+      ['error', '生成失败'],
+      ['no-change:up_to_date', '仅细节变化'],
+      ['no-change:level', '无需重新生成'],
+    ] as Array<[string, string]>) {
+      const { tool } = setupOverview({ refreshOverview: async () => outcome })
+      const result = (await tool.execute({ action: 'refresh' }, execWithSession('s1'))) as any
+      expect(result.text).toContain(needle)
+    }
+  })
+
+  it('rejects an unknown action rather than silently defaulting to show', async () => {
+    const { tool } = setupOverview()
+    await expect(tool.execute({ action: 'nope' }, execWithSession('s1')))
+      .rejects.toThrow(/unknown action/)
+  })
+
+  it('defaults to show', async () => {
+    const { bridge, tool } = setupOverview()
+    bridge.call.mockResolvedValue({ text: '## 以前做过的工作\n- A' })
+    await tool.execute({}, execWithSession('s1'))
+    expect(bridge.call.mock.calls.at(-1)![0]).toBe('summary')
+  })
+
+  it('honours the master switch', async () => {
+    const { tool } = setupOverview({ isEnabled: () => false })
+    await expect(tool.execute({}, execWithSession('s1'))).rejects.toThrow(/disabled/)
+  })
+
+  it('honours an explicit user argument', async () => {
+    const { bridge, tool } = setupOverview()
+    bridge.call.mockResolvedValue({ text: '## 以前做过的工作\n- A' })
+    await tool.execute({ user: 'someone-else' }, execWithSession('s1'))
+    expect(bridge.call.mock.calls.at(-1)![1]!.user_id).toBe('someone-else')
   })
 })

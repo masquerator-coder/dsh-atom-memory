@@ -59,6 +59,20 @@ export interface CaptureDeps {
   capture: (text: string, sessionId: string, cwd?: string) => Promise<void>
   /** Max recent messages remembered per session. */
   maxRecent?: number
+  /**
+   * Notified after a capture attempt settles, successfully or not.
+   *
+   * The overview refresher hangs off this: a write is the only thing that can
+   * make the store's overview stale, so this is the true "the store may have
+   * changed" signal. It is called with the outcome rather than only on success
+   * because a failed capture is followed by a rescue retry, and the retry
+   * settles here too — so the refresher sees every write that actually landed
+   * without this module having to model the retry.
+   *
+   * **Never awaited.** Capture must not wait on a summary being written, and the
+   * callback is required to be non-throwing; it is wrapped anyway.
+   */
+  afterPersist?: (sessionId: string, ok: boolean) => void
 }
 
 export interface CaptureOptions {
@@ -93,6 +107,21 @@ export function registerCapture(deps: CaptureDeps, opts: CaptureOptions): (() =>
   const maxRecent = deps.maxRecent ?? 20
   const recent = new Map<string, MessageEntry[]>()
   const enabled = () => opts.captureEnabled() !== false
+
+  /**
+   * Fire the post-capture notification without letting it affect capture.
+   *
+   * Swallows everything: the callback is a listener for the overview refresher,
+   * which schedules a detached task, and a bug in it must not turn a successful
+   * memory write into a rejected capture promise (which would mark the entry
+   * retriable and re-send it).
+   */
+  const notify = (sessionId: string, ok: boolean): void => {
+    if (deps.afterPersist === undefined) return
+    try {
+      deps.afterPersist(sessionId, ok)
+    } catch { /* best-effort */ }
+  }
 
   const push = (sessionId: string, entry: MessageEntry): void => {
     const list = recent.get(sessionId) ?? []
@@ -148,8 +177,8 @@ export function registerCapture(deps: CaptureDeps, opts: CaptureOptions): (() =>
     // context: which checkout a message came from is not derivable from its id,
     // and a harness can serve several sessions rooted in different ones.
     void capture(text, session.id, sessionCwdOf(session)).then(
-      () => { entry.captured = true },
-      () => { entry.failed = true },
+      () => { entry.captured = true; notify(session.id, true) },
+      () => { entry.failed = true; notify(session.id, false) },
     )
   }))
 

@@ -64,6 +64,32 @@ export interface Config {
   injectedSummaryTokens?: number
   /** Inject a session-start-frozen summary snapshot into the system prompt. */
   contextInjectionEnabled?: boolean
+  /**
+   * Whether the out-of-band work-overview synthesis runs.
+   *
+   * The injected snapshot leads with a model-written narrative of what has been
+   * worked on. Writing it costs a completion, so it is done ahead of time in a
+   * quiet moment rather than while a prompt is frozen; this switch turns that
+   * background job off. The snapshot itself is unaffected — with this off it
+   * leads with the deterministic overview instead.
+   */
+  overviewEnabled?: boolean
+  /**
+   * Seconds of quiet after a memory write before a refresh is attempted.
+   *
+   * The debounce window. Every write pushes the deadline out, so a burst of
+   * activity costs exactly one synthesis — at the pause, when the store has
+   * stopped changing and the overview will not be immediately obsolete.
+   */
+  overviewIdleSeconds?: number
+  /**
+   * Minimum minutes between two overview refreshes. `0` disables the floor.
+   *
+   * The changelog gate already prevents a refresh that would change nothing;
+   * this prevents a *repeated* one, so a long session cannot turn into a stream
+   * of completions however much it writes.
+   */
+  overviewRefreshMinutes?: number
   /** Per-RPC timeout in ms. */
   rpcTimeoutMs?: number
   /**
@@ -202,6 +228,9 @@ export const Config: z<Config> = z.object({
   summaryTokens: z.number().default(1500),
   injectedSummaryTokens: z.number().default(DEFAULT_INJECTED_SUMMARY_TOKENS),
   contextInjectionEnabled: z.boolean().default(true),
+  overviewEnabled: z.boolean().default(true),
+  overviewIdleSeconds: z.number().default(90),
+  overviewRefreshMinutes: z.number().default(15),
   rpcTimeoutMs: z.number().default(30_000),
   writeAckTimeoutMs: z.number().default(2500),
   maxVectorDistance: z.number().default(0.70),

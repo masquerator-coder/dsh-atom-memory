@@ -49,6 +49,9 @@ describe('ATOM_MEMORY_REMOTE', () => {
       'getRuntime',
       'health',
       'unarchive',
+      'changes',
+      'overviewStatus',
+      'refreshOverview',
     ])
     for (const descriptor of ATOM_MEMORY_REMOTE.descriptors) {
       expect(descriptor.namespace).toBe('atomMemory')

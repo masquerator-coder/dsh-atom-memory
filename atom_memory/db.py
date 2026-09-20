@@ -23,7 +23,7 @@ from .config import MemConfig
 logger = logging.getLogger(__name__)
 
 # The highest schema version the bundled migrations know about.
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 
 def now_ms() -> int:

@@ -334,6 +334,14 @@ export interface ToolDeps {
    * with nothing in it is not sent.
    */
   scopeContext?: (source?: SessionCwdSource) => ScopeContextPayload | undefined
+  /**
+   * Trigger one out-of-band overview refresh and report what happened.
+   *
+   * Optional: absent means the deployment does not maintain the overview, and
+   * `memory_overview action=refresh` says so rather than silently doing nothing.
+   * The returned token is one of the refresher's short outcome strings.
+   */
+  refreshOverview?: () => Promise<string>
 }
 
 /** Thrown when the memory master switch is off. */
@@ -643,6 +651,127 @@ export function renderDomainResult(action: string, value: unknown): string {
   }
 }
 
+/** One row of the memory changelog, as `changes` reports it. */
+export interface ChangeRow {
+  type?: string
+  created_at?: number
+  detail?: Record<string, unknown>
+}
+
+/** Human labels for the changelog's event types. */
+const CHANGE_LABELS: Record<string, string> = {
+  fact_written: '写入',
+  fact_deduplicated: '去重合并',
+  fact_superseded: '替换',
+  fact_retracted: '软删除',
+  fact_purged: '彻底删除',
+  fact_reinforced: '复用加强',
+  scope_created: '新建范围',
+  scope_updated: '范围更新',
+  domain_created: '新建主题',
+  domain_updated: '主题更新',
+  domain_merged: '主题合并',
+  fact_rejected: '丢弃',
+}
+
+/** Render a timestamp as a local `MM-DD HH:mm` stamp (falling back to the raw value). */
+function formatChangeTime(ms: number | undefined): string {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return '?'
+  const d = new Date(ms)
+  if (Number.isNaN(d.getTime())) return '?'
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+/**
+ * Render the changelog as a readable list.
+ *
+ * @param changes - Rows from Python, already newest-first.
+ * @param level - The change level the same call computed, when present.
+ * @returns A markdown-ish block; never empty (an empty store says so).
+ */
+export function renderChanges(changes: ChangeRow[], level?: string): string {
+  if (changes.length === 0) return '（近期没有记忆变动）'
+  const lines = changes.map((row) => {
+    const label = CHANGE_LABELS[row.type ?? ''] ?? row.type ?? '?'
+    const detail = row.detail ?? {}
+    // Name the thing that changed, using whatever the payload actually carries:
+    // a predicate reads best, a scope/domain name next, an id last.
+    const subject =
+      (typeof detail.predicate === 'string' && detail.predicate)
+      || (typeof detail.object === 'string' && detail.object)
+      || (typeof detail.name === 'string' && detail.name)
+      || (typeof detail.fact_id === 'string' && detail.fact_id)
+      || ''
+    const extra = typeof detail.type === 'string' ? `（${detail.type}）` : ''
+    return `- ${formatChangeTime(row.created_at)} ${label}${extra}${subject ? `：${subject}` : ''}`
+  })
+  const header = level === undefined ? '' : `变动级别：${level}\n`
+  return `${header}${lines.join('\n')}`
+}
+
+/** Render the overview cache's status, including whether a refresh is warranted. */
+export function renderOverviewStatus(status: Record<string, unknown>): string {
+  const cached = status.cached === true
+  const lines: string[] = []
+  lines.push(cached ? '总览：已缓存' : '总览：尚无缓存（当前渲染的是确定性回退版本）')
+  if (cached) {
+    const source = typeof status.source === 'string' ? status.source : '?'
+    const facts = typeof status.facts_count === 'number' ? status.facts_count : 0
+    const updated = formatChangeTime(status.updated_at as number | undefined)
+    lines.push(`来源：${source} · 覆盖 ${facts} 条 · 生成于 ${updated}`)
+  }
+  if (status.stale === true) lines.push('状态：已过期（记忆库在生成后发生了结构性变化）')
+  const reason = typeof status.refresh_reason === 'string' ? status.refresh_reason : ''
+  const reasonText: Record<string, string> = {
+    no_facts: '记忆库为空，无需生成',
+    not_cached: '尚无缓存，值得生成',
+    level: '发生了结构性变化，值得重新生成',
+    up_to_date: '仅细节变化，无需重新生成',
+  }
+  if (reason) lines.push(`判定：${reasonText[reason] ?? reason}`)
+  return lines.join('\n')
+}
+
+/** Translate the refresher's outcome token into a sentence. */
+export function renderRefreshOutcome(outcome: string): string {
+  if (outcome === 'refreshed') return '已重新生成并写入缓存（下个会话生效）。'
+  if (outcome === 'throttled') return '距上次刷新太近，已跳过；稍后再试。'
+  if (outcome === 'no-model') return '未配置可用模型，无法生成。'
+  if (outcome === 'nothing-to-narrate') return '记忆库暂无可叙述的内容。'
+  if (outcome === 'empty-generation') return '模型没有产出内容，缓存保持不变。'
+  if (outcome === 'skipped') return '总览后台生成未启用，或记忆功能已关闭。'
+  if (outcome === 'error') return '生成失败（详见日志），缓存保持不变。'
+  if (outcome.startsWith('no-change:')) {
+    const reason = outcome.slice('no-change:'.length)
+    return reason === 'up_to_date'
+      ? '仅细节变化，无需重新生成。'
+      : `无需重新生成（${reason}）。`
+  }
+  return outcome
+}
+
+/**
+ * Extract just the overview head from a full compact render.
+ *
+ * `memory_summary` and `memory_overview` share one render; this keeps the second
+ * from returning the first's digest, which would make the two tools
+ * indistinguishable to the model.
+ *
+ * @param text - A compact render with the overview head enabled.
+ * @returns The overview section onward, up to the lookup guide.
+ */
+export function overviewHeadOf(text: string): string {
+  const start = text.indexOf('## 以前做过的工作')
+  if (start < 0) {
+    // No head: either an empty store or an older Python side. Say so rather
+    // than returning the digest under a heading that would misdescribe it.
+    return text.trim() === '' ? '（无）' : text
+  }
+  const guideAt = text.indexOf('## 要了解细节', start)
+  return (guideAt < 0 ? text.slice(start) : text.slice(start, guideAt)).trim()
+}
+
 /** Register all memory tools and return their disposers. */
 export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
   const { ctx, bridge } = deps
@@ -854,7 +983,9 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
     name: 'memory_summary',
     description:
       '渲染当前用户记忆的紧凑摘要（与注入系统提示词的快照同一预算、同一份渲染，但不含数据围栏）。'
-      + '适合先看摘要，再按需用 memory_recall 查明细；要确认提示词里真正冻结的那段，用 memory_snapshot；要定位/编辑具体某条事实，用 memory_summary_detail。',
+      + '摘要先给「以前做过的工作」总览，再给「要了解细节」的查询指路，最后是按类型的明细。'
+      + '适合先看总览，再按需用 memory_recall 查明细；要看完整清单用 memory_summary_detail；'
+      + '要确认提示词里真正冻结的那段，用 memory_snapshot；要查记忆库近期变动，用 memory_overview action=changes。',
     parameters: {
       user: { type: 'string', description: '可选：归属用户 id（默认当前用户，跨会话共享）' },
     },
@@ -868,15 +999,93 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
     async execute(args, exec) {
       if (deps.isEnabled?.() === false) throw disabledError()
       const uid = args.user ?? userIdOf(exec, scope)
-      const text = await call<string>('summary', {
+      const raw = await call<string | { text?: string }>('summary', {
         user_id: uid,
         // The injection budget, so what the model reads here is the text the
         // session prompt would freeze at this moment.
         max_tokens: budget(),
         detail: false,
+        // Same head the injected snapshot uses. This tool's whole purpose is to
+        // show what the model is being told, so rendering it without the head
+        // would make the tool disagree with the prompt it claims to mirror.
+        overview: true,
         ...scopeParam(deps, exec),
       })
-      return { text }
+      // Tolerate a plain-string reply from an older Python side.
+      return { text: typeof raw === 'string' ? raw : (raw?.text ?? '') }
+    },
+  })))
+
+  disposers.push(ctx.tools.register(defineTool({
+    name: 'memory_overview',
+    description:
+      '查看与维护「以前做过的工作」总览，以及记忆库的变动记录。'
+      + 'action=show（默认）返回当前总览正文；status 返回缓存状态与是否值得重新生成；'
+      + 'changes 列出近期记忆变动（写入/去重/替换/退役等，按时间倒序）——'
+      + '想知道"记忆库最近有什么变化"就用它。'
+      + 'refresh 会立刻重新生成总览（会调用一次模型，仅在用户明确要求时使用）。',
+    parameters: {
+      action: {
+        type: 'string',
+        description: 'show | refresh | status | changes（默认 show）',
+      },
+      since: { type: 'string', description: 'action=changes 时可选：只看该时间戳（毫秒）之后的变动' },
+      limit: { type: 'string', description: 'action=changes 时可选：最多返回几条（默认 50）' },
+      user: { type: 'string', description: '可选：归属用户 id（默认当前用户，跨会话共享）' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true },
+      render(_args, value) {
+        const v = value as { text?: string }
+        return [{ type: 'text', text: v.text ?? '' }]
+      },
+    },
+    async execute(args, exec) {
+      if (deps.isEnabled?.() === false) throw disabledError()
+      const uid = args.user ?? userIdOf(exec, scope)
+      const action = (args.action ?? 'show').trim().toLowerCase()
+
+      if (action === 'refresh') {
+        if (deps.refreshOverview === undefined) {
+          return { text: '（本部署未启用总览后台生成，无法手动刷新）' }
+        }
+        const outcome = await deps.refreshOverview()
+        return { text: `总览刷新结果：${renderRefreshOutcome(outcome)}` }
+      }
+
+      if (action === 'status') {
+        const status = await call<Record<string, unknown>>('overview_status', {
+          user_id: uid,
+        })
+        return { text: renderOverviewStatus(status) }
+      }
+
+      if (action === 'changes') {
+        const since = Number.parseInt(args.since ?? '', 10)
+        const limit = Number.parseInt(args.limit ?? '', 10)
+        const result = await call<{ changes?: ChangeRow[]; level?: string }>('changes', {
+          user_id: uid,
+          ...(Number.isFinite(since) ? { since_ms: since } : {}),
+          ...(Number.isFinite(limit) ? { limit } : {}),
+        })
+        return { text: renderChanges(result.changes ?? [], result.level) }
+      }
+
+      if (action !== 'show') {
+        throw new Error(`memory_overview: unknown action "${args.action}"`)
+      }
+
+      const raw = await call<string | { text?: string }>('summary', {
+        user_id: uid,
+        max_tokens: budget(),
+        detail: false,
+        overview: true,
+        ...scopeParam(deps, exec),
+      })
+      const text = typeof raw === 'string' ? raw : (raw?.text ?? '')
+      // Show only the overview head: the digest below it is what `memory_summary`
+      // is for, and repeating it here would make the two tools indistinguishable.
+      return { text: overviewHeadOf(text) }
     },
   })))
 

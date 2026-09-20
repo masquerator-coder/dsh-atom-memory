@@ -146,6 +146,60 @@ _SECTION_ORDER = [
 
 _EMPTY_NOTICE = "_暂无持久化的原子记忆。_ (No active atomic facts yet.)"
 
+# -- the work-overview head (the compact depth's leading sections) --------------
+#
+# The compact depth used to be nothing but a type-grouped list of atomic facts,
+# and that answered the wrong question. A session opening with ``技术栈: Flask``
+# and ``内置斜杠命令: 仅 /compact`` learned a handful of disconnected details and
+# still could not say what had been *worked on* — or that anything had been.
+#
+# So the compact depth now leads with two sections that do answer it:
+#
+#   * the **work overview** — what has been worked on, per work unit, written out
+#     of band by a model (see `overview.py` and `dsh/src/overview.ts`) and cached,
+#     with a deterministic render as the fallback when nothing is cached;
+#   * the **lookup guide** — how to get at the detail: which tools to call and
+#     with what, including example queries built from this store's own labels.
+#
+# The type-grouped digest is still rendered, demoted to "参考明细" below both, and
+# only while the budget allows. It is the honest fallback (it is the only view
+# that cannot be wrong about the store) and it is what makes an empty cache
+# degrade to *something* rather than nothing.
+_OVERVIEW_TITLE = "以前做过的工作"
+_RECALL_TITLE = "要了解细节"
+
+#: Floor reserved for the overview section, in tokens. The overview is the reason
+#: this view exists, so it is the last content given up under a tight budget — the
+#: detail digest is sacrificed first, and a budget too small even for this floor
+#: drops to the guide alone rather than to a fact list.
+_OVERVIEW_MIN_TOKENS = 40
+
+#: Cap on the overview text taken from the cache. A model-written overview is
+#: unbounded by construction (it is prose), so it is clipped to this before it
+#: can crowd out everything else. Generous enough for several work units.
+_MAX_OVERVIEW_CHARS = 1600
+
+#: Cap on the rendered lookup guide. It is a fixed block plus example queries;
+#: this bounds the examples, not the tool wording.
+_MAX_GUIDE_CHARS = 700
+
+#: How many example queries the guide carries, drawn from the skeleton's own
+#: work-unit labels and topic names. Two or three show the *shape* of a useful
+#: query; more turns a guide into a list the model skims.
+_GUIDE_EXAMPLE_LIMIT = 4
+
+#: The lookup guide's fixed text, in decreasing order of usefulness. Each line
+#: names one tool and what it reaches, because the failure this section exists to
+#: fix is a model that knows memory exists but not which call reaches which depth
+#: of it. Ordered so the guide can be truncated from the tail under a tight
+#: budget without losing the mechanism for the convenience.
+_RECALL_GUIDE_LINES = [
+    "- 细节检索：memory_recall（名词短语最佳）；全文用 memory_get factId=…",
+    "- 完整清单：memory_summary_detail（含 fact_id，用于定位与编辑）",
+    "- 相关范围：memory_scope action=list / resolve",
+    "- 近期变动：memory_overview action=changes",
+]
+
 # Marker opening a compact section label (``## 决策规则``). Held as a constant
 # because it is measured as well as rendered: `_select` accounts for the label's
 # cost while it trims the artifact, so a marker that only existed inside
@@ -234,23 +288,45 @@ def generate_summary(
     detail: bool = True,
     scope_context: Optional[Mapping] = None,
     config: Optional[MemConfig] = None,
+    overview: Optional[str] = None,
+    use_overview: bool = False,
 ) -> str:
     """Build the ``summary`` text for a user.
+
+    The compact depth renders three things, in this order:
+
+    1. **the work overview** — what has been worked on, per work unit. ``overview``
+       carries the cached, model-written text when the caller has one; otherwise
+       it is aggregated and rendered deterministically (:func:`_fallback_overview`).
+       Either way this is where the view's budget goes first.
+    2. **the lookup guide** — which tools reach the detail, with example queries
+       drawn from this store (:func:`_render_guide`).
+    3. **the reference detail** — the type-grouped fact digest, demoted and
+       rendered only while the budget still allows.
 
     Args:
         conn: The SQLite connection.
         user_id: The user whose memory is rendered (hard isolation scope).
         max_tokens: Upper bound on the estimated token count of the body.
         detail: ``True`` renders the full fact list with ``fact_id`` references;
-            ``False`` renders the compact, type-grouped digest injected into the
-            session system prompt.
+            ``False`` renders the compact digest injected into the session system
+            prompt.
         scope_context: The session context payload. When given (and scope
-            awareness is on), the compact depth is rendered as scope blocks —
-            current scope, ancestors, phases, global rules, condition-matching
-            rules — instead of one flat digest. Ignored by the detail depth,
-            which exists to locate and edit facts and therefore lists everything.
+            awareness is on), the compact depth's *detail* section is rendered as
+            scope blocks — current scope, ancestors, phases, global rules,
+            condition-matching rules — instead of one flat digest. Ignored by the
+            detail depth, which exists to locate and edit facts and therefore
+            lists everything. It also orders the overview's work units (the
+            session's own project first) without filtering them.
         config: Configuration carrying the scope thresholds and the master
             switch. ``None`` uses library defaults.
+        overview: Cached overview text to lead with. ``None`` means "none
+            cached" and the deterministic fallback is rendered instead — this
+            parameter is never a request to *generate* one, because generating is
+            a model call and this function runs on the prompt-freeze path.
+        use_overview: Whether to render the overview head at all. Defaults to
+            ``False`` so an existing caller's output is unchanged; the injection
+            path and ``memory_summary`` pass ``True``.
 
     Returns:
         The rendered markdown string. An empty (but non-blank) notice is returned
@@ -265,9 +341,370 @@ def generate_summary(
     if detail:
         return _render_detail(buckets, user_id, max_tokens)
     cfg = config or MemConfig()
+    if use_overview:
+        return _render_with_overview(
+            conn, user_id, buckets, max_tokens, scope_context, cfg, overview
+        )
     if scope_context is not None and cfg.scope_aware:
         scoped = _render_scoped(conn, user_id, max_tokens, scope_context, cfg)
         if scoped is not None:
+            return scoped
+    return _render_compact(buckets, max_tokens)
+
+
+# -- the overview head ---------------------------------------------------------
+
+
+def _render_with_overview(
+    conn: sqlite3.Connection,
+    user_id: str,
+    buckets: dict,
+    max_tokens: int,
+    scope_context: Optional[Mapping],
+    config: MemConfig,
+    overview: Optional[str],
+) -> str:
+    """Render the compact depth as overview + guide + reference detail.
+
+    The budget is spent in that order, and the ordering is the whole design:
+
+    * the overview gets ``_OVERVIEW_MIN_TOKENS`` reserved before anything else,
+      because it is the section that answers "what has been done here";
+    * the detail digest is what shrinks — it goes through the same
+      :func:`_select` it always did, at whatever budget is left, so the
+      most-important-and-most-recent material still survives a squeeze;
+    * if even the reserve cannot be honoured, the overview is clipped rather than
+      dropped and the detail disappears entirely: half an overview is worth more
+      here than a fact list, which is the whole premise of the change.
+
+    Args:
+        conn: Open connection.
+        user_id: Owner whose memory is rendered.
+        buckets: ``section -> [fact, ...]``, already score-sorted.
+        max_tokens: Budget for the whole artifact.
+        scope_context: Session context, for unit ordering and the scoped detail.
+        config: Configuration.
+        overview: Cached overview text, or ``None``.
+
+    Returns:
+        The rendered artifact, clipped to ``max_tokens``. Never ``""`` unless the
+        budget cannot even hold one line: the guide is the last thing to go,
+        because a model that cannot see the overview can still be told how to
+        look one up.
+    """
+    guide = _render_guide(conn, user_id, scope_context, config)
+    guide_tokens = estimate_tokens(
+        f"{_COMPACT_LABEL_MARKER}{_RECALL_TITLE}\n{guide}"
+    ) if guide else 0
+
+    if overview:
+        overview_text = _clip_overview(overview)
+    else:
+        # Built to fit rather than clipped afterwards: the fallback is dense
+        # Chinese, and shrinking it post-hoc cost it its structure. The reserve
+        # left for the guide is capped, so at a mid budget the overview is not
+        # squeezed down to accommodate a hint block that costs more than it does.
+        reserve = min(guide_tokens, max(0, max_tokens // 3))
+        allowance = max_tokens - reserve - 6
+        overview_text = _fallback_overview(
+            conn, user_id, scope_context, config, max_tokens=max(0, allowance)
+        )
+
+    head = _compose_head(overview_text, guide, max_tokens)
+    head_tokens = estimate_tokens(head)
+
+    # The detail digest gets what is left, and only if that is worth rendering: a
+    # heading plus one line is the minimum at which a section is information
+    # rather than decoration.
+    remaining = max_tokens - head_tokens
+    detail_text = ""
+    if remaining >= _OVERVIEW_MIN_TOKENS:
+        detail_text = _render_detail_section(
+            conn, user_id, buckets, remaining, scope_context, config
+        )
+    return head + "\n" + detail_text if detail_text else head
+
+
+def _compose_head(overview_text: str, guide: str, max_tokens: int) -> str:
+    """Assemble the overview and the guide within ``max_tokens``.
+
+    The priority order is **overview first, guide second, and within the guide
+    the examples last**. That is the reverse of what a naive "keep the short
+    fixed block" rule produces, and the earlier version had it backwards: at a
+    mid budget it emitted the static hint block and *no* overview, which is the
+    one outcome this whole change exists to prevent. A model that reads a guide
+    tells you it has memory; a model that reads an overview knows what was done.
+
+    Degradation is therefore staged, and each stage is a whole unit rather than a
+    character slice, so nothing is ever half-said:
+
+    1. overview + full guide (with examples)
+    2. overview + guide without its example line
+    3. overview + the tool lines only (the examples are the first thing dropped:
+       they are a convenience, the tool names are the mechanism)
+    4. clipped overview + tool lines
+    5. tool lines alone, if the overview has been clipped to nothing
+
+    Every stage is measured, so ``max_tokens`` stays a hard cap on the returned
+    artifact at any budget — including one too small for the guide, where the
+    guide is itself clipped line by line (and, if need be, cut to the first line
+    plus an ellipsis) rather than returned over budget.
+
+    Args:
+        overview_text: The overview body, already character-clipped.
+        guide: The rendered guide, or ``""``.
+        max_tokens: Budget for the assembled head.
+
+    Returns:
+        The largest head that fits, or ``""`` when not even one line does.
+    """
+    guide_lines = guide.splitlines() if guide else []
+    # The example line is optional and is dropped first: it is a convenience,
+    # whereas the tool names are the mechanism.
+    tool_lines = [line for line in guide_lines if not line.startswith("- 例：")]
+    has_examples = len(tool_lines) != len(guide_lines)
+
+    candidates: List[str] = []
+    if overview_text:
+        # Most informative first, and **the overview is never the thing that
+        # gives way**: the guide shrinks from the tail (examples, then its last
+        # tool lines) while the overview stays whole, and only a budget that
+        # cannot hold both costs the overview its highlights, then its type
+        # breakdown. The guide is short, static and re-derivable; the overview is
+        # the answer this whole view was rebuilt to give, so an artifact that
+        # dropped it to make room for a hint block would be exactly backwards.
+        for lines in _guide_ladder(guide_lines, tool_lines, has_examples):
+            block = _head_block(overview_text, lines)
+            if block:
+                candidates.append(block)
+        for keep_chars in (600, 320, 160, 80):
+            clipped = _clip(overview_text, keep_chars)
+            if not clipped or clipped == overview_text:
+                continue
+            block = _head_block(clipped, tool_lines[:2])
+            if block and block not in candidates:
+                candidates.append(block)
+    if tool_lines:
+        candidates.append(_head_block("", tool_lines))
+    candidates.append(_head_block("", tool_lines[:1]))
+
+    for block in candidates:
+        if block and estimate_tokens(block) <= max_tokens:
+            # Candidates are ordered most-informative first, so the first that
+            # fits wins; there is nothing to optimise beyond that.
+            return block
+
+    # Nothing fit whole. This is the only path that cuts inside a line, and it
+    # exists so ``max_tokens`` holds even at a budget too small for one tool
+    # line. ``estimate_tokens`` charges CJK one token per character, so a
+    # character room of ``max_tokens`` minus the heading is never more than the
+    # estimate will ask for.
+    smallest = next((block for block in reversed(candidates) if block), "")
+    if not smallest:
+        return ""
+    room = max_tokens - estimate_tokens(_RECALL_TITLE) - 2
+    if room < 1:
+        return ""
+    keep = [
+        line for line in smallest.splitlines()
+        if not line.startswith(_COMPACT_LABEL_MARKER)
+    ]
+    clipped = _clip("\n".join(keep), room)
+    if not clipped:
+        return ""
+    return f"{_COMPACT_LABEL_MARKER}{_RECALL_TITLE}\n{clipped}"
+
+
+def _guide_ladder(
+    guide_lines: Sequence[str],
+    tool_lines: Sequence[str],
+    has_examples: bool,
+) -> List[List[str]]:
+    """Return the guide's progressively shorter forms, longest first.
+
+    Used to pair a whole overview with each form in turn, so the caller's
+    most-informative-first scan naturally trades guide detail for keeping the
+    overview instead of the other way round.
+    """
+    forms: List[List[str]] = []
+    if has_examples:
+        forms.append(list(guide_lines))
+    for count in (len(tool_lines), 3, 2, 1):
+        form = list(tool_lines[:count])
+        if form and form not in forms:
+            forms.append(form)
+    return forms
+
+
+def _head_block(overview_text: str, guide_lines: Sequence[str]) -> str:
+    """Join an optional overview section and an optional guide section."""
+    parts: List[str] = []
+    if overview_text:
+        parts.append(f"{_COMPACT_LABEL_MARKER}{_OVERVIEW_TITLE}\n{overview_text}")
+    if guide_lines:
+        parts.append(
+            f"{_COMPACT_LABEL_MARKER}{_RECALL_TITLE}\n" + "\n".join(guide_lines)
+        )
+    return "\n".join(parts)
+
+
+def _clip_overview(overview: str) -> str:
+    """Normalise a cached overview and bound it to :data:`_MAX_OVERVIEW_CHARS`.
+
+    Bounded rather than trusted: the text is model-written prose, so its length
+    is not something this renderer controls, and an unbounded head would consume
+    the entire budget before the detail section was ever considered. The window
+    is applied per line with a marker so a clipped overview says so instead of
+    just stopping.
+    """
+    text = overview.strip()
+    if not text:
+        return ""
+    if len(text) <= _MAX_OVERVIEW_CHARS:
+        return text
+    kept: List[str] = []
+    spent = 0
+    for line in text.splitlines():
+        if spent + len(line) > _MAX_OVERVIEW_CHARS - 12:
+            kept.append("…（总览已裁剪）")
+            break
+        kept.append(line)
+        spent += len(line) + 1
+    return "\n".join(kept)
+
+
+def _fallback_overview(
+    conn: sqlite3.Connection,
+    user_id: str,
+    scope_context: Optional[Mapping],
+    config: MemConfig,
+    max_tokens: Optional[int] = None,
+) -> str:
+    """Render the deterministic overview used when no cached text exists.
+
+    This is what a deployment that never runs the out-of-band job sees, and what
+    a brand-new store sees before its first refresh. It is the skeleton rendered
+    directly (see `overview.render_skeleton_overview`): terser than prose, but
+    true, derived from the same grouping, and requiring no model call — which is
+    the only kind of fallback a prompt-freeze path can afford.
+
+    ``max_tokens`` is forwarded so the render is *built* to fit. Clipping
+    afterwards was measurably worse: the fallback is dense Chinese, and a version
+    rendered to a character cap then shrunk to a token budget lost its structure
+    and came out as one severed line.
+
+    A failure here returns ``""`` rather than raising: this runs while a session
+    is being assembled, and a store whose aggregation is broken must still yield
+    a usable prompt.
+    """
+    from .overview import build_overview_skeleton, render_skeleton_overview
+
+    try:
+        skeleton = build_overview_skeleton(
+            conn, user_id, scope_context=scope_context, config=config
+        )
+        return render_skeleton_overview(
+            skeleton, max_chars=_MAX_OVERVIEW_CHARS, max_tokens=max_tokens
+        )
+    except Exception:  # pragma: no cover - defensive: freeze must not fail
+        import logging
+
+        logging.getLogger(__name__).exception(
+            "Failed to build fallback overview for %s", user_id
+        )
+        return ""
+
+
+def _render_guide(
+    conn: sqlite3.Connection,
+    user_id: str,
+    scope_context: Optional[Mapping],
+    config: MemConfig,
+) -> str:
+    """Render the lookup guide: which calls reach the detail, and with what.
+
+    The example queries are generated from this store's own labels (the work
+    units' names and the topic vocabulary) rather than being generic, because a
+    model that has just read an overview naming ``dsh-atom-memory`` can use
+    ``memory_recall「dsh-atom-memory 决定」`` immediately, whereas
+    ``memory_recall「<关键词>」`` leaves it to guess. The examples are omitted
+    entirely when the store yields no labels — a template with an empty slot is
+    worse than no example.
+    """
+    from .overview import build_overview_skeleton
+
+    lines = list(_RECALL_GUIDE_LINES)
+    examples: List[str] = []
+    try:
+        skeleton = build_overview_skeleton(
+            conn, user_id, scope_context=scope_context, config=config,
+            max_units=3, highlights_per_unit=0,
+        )
+        labels = [
+            str(unit.get("label") or "")
+            for unit in skeleton.get("units") or []
+            if unit.get("label") and unit.get("type") != "global"
+        ]
+        for label in labels[:2]:
+            examples.append(f"memory_recall「{label} 决定」")
+            examples.append(f"memory_recall「{label} 待办」")
+        for topic in (skeleton.get("topics") or [])[:1]:
+            if topic.get("label"):
+                examples.append(f"memory_recall「{topic['label']} 教训」")
+    except Exception:  # pragma: no cover - defensive
+        examples = []
+
+    if examples:
+        lines.append(
+            "- 例：" + "、".join(examples[:_GUIDE_EXAMPLE_LIMIT])
+        )
+    text = "\n".join(lines)
+    return _clip_text_block(text, _MAX_GUIDE_CHARS)
+
+
+def _clip_text_block(text: str, limit: int) -> str:
+    """Bound a multi-line block to ``limit`` characters, dropping whole lines.
+
+    Line-wise rather than character-wise: the guide is a list, and half a line of
+    tool guidance is worse than one line fewer.
+    """
+    if len(text) <= limit:
+        return text
+    kept: List[str] = []
+    spent = 0
+    for line in text.splitlines():
+        if spent + len(line) > limit:
+            break
+        kept.append(line)
+        spent += len(line) + 1
+    return "\n".join(kept)
+
+
+def _render_detail_section(
+    conn: sqlite3.Connection,
+    user_id: str,
+    buckets: dict,
+    max_tokens: int,
+    scope_context: Optional[Mapping],
+    config: MemConfig,
+) -> str:
+    """Render the demoted reference-detail section under a leftover budget.
+
+    Reuses the scope-blocked renderer when a context is available and the flat
+    digest otherwise — the same two paths the compact depth always used, so the
+    detail section cannot drift from what it rendered before this change. It is
+    only the *placement* that moved: the section now competes for a leftover
+    budget instead of owning the whole one.
+
+    Returns:
+        The rendered detail, or ``""`` when the budget holds nothing worth
+        showing.
+    """
+    if max_tokens <= 0 or not buckets:
+        return ""
+    if scope_context is not None and config.scope_aware:
+        scoped = _render_scoped(conn, user_id, max_tokens, scope_context, config)
+        if scoped:
             return scoped
     return _render_compact(buckets, max_tokens)
 

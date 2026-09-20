@@ -366,9 +366,10 @@ the curation prompt.
 ## 8. A switch is read when it is used
 
 **Rule.** The live settings (`enabled`, `captureEnabled`, `llmExtractionEnabled`,
-`contextInjectionEnabled`, `injectedSummaryTokens`, `extractionModel`) reach
-their consumers as *getters* and are resolved at the moment of use — per message,
-per prompt assembly, per freeze, per extraction call.
+`contextInjectionEnabled`, `overviewEnabled`, `injectedSummaryTokens`,
+`extractionModel`) reach their consumers as *getters* and are resolved at the
+moment of use — per message, per prompt assembly, per freeze, per extraction
+call, per scheduled refresh.
 
 **Why.** A switch captured at registration time applies at the next restart,
 which in practice means "never" for a session already in progress: the settings
@@ -666,3 +667,95 @@ the place a project-specific nuance remains visible.
 (including its idempotence and a zero-orphan index check),
 `test_promotion_stays_off_with_scope_awareness_disabled`;
 `tests/test_scope.py::test_abstraction_requires_independent_scopes`.
+
+---
+
+## 19. A generated view is written off the hot path, and read on it
+
+**Rule.** The work overview — the "what has been worked on" narrative that leads
+the injected snapshot — is written by a model **out of band**, during a debounced
+idle window after a memory write, and cached in `memory_overview`. The injection
+path **only reads** that cache. When nothing is cached it renders a deterministic
+overview instead of calling a model. A refresh that lands mid-session takes
+effect in the *next* session.
+
+**Why.** Freezing happens on the first assembly of every session. Generating there
+would put a completion in front of every first request, and — worse than the
+latency — would make the frozen prefix depend on *when it happened to be built*,
+so the same session replayed would freeze different text and the prompt-prefix
+stability the whole injection design rests on would become a coincidence. Splitting
+write-time from read-time is what lets one view be model-written and still be
+prompt-safe. The deterministic fallback matters for the same reason: a deployment
+that never runs the background job, or a first session that starts before the job
+has fired, must still get a head rather than a blank one — an empty cache is a
+state, not an error.
+
+**Owner.** `atom_memory/overview.py` (`build_overview_skeleton`,
+`render_skeleton_overview`, `read_overview`, `write_overview`),
+`dsh/src/overview.ts` (`createOverviewRefresher`), `dsh/src/capture.ts`
+(`afterPersist`), `dsh/src/context.ts` (the freeze passes `overview: true`).
+
+**Tests.** `tests/test_overview.py` — `test_a_cached_overview_is_rendered_verbatim`,
+`test_without_a_cache_the_overview_is_derived_not_omitted`;
+`tests/test_rpc.py::test_the_head_degrades_when_nothing_is_cached`;
+`dsh/tests/overview.test.ts` (the debounce never blocks and never spends a call
+the gate declined).
+
+---
+
+## 20. Regeneration is decided by the kind of change, not by its size
+
+**Rule.** Memory changes classify into four levels — `none` < `detail` <
+`structural` < `reset` — and the overview is regenerated only at `structural` or
+above. A `detail` change (an attribute took a new value, a preference was
+repeated, a fact was reused again) leaves the cached overview alone. The
+classification is semantic: it asks *what sort of thing* changed, not how many
+rows moved.
+
+**Why.** The overview is a summary of *work*, and most writes do not change what
+work was done. Counting writes would regenerate constantly for no gain; the
+question worth answering is whether the narrative itself became wrong, and that
+only happens when a new work unit appears or a new kind of claim — decision,
+lesson, procedure, task — is recorded. Keeping the verdict in Python (rather than
+re-deriving it in the host) is deliberate: the changelog lives there, and a second
+implementation would be a second thing to keep in sync. The host asks
+(`overview_status` → `should_refresh`) and obeys.
+
+**Owner.** `atom_memory/overview.py` (`change_level`, `LEVEL_*`,
+`should_refresh`, `_RESET_EVENTS`, `_STRUCTURAL_EVENTS`, `_STRUCTURAL_TYPES`),
+`atom_memory/worker.py` (`_record_written` emits `fact_written` on the success
+path).
+
+**Tests.** `tests/test_overview.py` (level boundaries including the boundary
+millisecond, per-user isolation, and
+`test_a_fingerprint_drift_alone_does_not_refresh`),
+`dsh/tests/overview.test.ts::skips the model call when the changelog gate says no`.
+
+---
+
+## 21. The overview yields last, and `max_tokens` still holds
+
+**Rule.** Inside the compact render the sections are ordered overview, then lookup
+guide, then the type-grouped digest, and under pressure they yield in reverse:
+the digest goes first, then the guide's examples, then the guide's tool lines.
+The overview is the **last** thing to give way. `max_tokens` remains a hard cap on
+the assembled artifact at every budget, including one too small to hold a single
+tool line.
+
+**Why.** The overview is the reason the compact view was restructured at all. A
+render that kept the static hint block and dropped the overview at a mid budget
+would answer "you have memory" while saying nothing about what was done — the
+exact failure the change exists to remove. Making the post-hoc clipping
+budget-aware (each stage measured before it is committed) is what keeps that
+priority from costing correctness: the earlier clip-afterwards implementation
+overshot the hard cap at small budgets, because dense Chinese is several times its
+character length in tokens.
+
+**Owner.** `atom_memory/summary.py` (`_render_with_overview`, `_compose_head`,
+`_guide_ladder`, `_clip_overview`), `atom_memory/overview.py`
+(`render_skeleton_overview` with `max_tokens`).
+
+**Tests.** `tests/test_summary.py` — `test_the_overview_survives_a_budget_that_kills_the_detail`,
+`test_the_guide_gives_up_its_examples_before_the_overview`,
+`test_the_head_is_a_hard_cap_at_every_budget`;
+`tests/test_overview.py::test_the_fallback_render_respects_a_token_cap`.

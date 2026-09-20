@@ -48,6 +48,15 @@ export interface LiveRuntime {
    * the prompt prefix (and the provider's KV cache) stays valid.
    */
   injectedSummaryTokens: number
+  /**
+   * Whether the out-of-band work-overview synthesis runs.
+   *
+   * Separate from {@link contextInjectionEnabled} because it is the only switch
+   * in this plugin that spends model calls *without* the user asking for
+   * anything. Turning it off leaves the injected snapshot intact — it falls back
+   * to the deterministic overview — so it is a cost knob, not a feature kill.
+   */
+  overviewEnabled: boolean
   /** Manual LLM extraction model override; empty provider+model = follow dsh default. */
   extractionModel?: ExtractionModelOverride
 }
@@ -65,6 +74,7 @@ export function createRuntime(seed: LiveRuntimeSeed): LiveRuntime {
     llmExtractionEnabled: seed.llmExtractionEnabled ?? true,
     contextInjectionEnabled: seed.contextInjectionEnabled ?? true,
     injectedSummaryTokens: clampInjectedSummaryTokens(seed.injectedSummaryTokens),
+    overviewEnabled: seed.overviewEnabled ?? true,
     extractionModel: seed.extractionModel,
   }
 }
@@ -94,7 +104,8 @@ export class Runtime {
       this.value.enabled !== next.enabled ||
       this.value.captureEnabled !== next.captureEnabled ||
       this.value.llmExtractionEnabled !== next.llmExtractionEnabled ||
-      this.value.contextInjectionEnabled !== next.contextInjectionEnabled
+      this.value.contextInjectionEnabled !== next.contextInjectionEnabled ||
+      this.value.overviewEnabled !== next.overviewEnabled
     // The injection budget is deliberately *not* part of `changed`: nothing
     // subscribes to re-wire it. It is read at each snapshot freeze (see
     // context.ts), which is exactly the moment a larger/smaller budget should

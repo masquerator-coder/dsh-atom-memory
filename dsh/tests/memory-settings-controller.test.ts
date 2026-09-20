@@ -26,6 +26,7 @@ function snapshot(over: Partial<SettingsScopeSnapshot<MemorySettingsSection>>): 
       llmExtractionEnabled: true,
       contextInjectionEnabled: true,
       injectedSummaryTokens: DEFAULT_INJECTED_SUMMARY_TOKENS,
+      overviewEnabled: true,
       extractionModel: undefined,
       ...(over.value as Partial<MemorySettingsSection> | undefined),
     },
@@ -65,8 +66,9 @@ function fakeRemote() {
     value: { suggestions: [], existing: 0, limit: 50, full: false },
   }))
   const summary = vi.fn(async () => ({ ok: true, value: '# 记忆摘要 (Summary) — global\n决策规则\n- 一条规则' }))
-  const remote: Record<string, unknown> = { listFacts, editFact: vi.fn(async () => ({ ok: true, value: {} })), deleteFact, summary, listProfile, upsertProfile: vi.fn(async () => ({ ok: true, value: {} })), deleteProfile: vi.fn(async () => ({ ok: true, value: {} })), writeProfile, generateProfile, backup, restore }
-  return { remote, backup, restore, listFacts, listProfile, deleteFact, summary, writeProfile, generateProfile }
+  const refreshOverview = vi.fn(async (): Promise<unknown> => ({ ok: true, value: 'refreshed' }))
+  const remote: Record<string, unknown> = { listFacts, editFact: vi.fn(async () => ({ ok: true, value: {} })), deleteFact, summary, listProfile, upsertProfile: vi.fn(async () => ({ ok: true, value: {} })), deleteProfile: vi.fn(async () => ({ ok: true, value: {} })), writeProfile, generateProfile, backup, restore, refreshOverview }
+  return { remote, backup, restore, listFacts, listProfile, deleteFact, summary, writeProfile, generateProfile, refreshOverview }
 }
 
 describe('MemorySettingsController', () => {
@@ -309,5 +311,62 @@ describe('MemorySettingsController', () => {
     expect(upsertProfile).toHaveBeenLastCalledWith({
       user: 'global', section: '背景', key: '职业', value: '工程师',
     })
+  })
+
+  // -- the work-overview controls ---------------------------------------------
+
+  it('routes setOverviewEnabled through the settings scope', async () => {
+    const { scope, set } = fakeScope(snapshot({}))
+    const { remote } = fakeRemote()
+    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, remote)
+    await controller.inject().setOverviewEnabled(false)
+    expect(set).toHaveBeenLastCalledWith('overviewEnabled', false)
+  })
+
+  it('defaults a missing overview switch to on', () => {
+    // Older settings documents predate the field; the panel must not render it
+    // as unchecked and imply the feature is off when it is running.
+    const value = { ...snapshot({}).value } as Partial<MemorySettingsSection>
+    delete value.overviewEnabled
+    const { scope } = fakeScope({ ...snapshot({}), value: value as MemorySettingsSection })
+    const face = new MemorySettingsController(
+      scope as unknown as SettingsScope<MemorySettingsSection>, fakeRemote().remote,
+    ).inject()
+    expect(face.hooks.memorySettings.getSnapshot().section.overviewEnabled).toBe(true)
+  })
+
+  it('forwards a refresh and returns the outcome token', async () => {
+    const { scope } = fakeScope(snapshot({}))
+    const { remote, refreshOverview } = fakeRemote()
+    const face = new MemorySettingsController(
+      scope as unknown as SettingsScope<MemorySettingsSection>, remote,
+    ).inject()
+    await expect(face.refreshOverview()).resolves.toBe('refreshed')
+    expect(refreshOverview).toHaveBeenLastCalledWith({ user: 'global' })
+  })
+
+  it('drops the cached summary after a refresh, so the modal cannot go stale', async () => {
+    // Without this the panel would keep rendering the pre-refresh overview and
+    // read as "the button did nothing".
+    const { scope } = fakeScope(snapshot({}))
+    const { remote } = fakeRemote()
+    const face = new MemorySettingsController(
+      scope as unknown as SettingsScope<MemorySettingsSection>, remote,
+    ).inject()
+    await face.fetchSummary()
+    expect(face.hooks.memorySettings.getSnapshot().data.summary).toBeTruthy()
+
+    await face.refreshOverview()
+    expect(face.hooks.memorySettings.getSnapshot().data.summary).toBeUndefined()
+  })
+
+  it('surfaces a failed refresh as a rejection', async () => {
+    const { scope } = fakeScope(snapshot({}))
+    const { remote, refreshOverview } = fakeRemote()
+    refreshOverview.mockResolvedValueOnce({ ok: false, error: { message: 'bridge down' } })
+    const face = new MemorySettingsController(
+      scope as unknown as SettingsScope<MemorySettingsSection>, remote,
+    ).inject()
+    await expect(face.refreshOverview()).rejects.toThrow(/bridge down/)
   })
 })

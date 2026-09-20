@@ -1,4 +1,5 @@
-"""Focused tests for the Worker queue lifecycle: orphaned `running` reclaim."""
+"""Focused tests for the Worker queue lifecycle: orphaned `running` reclaim,
+plus the changelog event a successful write must emit."""
 
 from __future__ import annotations
 
@@ -9,6 +10,12 @@ import uuid
 
 import pytest
 
+from atom_memory.config import MemConfig
+from atom_memory.models import (
+    TYPE_DECISION_RULE,
+    TYPE_SEMANTIC,
+    FactCandidate,
+)
 from atom_memory.worker import TASK_PENDING, TASK_RUNNING, Worker
 from atom_memory.db import connect_for_tests
 
@@ -134,3 +141,80 @@ def test_no_running_rows_is_a_noop():
             conn.close()
 
     asyncio.run(scenario())
+
+
+# ---- the changelog event -----------------------------------------------------
+
+
+def _write_one(conn, memory_type: str, predicate: str = "决定") -> list:
+    """Persist one candidate through the real write gate; return its events.
+
+    The embed stub returns a correctly-shaped vector: the write path indexes the
+    fact into ``facts_vec``, whose ``vec0`` column is a 512-dim float32 blob, and
+    a short stub makes the insert fail rather than the assertion under test.
+    """
+    worker = Worker(
+        conn=conn,
+        embed_func=lambda _text: b"\x00" * (512 * 4),
+        poll_interval_sec=0.01,
+        config=MemConfig(),
+    )
+    candidate = FactCandidate(
+        candidate_id=str(uuid.uuid4()),
+        user_id="u1",
+        session_id="s1",
+        subject="项目",
+        predicate=predicate,
+        object="先回滚再排查",
+        type=memory_type,
+    )
+    outcome = asyncio.run(worker._apply_candidates([candidate], "u1", "s1"))
+    assert outcome["written"], "fixture assumption: the write must land"
+    return conn.execute(
+        "SELECT type, payload FROM events WHERE user_id = 'u1' ORDER BY created_at"
+    ).fetchall()
+
+
+def test_a_successful_write_is_recorded_in_the_changelog():
+    """The hole this closed: a *written* fact used to leave no event at all.
+
+    Refusals and reorganisations were logged while the ordinary path was silent,
+    so a store that only ever grew looked unchanged — and the work overview's
+    refresh trigger reads exactly this log.
+    """
+    conn = connect_for_tests()
+    try:
+        rows = _write_one(conn, TYPE_DECISION_RULE)
+        written = [r for r in rows if r["type"] == "fact_written"]
+        assert len(written) == 1, [r["type"] for r in rows]
+    finally:
+        conn.close()
+
+
+def test_the_written_event_records_the_type_and_scope():
+    """The refresh gate classifies on ``type``; the scope places the change."""
+    conn = connect_for_tests()
+    try:
+        rows = _write_one(conn, TYPE_DECISION_RULE)
+        payload = json.loads(
+            next(r for r in rows if r["type"] == "fact_written")["payload"]
+        )
+        assert payload["type"] == TYPE_DECISION_RULE
+        assert payload["subject"] == "项目"
+        assert "scope_id" in payload
+        assert payload["fact_id"]
+    finally:
+        conn.close()
+
+
+def test_a_detail_write_is_recorded_as_its_own_type():
+    """An attribute must arrive as ``semantic`` so it classifies as a detail."""
+    conn = connect_for_tests()
+    try:
+        rows = _write_one(conn, TYPE_SEMANTIC, predicate="属性")
+        payload = json.loads(
+            next(r for r in rows if r["type"] == "fact_written")["payload"]
+        )
+        assert payload["type"] == TYPE_SEMANTIC
+    finally:
+        conn.close()

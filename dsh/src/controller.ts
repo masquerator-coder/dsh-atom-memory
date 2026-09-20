@@ -17,6 +17,7 @@ import type { PythonBridge } from './bridge.ts'
 import { clampInjectedSummaryTokens } from './injection-budget.ts'
 import type { LiveRuntime, Runtime } from './runtime.ts'
 import type { LlmCompleter } from './llm-extractor.ts'
+import type { ChangeRow } from './tools.ts'
 import {
   synthesizeProfileSuggestions,
   type ProfileCandidate,
@@ -93,6 +94,12 @@ export class AtomMemoryController extends TypertRemoteService {
      * that would read as "your memory has nothing worth keeping".
      */
     private readonly complete: LlmCompleter | undefined = undefined,
+    /**
+     * Run one overview refresh on demand (the panel's "regenerate" button).
+     * Absent when overview maintenance is off, in which case the panel is told
+     * so instead of appearing to work.
+     */
+    private readonly refreshOverviewFn: (() => Promise<string>) | undefined = undefined,
   ) {
     super(ctx, 'atomMemoryController', { namespace: 'atomMemory' })
   }
@@ -189,10 +196,63 @@ export class AtomMemoryController extends TypertRemoteService {
       // frozen copy — `memory_snapshot` is the tool-side view of that.
       max_tokens: args.maxTokens ?? clampInjectedSummaryTokens(this.runtime.get().injectedSummaryTokens),
       detail: false,
+      // The head is part of what the model sees, so the modal has to render it
+      // too — otherwise the panel would show a text no session ever received.
+      overview: true,
     })
     // `AtomMem.summary` returns the markdown string directly; tolerate a
     // wrapped shape in case the Python side ever changes the contract.
     return typeof result === 'string' ? result : (result?.text ?? '')
+  }
+
+  /**
+   * The memory changelog: what the store did lately, newest first.
+   *
+   * The panel's answer to "did anything change?", and the same source the
+   * overview refresher gates on — so a user seeing "no changes" here and no
+   * overview refresh is seeing one consistent fact, not two implementations
+   * agreeing by luck.
+   */
+  @Remote
+  async changes(args: { user: string; sinceMs?: number; limit?: number }): Promise<{
+    changes: ChangeRow[]
+    level?: string
+  }> {
+    this.assertReady()
+    return this.bridge.call('changes', {
+      user_id: args.user,
+      ...(args.sinceMs === undefined ? {} : { since_ms: args.sinceMs }),
+      ...(args.limit === undefined ? {} : { limit: args.limit }),
+    })
+  }
+
+  /**
+   * The overview cache's state, including whether a refresh is warranted.
+   *
+   * Read-only on purpose: the panel must be able to answer "why is the overview
+   * stale / why did nothing regenerate" without triggering the very generation
+   * it is asking about.
+   */
+  @Remote
+  async overviewStatus(args: { user: string }): Promise<Record<string, unknown>> {
+    this.assertReady()
+    return this.bridge.call('overview_status', { user_id: args.user })
+  }
+
+  /**
+   * Regenerate the overview now.
+   *
+   * User-triggered, so it bypasses the debounce and the minimum gap but still
+   * consults the changelog gate — an explicit refresh of an unchanged store is
+   * still a wasted completion, and the panel reports the outcome either way.
+   */
+  @Remote
+  async refreshOverview(args: { user: string }): Promise<string> {
+    this.assertReady()
+    if (this.refreshOverviewFn === undefined) {
+      return '（本部署未启用总览后台生成）'
+    }
+    return this.refreshOverviewFn()
   }
 
   /**

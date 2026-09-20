@@ -256,3 +256,165 @@ def test_lifecycle_and_write_receipts_over_the_wire(proc, tmp_path):
     _send(proc, 20, "stats", {"user_id": "u1"})
     stats = _recv(proc)["result"]
     assert stats["facts"] == 0 and "archived" in stats and isinstance(stats["recent"], list)
+
+
+# ---- the work-overview surface -----------------------------------------------
+#
+# The out-of-band job's whole vocabulary: ask whether a refresh is warranted,
+# fetch the deterministic material to write from, store the prose, and read the
+# changelog. These drive it over the real wire because the dsh half depends on
+# the exact shapes.
+
+
+def _start(proc, tmp_path, name="ov.db"):
+    _send(proc, 1, "start", {
+        "db_path": str(tmp_path / name),
+        "worker_poll_interval_sec": 0.05,
+        "max_retries": 1,
+    })
+    assert _recv(proc)["ok"] is True
+
+
+def _seed_one_rule(proc, rid=2, next_rid=3):
+    """Write one decision rule through the real pipeline; returns the next rid.
+
+    Uses ``persist_candidates`` rather than ``add``: the latter runs the Python
+    rule engine, whose patterns are narrow, so a fixture phrased like a real
+    fact ("决定：…") is reported ``skipped`` rather than stored. The dsh plugin
+    takes this path in production — it extracts with the LLM and ships typed
+    candidates — so this is also the more faithful stand-in.
+    """
+    _send(proc, rid, "persist_candidates", {
+        "user_id": "u1", "session_id": "s1", "turn_id": 0, "wait_ms": 8000,
+        "candidates": [{
+            "subject": "dsh-atom-memory", "predicate": "决定",
+            "object": "摘要先给工作总览", "type": "decision_rule",
+            "importance": 0.9, "confidence": 0.9,
+        }],
+    })
+    resp = _recv(proc)
+    assert resp["ok"] is True, resp
+    assert resp["result"]["status"] == "applied", resp["result"]
+    return next_rid
+
+
+def test_overview_status_on_an_empty_store(proc, tmp_path):
+    p = proc
+    _start(p, tmp_path)
+    _send(p, 2, "overview_status", {"user_id": "u1"})
+    status = _recv(p)["result"]
+    assert status["cached"] is False
+    assert status["stale"] is True
+    # Nothing to narrate, so no refresh is warranted however stale it looks.
+    assert status["should_refresh"] is False
+    assert status["refresh_reason"] == "no_facts"
+
+
+def test_overview_skeleton_is_returned_over_the_wire(proc, tmp_path):
+    p = proc
+    _start(p, tmp_path)
+    next_rid = _seed_one_rule(p)
+
+    _send(p, next_rid, "overview_skeleton", {"user_id": "u1"})
+    resp = _recv(p)
+    assert resp["ok"] is True, resp
+    skeleton = resp["result"]
+    assert skeleton["totals"]["facts"] == 1
+    assert len(skeleton["units"]) == 1
+    assert skeleton["fingerprint"]
+    # It has to survive JSON: the aggregation holds per-fact rows while grouping
+    # and must not leak them into the payload.
+    assert "_candidates" not in json.dumps(skeleton, ensure_ascii=False)
+
+
+def test_overview_put_then_read_back_through_summary(proc, tmp_path):
+    p = proc
+    _start(p, tmp_path)
+    next_rid = _seed_one_rule(p)
+
+    _send(p, next_rid, "overview_status", {"user_id": "u1"})
+    status = _recv(p)["result"]
+    assert status["should_refresh"] is True
+    assert status["refresh_reason"] == "not_cached"
+
+    prose = "- 完成了记忆摘要改造：摘要先给工作总览，再给查询指路。"
+    _send(p, next_rid + 1, "overview_put", {
+        "user_id": "u1", "text": prose, "facts_count": 1,
+    })
+    assert _recv(p)["result"]["stored"] is True
+
+    # The freeze path asks for the head and gets the stored prose verbatim.
+    _send(p, next_rid + 2, "summary", {
+        "user_id": "u1", "max_tokens": 600, "detail": False,
+        "overview": True, "include_meta": True,
+    })
+    meta = _recv(p)["result"]
+    assert meta["overview"]["cached"] is True
+    assert prose in meta["text"]
+    assert "以前做过的工作" in meta["text"]
+    assert "要了解细节" in meta["text"]
+
+
+def test_overview_put_refuses_empty_text(proc, tmp_path):
+    """An empty generation must not overwrite a good overview."""
+    p = proc
+    _start(p, tmp_path)
+    next_rid = _seed_one_rule(p)
+    _send(p, next_rid, "overview_put", {"user_id": "u1", "text": "   "})
+    resp = _recv(p)
+    assert resp["ok"] is False and "non-empty" in resp["error"]
+
+
+def test_summary_without_the_overview_flag_is_unchanged(proc, tmp_path):
+    """Compatibility: an older dsh keeps its exact previous output."""
+    p = proc
+    _start(p, tmp_path)
+    next_rid = _seed_one_rule(p)
+    _send(p, next_rid, "overview_put", {"user_id": "u1", "text": "总览正文"})
+
+    _send(p, next_rid + 1, "summary", {
+        "user_id": "u1", "max_tokens": 600, "detail": False,
+    })
+    text = _recv(p)["result"]
+    assert "以前做过的工作" not in text
+    assert "要了解细节" not in text
+
+
+def test_the_head_degrades_when_nothing_is_cached(proc, tmp_path):
+    """No cache is not an error: the deterministic head is rendered instead."""
+    p = proc
+    _start(p, tmp_path)
+    next_rid = _seed_one_rule(p)
+    _send(p, next_rid, "summary", {
+        "user_id": "u1", "max_tokens": 400, "detail": False,
+        "overview": True, "include_meta": True,
+    })
+    meta = _recv(p)["result"]
+    assert meta["overview"]["cached"] is False
+    assert "以前做过的工作" in meta["text"]
+    assert "要了解细节" in meta["text"]
+
+
+def test_changes_lists_what_the_store_did(proc, tmp_path):
+    p = proc
+    _start(p, tmp_path)
+    next_rid = _seed_one_rule(p)
+
+    _send(p, next_rid, "changes", {"user_id": "u1"})
+    result = _recv(p)["result"]
+    assert isinstance(result["changes"], list)
+    written = [c for c in result["changes"] if c["type"] == "fact_written"]
+    assert len(written) == 1
+    assert written[0]["detail"]["type"] == "decision_rule"
+    assert result["level"] == "structural"
+
+
+def test_overview_methods_require_start(proc, tmp_path):
+    """Every new method fails cleanly before the store is started."""
+    p = proc
+    for rid, method in enumerate(
+        ("overview_status", "overview_skeleton", "changes"), start=1
+    ):
+        _send(p, rid, method, {"user_id": "u1"})
+        resp = _recv(p)
+        assert resp["ok"] is False and "start" in resp["error"], method

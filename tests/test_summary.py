@@ -16,6 +16,9 @@ import pytest
 
 from atom_memory.db import connect_for_tests
 from atom_memory.models import NEUTRAL_SCORE
+from atom_memory.config import MemConfig
+from atom_memory.overview import write_overview, read_overview
+from atom_memory.scope import ScopeStore
 from atom_memory.summary import (
     _COMPACT_LABEL_MARKER,
     _DETAIL_CONTENT_CHARS,
@@ -953,3 +956,241 @@ def test_selecting_a_large_render_is_not_quadratic():
     # The measured O(n²) implementation took ~2 s at 1500 lines and ~8 s at
     # 3000; this bound is far above the fast path and far below the old one.
     assert elapsed < 1.0, f"selection took {elapsed:.2f}s"
+
+
+# ---- the work-overview head --------------------------------------------------
+#
+# The compact depth used to be nothing but a type-grouped fact list, which
+# answered the wrong question: a model could read every attribute it held and
+# still not know what had been worked on. These tests pin the replacement — an
+# overview section, a lookup guide, and the old digest demoted to a reference
+# section that only renders while the budget allows.
+
+
+def _overview_md(conn, max_tokens=600, overview=None, scope_context=None):
+    """Render the compact depth with the overview head enabled."""
+    return generate_summary(
+        conn, "u1", max_tokens, False,
+        scope_context=scope_context, overview=overview, use_overview=True,
+    )
+
+
+def test_the_head_leads_with_the_work_overview_then_the_guide():
+    """Order is the contract: what was done, then how to look it up."""
+    conn = connect_for_tests()
+    try:
+        _insert_fact(conn, "f1", "决定", "先回滚再排查", memory_type="decision_rule")
+        md = _overview_md(conn)
+
+        assert _COMPACT_LABEL_MARKER + "以前做过的工作" in md
+        assert _COMPACT_LABEL_MARKER + "要了解细节" in md
+        assert md.index("以前做过的工作") < md.index("要了解细节")
+    finally:
+        conn.close()
+
+
+def test_a_cached_overview_is_rendered_verbatim():
+    """The cached text is model-written prose; the renderer does not touch it."""
+    conn = connect_for_tests()
+    try:
+        _insert_fact(conn, "f1", "决定", "先回滚再排查", memory_type="decision_rule")
+        prose = "- 完成了记忆基数分层修复，并沉淀了沙箱测试的教训。"
+        md = _overview_md(conn, overview=prose)
+        assert prose in md
+    finally:
+        conn.close()
+
+
+def test_without_a_cache_the_overview_is_derived_not_omitted():
+    """An empty cache degrades to the deterministic render, never to nothing.
+
+    This is the state of every deployment that has not run the out-of-band job
+    yet, so an overview that only appeared once the model had run would leave
+    exactly those users with the old fact-list experience.
+    """
+    conn = connect_for_tests()
+    try:
+        _insert_fact(conn, "f1", "决定", "先回滚再排查", memory_type="decision_rule")
+        md = _overview_md(conn, max_tokens=400)
+        head = md.split(_COMPACT_LABEL_MARKER + "要了解细节")[0]
+        assert "决定" in head or "条" in head, head
+    finally:
+        conn.close()
+
+
+def test_the_guide_names_the_tools_that_reach_the_detail():
+    """The failure this section fixes: knowing memory exists, not how to reach it."""
+    conn = connect_for_tests()
+    try:
+        _insert_fact(conn, "f1", "职业", "工程师")
+        md = _overview_md(conn)
+        for tool in ("memory_recall", "memory_summary_detail", "memory_get"):
+            assert tool in md, tool
+    finally:
+        conn.close()
+
+
+def test_the_guide_examples_come_from_this_store():
+    """A concrete query the model can copy beats a template with a blank in it."""
+    conn = connect_for_tests()
+    try:
+        store = ScopeStore(conn, MemConfig())
+        scope_id = store.create("project", "dsh-atom-memory", parent_id=1, confidence=1.0)
+        _insert_fact(conn, "f1", "决定", "x", memory_type="decision_rule")
+        conn.execute(
+            "INSERT INTO fact_scope(fact_id, scope_id, priority) VALUES ('f1', ?, 0)",
+            (scope_id,),
+        )
+        conn.commit()
+        md = _overview_md(conn)
+        assert "dsh-atom-memory" in md
+        assert "memory_recall「dsh-atom-memory" in md
+    finally:
+        conn.close()
+
+
+def test_the_guide_omits_examples_when_the_store_has_no_labels():
+    """A dangling '记忆检索「」' is worse than no example at all."""
+    conn = connect_for_tests()
+    try:
+        # Global-only facts: no project label exists to build an example from.
+        _insert_fact(conn, "f1", "决定", "x", memory_type="decision_rule")
+        md = _overview_md(conn)
+        assert "「」" not in md
+        assert "memory_recall「" not in md
+    finally:
+        conn.close()
+
+
+def test_the_reference_digest_is_demoted_below_the_head():
+    conn = connect_for_tests()
+    try:
+        _insert_fact(conn, "f1", "职业", "工程师")
+        md = _overview_md(conn, max_tokens=600)
+        assert md.index("以前做过的工作") < md.index("属性")
+    finally:
+        conn.close()
+
+
+def test_the_overview_survives_a_budget_that_kills_the_detail():
+    """The detail digest is what gives way, not the overview.
+
+    The earlier implementation had this backwards and emitted the static guide
+    with no overview at all at a mid budget — the one outcome the change exists
+    to prevent.
+    """
+    conn = connect_for_tests()
+    try:
+        for index in range(30):
+            _insert_fact(conn, f"f{index}", f"属性{index}", "值" * 10, created_at=1000 + index)
+        md = _overview_md(conn, max_tokens=120)
+        assert "以前做过的工作" in md
+    finally:
+        conn.close()
+
+
+def test_the_guide_gives_up_its_examples_before_the_overview():
+    """Examples are a convenience; the overview is the payload."""
+    conn = connect_for_tests()
+    try:
+        store = ScopeStore(conn, MemConfig())
+        scope_id = store.create("project", "demo", parent_id=1, confidence=1.0)
+        for index in range(20):
+            _insert_fact(conn, f"f{index}", f"属性{index}", "值" * 8, created_at=1000 + index)
+            conn.execute(
+                "INSERT INTO fact_scope(fact_id, scope_id, priority) VALUES (?, ?, 0)",
+                (f"f{index}", scope_id),
+            )
+        conn.commit()
+
+        roomy = _overview_md(conn, max_tokens=400)
+        tight = _overview_md(conn, max_tokens=90)
+        assert "- 例：" in roomy
+        assert "- 例：" not in tight
+        assert "以前做过的工作" in tight
+    finally:
+        conn.close()
+
+
+def test_the_head_is_a_hard_cap_at_every_budget():
+    """``max_tokens`` bounds the assembled artifact, head included."""
+    conn = connect_for_tests()
+    try:
+        store = ScopeStore(conn, MemConfig())
+        scope_id = store.create("project", "demo", parent_id=1, confidence=1.0)
+        for index in range(25):
+            _insert_fact(conn, f"f{index}", f"属性{index}", "值" * 8, created_at=1000 + index)
+            conn.execute(
+                "INSERT INTO fact_scope(fact_id, scope_id, priority) VALUES (?, ?, 0)",
+                (f"f{index}", scope_id),
+            )
+        conn.commit()
+        for budget in (10, 15, 25, 40, 60, 90, 130, 200, 400, 800):
+            md = _overview_md(conn, max_tokens=budget)
+            assert estimate_tokens(md) <= budget, (budget, estimate_tokens(md))
+    finally:
+        conn.close()
+
+
+def test_the_cache_keeps_rendering_after_a_detail_only_change():
+    """A detail change does not regenerate the overview, so it keeps serving.
+
+    The end-to-end consequence of the refresh gate: ``read_overview`` given the
+    *stored* fingerprint still returns the text, which is what the freeze path
+    passes when it has decided not to wait for a new one.
+    """
+    conn = connect_for_tests()
+    try:
+        _insert_fact(conn, "f1", "决定", "先回滚再排查", memory_type="decision_rule")
+        prose = "- 做过记忆基数分层修复。"
+        stored = "fixed-fingerprint"
+        write_overview(conn, "u1", prose, stored, 1)
+
+        # The freeze path uses the cached text it holds rather than recomputing.
+        assert read_overview(conn, "u1", stored) == prose
+        md = _overview_md(conn, overview=read_overview(conn, "u1", stored))
+        assert prose in md
+    finally:
+        conn.close()
+
+
+def test_the_overview_head_is_off_by_default():
+    """An existing caller's output is unchanged unless it opts in."""
+    conn = connect_for_tests()
+    try:
+        _insert_fact(conn, "f1", "职业", "工程师")
+        md = generate_summary(conn, "u1", 600, False)
+        assert "以前做过的工作" not in md
+        assert "要了解细节" not in md
+    finally:
+        conn.close()
+
+
+def test_an_empty_store_is_still_the_notice():
+    """No facts means no head either: the notice is the whole artifact."""
+    conn = connect_for_tests()
+    try:
+        md = _overview_md(conn)
+        assert "暂无" in md
+        assert "以前做过的工作" not in md
+    finally:
+        conn.close()
+
+
+def test_the_overview_head_never_injects_a_fact_id():
+    """The head shares the compact depth's rule: no UUIDs in the prompt."""
+    conn = connect_for_tests()
+    try:
+        store = ScopeStore(conn, MemConfig())
+        scope_id = store.create("project", "demo", parent_id=1, confidence=1.0)
+        _insert_fact(conn, "aaaa1111-2222-3333-4444-555566667777", "决定", "x")
+        conn.execute(
+            "INSERT INTO fact_scope(fact_id, scope_id, priority) VALUES "
+            "('aaaa1111-2222-3333-4444-555566667777', ?, 0)",
+            (scope_id,),
+        )
+        conn.commit()
+        md = _overview_md(conn, max_tokens=800)
+        assert not UUID_RE.search(md)
+    finally:
+        conn.close()

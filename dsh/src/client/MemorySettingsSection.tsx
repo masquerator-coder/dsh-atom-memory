@@ -82,6 +82,42 @@ const PRESET_LABEL_KEYS: Record<(typeof INJECTED_SUMMARY_TOKEN_PRESETS)[number],
 /** DOM id of the injection-budget slider (its `<label>` points at it). */
 const BUDGET_SLIDER_ID = 'atom-memory-inject-budget'
 
+/**
+ * Render a refresh outcome token as words.
+ *
+ * The Host returns a token rather than a sentence because the vocabulary belongs
+ * there (the same tokens are what the model sees from `memory_overview
+ * action=refresh`); this maps them for a human reading the panel.
+ *
+ * @param t - The section's translate function.
+ * @param outcome - The token, or `error:<message>` from a failed call.
+ * @returns A sentence for the panel.
+ */
+function renderOutcomeText(
+  t: (key: MemorySettingsLocaleKey, params?: Record<string, unknown>) => string,
+  outcome: string,
+): string {
+  if (outcome.startsWith('error:')) return outcome.slice('error:'.length)
+  const known: Record<string, MemorySettingsLocaleKey> = {
+    refreshed: 'overviewOutcomeRefreshed',
+    throttled: 'overviewOutcomeThrottled',
+    'no-model': 'overviewOutcomeNoModel',
+    'nothing-to-narrate': 'overviewOutcomeNothing',
+    'empty-generation': 'overviewOutcomeEmpty',
+    skipped: 'overviewOutcomeSkipped',
+    error: 'overviewOutcomeError',
+  }
+  const key = known[outcome]
+  if (key !== undefined) return t(key)
+  if (outcome.startsWith('no-change:')) {
+    const reason = outcome.slice('no-change:'.length)
+    return reason === 'up_to_date'
+      ? t('overviewOutcomeNoChange')
+      : t('overviewOutcomeNoChangeReason', { reason })
+  }
+  return outcome
+}
+
 /** Declare the section's locale dictionary namespace (type-only merge). */
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -194,6 +230,11 @@ export function MemorySettingsSection(props: MemorySettingsSectionProps) {
   // Back-up/restore transient feedback.
   const [status, setStatus] = useState<string>()
   const [phase, setPhase] = useState<'idle' | 'busy'>('idle')
+
+  // Work-overview regeneration feedback: 'idle' while nothing is running, then
+  // the refresher's outcome token. Held as its own state (not folded into
+  // `status`) so a regeneration result cannot be confused with a backup result.
+  const [overviewRefresh, setOverviewRefresh] = useState<'idle' | 'busy' | string>('idle')
 
   // Which modal is open: 'summary' | 'facts' | 'profile' | undefined.
   const [modal, setModal] = useState<'summary' | 'facts' | 'profile'>()
@@ -322,6 +363,49 @@ export function MemorySettingsSection(props: MemorySettingsSectionProps) {
           </p>
         </div>
         <p className={css.hint}>{t('injectHint', { tokens: String(tokens) })}</p>
+      </fieldset>
+
+      {/* 2b) out-of-band work overview — the only self-initiated model spend */}
+      <fieldset className={css.block} disabled={!state.available}>
+        <legend>{t('overviewHeader')}</legend>
+        <label className={css.switchRow}>
+          <span className={css.switch}>
+            <input
+              type="checkbox"
+              className={css.switchInput}
+              checked={state.section.overviewEnabled}
+              onChange={(e) => { void props.setOverviewEnabled(e.currentTarget.checked) }}
+            />
+            <span className={css.switchTrack} aria-hidden="true">
+              <span className={css.switchThumb} />
+            </span>
+          </span>
+          <span>{t('overviewDesc')}</span>
+        </label>
+        <div className={css.actions}>
+          <button
+            type="button"
+            className={css.btn}
+            disabled={!state.available || overviewRefresh === 'busy'}
+            onClick={() => {
+              setOverviewRefresh('busy')
+              void props.refreshOverview()
+                // The token is translated by `renderRefreshOutcome` on the Host
+                // side, so the panel shows the sentence the tool would show.
+                .then((outcome) => setOverviewRefresh(outcome))
+                .catch((err) => setOverviewRefresh(`error:${(err as Error)?.message ?? String(err)}`))
+            }}
+          >
+            {overviewRefresh === 'busy' ? t('overviewRefreshing') : t('overviewRefresh')}
+          </button>
+          {overviewRefresh !== 'idle' && overviewRefresh !== 'busy'
+            ? (
+                <span className={css.hint}>
+                  {t('overviewRefreshDone', { outcome: renderOutcomeText(t, overviewRefresh) })}
+                </span>
+              )
+            : null}
+        </div>
       </fieldset>
 
       {/* 3) extraction model */}
