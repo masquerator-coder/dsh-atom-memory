@@ -101,7 +101,6 @@ window.__ModuleLoader__.load({
 				available: false,
 				loading: true,
 				section: {
-					enabled: true,
 					captureEnabled: true,
 					llmExtractionEnabled: true,
 					contextInjectionEnabled: true,
@@ -125,7 +124,6 @@ window.__ModuleLoader__.load({
 			inject() {
 				return {
 					hooks: { memorySettings: this.store },
-					setEnabled: (enabled) => this.scope.set("enabled", enabled),
 					setInjectedSummaryTokens: (tokens) => this.scope.set("injectedSummaryTokens", clampInjectedSummaryTokens(tokens)),
 					setOverviewEnabled: (enabled) => this.scope.set("overviewEnabled", enabled),
 					refreshOverview: async () => {
@@ -201,7 +199,7 @@ window.__ModuleLoader__.load({
 			}
 			async saveFact(fact) {
 				try {
-					await this.r().editFact({
+					unwrap(await this.r().editFact({
 						user: USER,
 						fact_id: fact.fact_id,
 						subject: fact.subject,
@@ -209,27 +207,29 @@ window.__ModuleLoader__.load({
 						object: fact.object,
 						content: fact.content,
 						type: fact.type
-					});
+					}));
 					await this.refreshData();
 				} catch (err) {
 					this.store.set({
 						...this.store.getSnapshot(),
 						lastError: err?.message ?? String(err)
 					});
+					throw err;
 				}
 			}
 			async deleteFact(factId) {
 				try {
-					await this.r().deleteFact({
+					unwrap(await this.r().deleteFact({
 						user: USER,
 						fact_id: factId
-					});
+					}));
 					await this.refreshData();
 				} catch (err) {
 					this.store.set({
 						...this.store.getSnapshot(),
 						lastError: err?.message ?? String(err)
 					});
+					throw err;
 				}
 			}
 			async fetchSummary() {
@@ -285,25 +285,43 @@ window.__ModuleLoader__.load({
 			}
 			async saveAllFacts(rows) {
 				try {
-					for (const row of rows) if (row.deleted) await this.r().deleteFact({
-						user: USER,
-						fact_id: row.fact_id
-					});
-					else await this.r().editFact({
-						user: USER,
-						fact_id: row.fact_id,
-						subject: row.subject,
-						predicate: row.predicate,
-						object: row.object,
-						content: row.content,
-						type: row.type
-					});
+					const before = this.store.getSnapshot().data.facts;
+					const originalById = new Map(before.map((f) => [f.fact_id, f]));
+					for (const row of rows) {
+						if (row.deleted) {
+							unwrap(await this.r().deleteFact({
+								user: USER,
+								fact_id: row.fact_id
+							}));
+							continue;
+						}
+						const original = originalById.get(row.fact_id);
+						const patch = {
+							user: USER,
+							fact_id: row.fact_id
+						};
+						if (original === void 0) {
+							patch.subject = row.subject;
+							patch.predicate = row.predicate;
+							patch.object = row.object;
+							patch.content = row.content ?? "";
+						} else {
+							if (row.subject !== original.subject) patch.subject = row.subject;
+							if (row.predicate !== original.predicate) patch.predicate = row.predicate;
+							if (row.object !== original.object) patch.object = row.object;
+							if ((row.content ?? "") !== (original.content ?? "")) patch.content = row.content ?? "";
+						}
+						if (Object.keys(patch).length <= 2) continue;
+						unwrap(await this.r().editFact(patch));
+					}
 					await this.refreshData();
 				} catch (err) {
+					const message = err?.message ?? String(err);
 					this.store.set({
 						...this.store.getSnapshot(),
-						lastError: err?.message ?? String(err)
+						lastError: message
 					});
+					throw err;
 				}
 			}
 			async saveAllProfile(rows) {
@@ -349,7 +367,6 @@ window.__ModuleLoader__.load({
 		/** Fill defaults onto a (possibly partial / identical) section value. */
 		function defaulted(value) {
 			return {
-				enabled: value.enabled ?? true,
 				captureEnabled: value.captureEnabled ?? true,
 				llmExtractionEnabled: value.llmExtractionEnabled ?? true,
 				contextInjectionEnabled: value.contextInjectionEnabled ?? true,
@@ -361,9 +378,7 @@ window.__ModuleLoader__.load({
 		const dicts = {
 			zh: {
 				title: "记忆",
-				intro: "管理 dsh-atom-memory 的记忆能力：开关、抽取模型、用户画像、记忆内容与备份恢复。",
-				masterHeader: "记忆开关",
-				masterDesc: "关闭后停用记忆插件：不再捕获、不再注入上下文，记忆工具也会拒绝调用。打开即时恢复。",
+				intro: "管理 dsh-atom-memory 的记忆能力：抽取模型、用户画像、记忆内容与备份恢复。插件本身的启用与禁用由 dsh 的插件开关负责。",
 				injectHeader: "系统提示词注入体积（记忆摘要）",
 				injectSliderLabel: "挡位",
 				injectPresetCompact: "精简 · {tokens} tokens",
@@ -386,7 +401,7 @@ window.__ModuleLoader__.load({
 				overviewOutcomeNoModel: "未配置可用模型，无法生成。",
 				overviewOutcomeNothing: "记忆库暂无可叙述的内容。",
 				overviewOutcomeEmpty: "模型没有产出内容，缓存保持不变。",
-				overviewOutcomeSkipped: "总览后台生成未启用，或记忆功能已关闭。",
+				overviewOutcomeSkipped: "总览后台生成未启用。",
 				overviewOutcomeError: "生成失败（详见日志），缓存保持不变。",
 				overviewOutcomeNoChange: "仅细节变化，无需重新生成。",
 				overviewOutcomeNoChangeReason: "无需重新生成（{reason}）。",
@@ -468,9 +483,7 @@ window.__ModuleLoader__.load({
 			},
 			en: {
 				title: "Memory",
-				intro: "Manage dsh-atom-memory: master switch, extraction model, user profile, memory content, and backup/restore.",
-				masterHeader: "Memory switch",
-				masterDesc: "When off the memory plugin is disabled: no capture, no context injection, and memory tools refuse calls. Turning on restores immediately.",
+				intro: "Manage dsh-atom-memory: extraction model, user profile, memory content, and backup/restore. Enabling or disabling the plugin itself is dsh's own plugin switch.",
 				injectHeader: "System-prompt injection size (memory summary)",
 				injectSliderLabel: "Gear",
 				injectPresetCompact: "Compact · {tokens} tokens",
@@ -493,7 +506,7 @@ window.__ModuleLoader__.load({
 				overviewOutcomeNoModel: "No usable model is configured, so nothing could be generated.",
 				overviewOutcomeNothing: "There is nothing in the memory store to narrate yet.",
 				overviewOutcomeEmpty: "The model produced no text; the cache is unchanged.",
-				overviewOutcomeSkipped: "Background overview generation is off, or memory is disabled.",
+				overviewOutcomeSkipped: "Background overview generation is off.",
 				overviewOutcomeError: "Generation failed (see the logs); the cache is unchanged.",
 				overviewOutcomeNoChange: "Only detail-level changes — no regeneration needed.",
 				overviewOutcomeNoChangeReason: "No regeneration needed ({reason}).",
@@ -869,28 +882,6 @@ window.__ModuleLoader__.load({
 						className: css.status,
 						children: status
 					}) : null,
-					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("fieldset", {
-						className: css.block,
-						disabled: !state.available,
-						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("legend", { children: t("masterHeader") }), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
-							className: css.switchRow,
-							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
-								className: css.switch,
-								children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
-									type: "checkbox",
-									className: css.switchInput,
-									checked: state.section.enabled,
-									onChange: (e) => {
-										props.setEnabled(e.currentTarget.checked);
-									}
-								}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-									className: css.switchTrack,
-									"aria-hidden": "true",
-									children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { className: css.switchThumb })
-								})]
-							}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: t("masterDesc") })]
-						})]
-					}),
 					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("fieldset", {
 						className: css.block,
 						disabled: !state.available,
@@ -1313,15 +1304,20 @@ window.__ModuleLoader__.load({
 				deleted: false
 			})));
 			const [saving, setSaving] = (0, react.useState)(false);
+			const [saveError, setSaveError] = (0, react.useState)(void 0);
 			const setRow = (index, patch) => setRows((prev) => prev.map((r, i) => i === index ? {
 				...r,
 				...patch
 			} : r));
 			const save = () => {
 				setSaving(true);
-				Promise.resolve(onSave(withoutUid(rows))).finally(() => {
+				setSaveError(void 0);
+				Promise.resolve(onSave(withoutUid(rows))).then(() => {
 					setSaving(false);
 					onClose();
+				}).catch((err) => {
+					setSaving(false);
+					setSaveError(err?.message ?? String(err));
 				});
 			};
 			const footer = /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
@@ -1337,12 +1333,16 @@ window.__ModuleLoader__.load({
 				disabled: saving,
 				children: saving ? t("saving") : t("saveAll")
 			})] });
-			return /* @__PURE__ */ (0, react_jsx_runtime.jsx)(Modal, {
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(Modal, {
 				t,
 				title: t("memoryModalTitle"),
 				footer,
 				onClose,
-				children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("table", {
+				children: [saveError ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+					className: css.hint,
+					style: { color: "#c0392b" },
+					children: saveError
+				}) : null, /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("table", {
 					className: css.editor,
 					children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("thead", { children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("tr", { children: [
 						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("th", { children: t("colSubject") }),
@@ -1385,7 +1385,7 @@ window.__ModuleLoader__.load({
 							}) })
 						]
 					}, row.uid)) })]
-				})
+				})]
 			});
 		}
 		/** Modal editor for the user profile: Excel-like editable table + single save all. */

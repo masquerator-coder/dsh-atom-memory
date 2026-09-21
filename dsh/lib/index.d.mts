@@ -9,8 +9,6 @@ interface Config {
   pythonBin?: string;
   /** Auto-start the bridge on plugin load (deployment-time switch). */
   autostart?: boolean;
-  /** Master memory switch: when false the plugin is inert (no capture/context/tools). */
-  enabled?: boolean;
   /** Manual LLM extraction model override; omit or leave provider empty to follow dsh default. */
   extractionModel?: {
     provider?: string;
@@ -310,8 +308,6 @@ declare function retryDelayMs(attempt: number): number;
 declare function buildStartParams(config: Config): Record<string, unknown>;
 /** Everything the ingestion point needs, so it can be exercised without a child. */
 interface CaptureWiring {
-  /** Master/durability gate: false makes the capture a no-op. */
-  isEnabled: () => boolean;
   /**
    * Whether the Python bridge is up. A down bridge means *no* RPC at all rather
    * than a failed one: the message stays uncaptured and the nudge retries it.
