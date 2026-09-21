@@ -619,6 +619,63 @@ describe('MemorySettingsSection client render', () => {
     expect(screen.getByDisplayValue('中文')).toBeTruthy()
   })
 
+  it('keeps the facts editor open and shows why when a save is refused', async () => {
+    const controller = buildController(true)
+    const { props } = bind(controller)
+    props.saveAllFacts = (async () => {
+      throw new Error('事实编辑被拒绝')
+    }) as never
+
+    await act(async () => {
+      render(createElement(MemorySettingsSection, props))
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.click(screen.getByText('编辑记忆'))
+    })
+    await act(async () => {})
+    // Edit a cell so there is unsaved work worth preserving.
+    const cell = screen.getAllByRole('textbox')[0]!
+    await act(async () => {
+      fireEvent.change(cell, { target: { value: '改过的主题' } })
+    })
+    await act(async () => {
+      fireEvent.click(screen.getAllByText('保存全部')[0]!)
+    })
+    await act(async () => {})
+
+    // The reason is on screen and the editor — with the edit — is still there.
+    // Closing in a `.finally()` used to take both away.
+    expect(screen.getByText(/事实编辑被拒绝/u)).toBeTruthy()
+    expect(screen.getByDisplayValue('改过的主题')).toBeTruthy()
+  })
+
+  it('closes the facts editor once a save succeeds', async () => {
+    const controller = buildController(true)
+    const { props } = bind(controller)
+    const saved: unknown[] = []
+    props.saveAllFacts = (async (rows: unknown[]) => { saved.push(rows) }) as never
+
+    await act(async () => {
+      render(createElement(MemorySettingsSection, props))
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.click(screen.getByText('编辑记忆'))
+    })
+    await act(async () => {})
+    expect(screen.getByText('编辑记忆')).toBeTruthy()
+
+    await act(async () => {
+      fireEvent.click(screen.getAllByText('保存全部')[0]!)
+    })
+    await act(async () => {})
+
+    expect(saved).toHaveLength(1)
+    // The modal's own title button is gone: it closed on success.
+    expect(screen.queryByDisplayValue('改过的主题')).toBeNull()
+  })
+
   /**
    * The class map in the component and the stylesheet in `styles.ts` are two
    * hand-maintained mirrors (the bundle has no CSS pipeline to check them

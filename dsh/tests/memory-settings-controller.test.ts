@@ -234,6 +234,89 @@ describe('MemorySettingsController', () => {
     expect(listFacts.mock.calls.length).toBeGreaterThan(0)
   })
 
+  it('sends only the fields the user changed, so an untouched fact keeps its type', async () => {
+    const { scope } = fakeScope(snapshot({}))
+    const { remote } = fakeRemote()
+    const editFact = remote.editFact as ReturnType<typeof vi.fn>
+    const listFacts = remote.listFacts as ReturnType<typeof vi.fn>
+    // The snapshot the editor opened with: this fact is an SOP, not a semantic
+    // memory.
+    listFacts.mockResolvedValue({
+      ok: true,
+      value: {
+        facts: [{ fact_id: 'f1', subject: 'a', predicate: 'b', object: 'c', content: 'x', type: 'sop' }],
+        total: 1,
+      },
+    })
+    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, remote)
+    const face = controller.inject()
+    await face.refreshData()
+    await face.saveAllFacts([
+      // Only `object` was edited.
+      { fact_id: 'f1', subject: 'a', predicate: 'b', object: 'CHANGED', content: 'x', type: 'sop', deleted: false },
+    ])
+    expect(editFact).toHaveBeenCalledTimes(1)
+    const patch = editFact.mock.calls[0][0] as Record<string, unknown>
+    expect(patch).toEqual({ user: 'global', fact_id: 'f1', object: 'CHANGED' })
+    // `type` in particular: sending it re-typed the row on every save, because
+    // the editor never showed it and the draft carried an empty string.
+    expect(patch).not.toHaveProperty('type')
+    expect(patch).not.toHaveProperty('subject')
+  })
+
+  it('sends nothing at all when the user changed nothing', async () => {
+    const { scope } = fakeScope(snapshot({}))
+    const { remote } = fakeRemote()
+    const editFact = remote.editFact as ReturnType<typeof vi.fn>
+    const listFacts = remote.listFacts as ReturnType<typeof vi.fn>
+    listFacts.mockResolvedValue({
+      ok: true,
+      value: { facts: [{ fact_id: 'f1', subject: 'a', predicate: 'b', object: 'c', content: 'x' }], total: 1 },
+    })
+    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, remote)
+    const face = controller.inject()
+    await face.refreshData()
+    await face.saveAllFacts([
+      { fact_id: 'f1', subject: 'a', predicate: 'b', object: 'c', content: 'x', deleted: false },
+    ])
+    expect(editFact).not.toHaveBeenCalled()
+  })
+
+  it('rejects when a fact edit fails, so the panel can keep the editor open', async () => {
+    const { scope } = fakeScope(snapshot({}))
+    const { remote } = fakeRemote()
+    const editFact = remote.editFact as ReturnType<typeof vi.fn>
+    const listFacts = remote.listFacts as ReturnType<typeof vi.fn>
+    listFacts.mockResolvedValue({
+      ok: true,
+      value: { facts: [{ fact_id: 'f1', subject: 'a', predicate: 'b', object: 'c', content: 'x' }], total: 1 },
+    })
+    editFact.mockResolvedValue({ ok: false, error: new Error('edit refused') })
+    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, remote)
+    const face = controller.inject()
+    await face.refreshData()
+    await expect(
+      face.saveAllFacts([
+        { fact_id: 'f1', subject: 'a', predicate: 'b', object: 'CHANGED', content: 'x', deleted: false },
+      ]),
+    ).rejects.toThrow('edit refused')
+    // ...and the reason is also on the snapshot for the panel to render.
+    expect(face.hooks.memorySettings.getSnapshot().lastError).toBe('edit refused')
+  })
+
+  it('rejects when a fact deletion fails', async () => {
+    const { scope } = fakeScope(snapshot({}))
+    const { remote } = fakeRemote()
+    const deleteFact = remote.deleteFact as ReturnType<typeof vi.fn>
+    deleteFact.mockResolvedValue({ ok: false, error: new Error('delete refused') })
+    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, remote)
+    await expect(
+      controller.inject().saveAllFacts([
+        { fact_id: 'f1', subject: 'a', predicate: 'b', object: 'c', deleted: true },
+      ]),
+    ).rejects.toThrow('delete refused')
+  })
+
   it('batch-saves a profile table in one call: upserts and deletions together', async () => {
     const { scope } = fakeScope(snapshot({}))
     const { remote, writeProfile } = fakeRemote()

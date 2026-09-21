@@ -1398,6 +1398,22 @@ class DomainStore:
         generic sentence ends up labelled with every topic the user has, and
         "domains intersect" — the conflict rule — stops discriminating.
 
+        Two invariants this method owns, neither of which the SQL alone expresses:
+
+        * **At most one primary per fact.** ``is_primary`` is read by ranking and
+          by conflict judgement, so two primaries make "the topic of this fact"
+          depend on a confidence tie-break. The upsert only ever *promotes*, so
+          the incumbent has to be demoted explicitly — and inside the same
+          transaction, or a reader in between sees two primaries.
+        * **The first label is the fact's standing.** ``assign`` marks the first
+          label of *every* assignment primary, so an incoming primary is not an
+          instruction to re-rank: it would let any later mention of a stored
+          claim silently re-topic it. Later labels are additions.
+
+        ``domain_max_per_fact`` is enforced against the stored rows *and* the
+        labels written by this call, so one assignment carrying more labels than
+        the cap cannot slip past it.
+
         Args:
             fact_id: The fact the labels belong to.
             assignment: The labels to attach.
@@ -1410,6 +1426,13 @@ class DomainStore:
         limit = max(1, int(getattr(self.config, "domain_max_per_fact", 5) or 5))
         existing = {label.domain_id: label for label in self.labels_of(fact_id)}
         now = now_ms()
+        # The primary already stored on this fact, if any. It is the incumbent and
+        # keeps its standing across restatements: see the `is_primary` rule in
+        # the loop below.
+        stored_primary = next(
+            (label.domain_id for label in existing.values() if label.is_primary),
+            None,
+        )
         for label in assignment.labels:
             current = existing.get(label.domain_id)
             keep_primary = 0
@@ -1428,14 +1451,29 @@ class DomainStore:
                 and source_rank(current.source) <= source_rank(label.source)
                 else label.source
             )
-            is_primary = 1 if label.is_primary or keep_primary else 0
+            # Whether this row ends up primary:
+            #   * a *new* row takes the incoming flag — but only while no
+            #     primary exists yet, because the incumbent keeps its standing;
+            #   * an existing row keeps what it has unless this assignment
+            #     explicitly restates it as non-primary.
+            # The rule the second case encodes: `assign` marks the first label
+            # of *every* assignment primary, so treating an incoming primary as
+            # an instruction to re-rank would let any later mention of an
+            # already-labelled claim silently re-topic it. The first label a
+            # fact gets is its standing; later labels are additions.
+            if keep_primary:
+                is_primary = 1
+            elif stored_primary is not None:
+                is_primary = 1 if label.domain_id == stored_primary else 0
+            else:
+                is_primary = 1 if label.is_primary else 0
             with self.conn:
                 self.conn.execute(
                     "INSERT INTO fact_domain(fact_id, domain_id, confidence, "
                     "is_primary, source, created_at) VALUES (?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(fact_id, domain_id) DO UPDATE SET "
                     "confidence = MAX(confidence, excluded.confidence), "
-                    "is_primary = MAX(is_primary, excluded.is_primary), "
+                    "is_primary = excluded.is_primary, "
                     "source = excluded.source",
                     (
                         fact_id,
@@ -1446,6 +1484,37 @@ class DomainStore:
                         now,
                     ),
                 )
+                # Exactly one primary per fact: promoting a row demotes the
+                # others in the same transaction, so no reader can observe two.
+                if is_primary:
+                    self.conn.execute(
+                        "UPDATE fact_domain SET is_primary = 0 "
+                        "WHERE fact_id = ? AND domain_id != ?",
+                        (fact_id, label.domain_id),
+                    )
+            # Track what this call has written, so the cap counts it. The
+            # snapshot is refreshed rather than merely incremented: an upsert of
+            # an existing row must not consume a new slot.
+            existing[label.domain_id] = DomainLabel(
+                domain_id=label.domain_id,
+                name=label.name,
+                confidence=confidence,
+                is_primary=bool(is_primary),
+                source=source,
+            )
+            if is_primary:
+                # The demotion above cleared every other stored primary; mirror
+                # that in the snapshot so a later iteration of this same loop
+                # does not read a stale `current.is_primary` and re-promote it.
+                for other_id, other in list(existing.items()):
+                    if other_id != label.domain_id and other.is_primary:
+                        existing[other_id] = DomainLabel(
+                            domain_id=other.domain_id,
+                            name=other.name,
+                            confidence=other.confidence,
+                            is_primary=False,
+                            source=other.source,
+                        )
         return self.labels_of(fact_id)
 
     def set_fact_domains(

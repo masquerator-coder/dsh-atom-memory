@@ -1194,6 +1194,50 @@ def test_the_head_is_a_hard_cap_at_every_budget():
         conn.close()
 
 
+def test_the_detail_view_is_a_hard_cap_at_every_budget():
+    """``detail=True`` bounds the assembled artifact too — footer included.
+
+    The heading and the "N 条事实" footer are part of what the caller pays for,
+    and the footer quotes the limit itself, so an unmeasured append overshot by
+    an amount that *grew with the budget*. This text is frozen into a session's
+    system prompt, so the overshoot was charged on every request.
+
+    Budgets below the irreducible framing cost (heading + one fact +
+    worst-case footer) cannot be satisfied by any render; that floor is the
+    only place an overshoot is acceptable, and it is asserted separately below.
+    """
+    conn = connect_for_tests()
+    try:
+        for index in range(60):
+            _insert_fact(conn, f"f{index}", f"属性{index}", "值" * 6, created_at=1000 + index)
+        # The floor for this corpus, measured empirically: below it no render can
+        # fit, at or above it every render must.
+        floor = 60
+        for budget in (floor, 80, 120, 200, 400, 800, 1500):
+            md = _md(conn, max_tokens=budget, detail=True)
+            assert estimate_tokens(md) <= budget, (budget, estimate_tokens(md))
+    finally:
+        conn.close()
+
+
+def test_the_detail_view_keeps_the_top_fact_at_a_tiny_budget():
+    """A drill-down list stays useful when the budget is below the framing cost.
+
+    Returning nothing would say less than showing the top fact and admitting the
+    trim, so the first fact is kept unconditionally and the result announces it.
+    """
+    conn = connect_for_tests()
+    try:
+        for index in range(10):
+            _insert_fact(conn, f"f{index}", f"属性{index}", "值" * 6, created_at=1000 + index)
+        md = _md(conn, max_tokens=1, detail=True)
+        assert md, "a tiny budget must not produce an empty detail view"
+        assert "超出 token 预算" in md, "and it must say it was trimmed"
+        assert md.count("\n- ") == 1, "only the top fact survives"
+    finally:
+        conn.close()
+
+
 def test_the_cache_keeps_rendering_after_a_detail_only_change():
     """A detail change does not regenerate the overview, so it keeps serving.
 

@@ -69,6 +69,50 @@ def _decode_outcome(raw: Optional[str]) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _merge_truncation_records(
+    stored: Optional[list], incoming: Optional[list]
+) -> list:
+    """Union two truncation-record lists, preserving order and dropping repeats.
+
+    The same loss is reported from two sides. The caller shortened the text
+    before enqueueing (``add``/``replace`` clean the utterance body), and the
+    worker shortened the extracted candidate fields, writing its own records
+    into the stored outcome. When both cover the same field the naive
+    concatenation reported one shortened field twice, so a model or panel
+    reading the receipt saw a doubled record for a single loss.
+
+    Records are compared on the fields that identify the loss
+    (``field``/``original_chars``/``kept_chars``): the same field shortened to
+    the same length is the same event regardless of how it reached the receipt.
+    Stored records come first — they describe what was actually written.
+
+    Args:
+        stored: Records already persisted on the candidate (may be ``None``).
+        incoming: Records the calling write produced (may be ``None``).
+
+    Returns:
+        A de-duplicated list, stored records first.
+    """
+    merged: list = []
+    seen: set = set()
+    for record in list(stored or []) + list(incoming or []):
+        if not isinstance(record, dict):
+            # Unrecognised shape: keep it rather than silently dropping a
+            # record we cannot reason about.
+            merged.append(record)
+            continue
+        key = (
+            record.get("field"),
+            record.get("original_chars"),
+            record.get("kept_chars"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(record)
+    return merged
+
+
 class AtomMem:
     """In-process long-term memory for DeepSeek Harness."""
 
@@ -331,7 +375,9 @@ class AtomMem:
                 receipt["status"] = row["status"]
                 outcome = _decode_outcome(row["result_fact_ids"])
                 if truncated:
-                    outcome["truncated"] = list(outcome.get("truncated") or []) + list(truncated)
+                    outcome["truncated"] = _merge_truncation_records(
+                        outcome.get("truncated"), truncated
+                    )
                 receipt["outcome"] = outcome
                 if row["reject_kind"]:
                     receipt["reject_kind"] = row["reject_kind"]

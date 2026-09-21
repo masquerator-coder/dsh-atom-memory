@@ -2242,6 +2242,12 @@ class Worker:
           reuse bonus), so a fact that was once heavily used but has not been
           touched for months is archived before a modest one that is live.
 
+        The cap is *best-effort by construction*: protected facts are exempt, so
+        when they alone exceed the cap no amount of archiving can reach it. That
+        case is reported rather than silently swallowed — the pass logs the
+        shortfall it could not close, because a capacity policy that quietly
+        stops working is worse than one that says so.
+
         Args:
             user_id: Restrict to one user; ``None`` applies to every user.
 
@@ -2271,7 +2277,11 @@ class Worker:
             by_user.setdefault(row["user_id"], []).append(row)
 
         archived: List[dict] = []
+        # Facts the cap could not reach because every removable slot was
+        # protected. Reported at the end; see the docstring.
+        unreachable_total = 0
         for owner, owner_rows in by_user.items():
+            # How many rows must go for this owner to be at or under the cap.
             overflow = len(owner_rows) - cap
             if overflow <= 0:
                 continue
@@ -2293,9 +2303,16 @@ class Worker:
                     )
                 )
             candidates.sort()
-            for _rank, _created, fact_id, predicate, memory_type in candidates[
-                :overflow
-            ]:
+            # The shortfall is counted against the *archivable* list, not the
+            # whole set: protected rows are exempt from archiving, so a slot
+            # they occupy is one this pass can never free. Slicing by the
+            # all-rows overflow would silently under-archive whenever protected
+            # facts outnumber it — and still report success.
+            chosen = candidates[:overflow]
+            # Counted against the archivable list; summed across owners and
+            # reported once, below.
+            unreachable_total += overflow - len(chosen)
+            for _rank, _created, fact_id, predicate, memory_type in chosen:
                 self.conn.execute(
                     "UPDATE facts SET status = ?, archived_at = ? WHERE fact_id = ?",
                     (FACT_STATUS_ARCHIVED, now_ms(), fact_id),
@@ -2308,16 +2325,25 @@ class Worker:
                         "type": memory_type,
                     }
                 )
-        if archived:
+        if archived or unreachable_total:
             self.conn.commit()
             record_event(
                 self.conn,
                 "facts_archived",
-                {"cap": cap, "archived": archived},
+                {
+                    "cap": cap,
+                    "archived": archived,
+                    "unreachable": unreachable_total,
+                },
                 user_id=user_id or "",
             )
             logger.warning(
-                "Capacity pass archived %d fact(s) over cap %d", len(archived), cap
+                "Capacity pass archived %d fact(s) over cap %d"
+                + (" (%d slot(s) held by protected facts, cap still exceeded)")
+                * bool(unreachable_total),
+                len(archived),
+                cap,
+                *([unreachable_total] if unreachable_total else []),
             )
         return archived
 

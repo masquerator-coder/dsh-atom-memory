@@ -328,7 +328,11 @@ export class MemorySettingsController {
 
   private async saveFact(fact: MemoryData['facts'][number]): Promise<void> {
     try {
-      await this.r().editFact({
+      // `unwrap`: a `{ok:false}` refusal must not be read as a save. `type` is
+      // carried here on purpose — this path edits the whole row the *list* view
+      // rendered, so the value came from the store rather than from an editor
+      // that never showed it.
+      unwrap(await this.r().editFact({
         user: USER,
         fact_id: fact.fact_id,
         subject: fact.subject,
@@ -336,23 +340,25 @@ export class MemorySettingsController {
         object: fact.object,
         content: fact.content,
         type: fact.type,
-      })
+      }))
       await this.refreshData()
     } catch (err) {
       this.store.set({
         ...this.store.getSnapshot(), lastError: (err as Error)?.message ?? String(err),
       })
+      throw err
     }
   }
 
   private async deleteFact(factId: string): Promise<void> {
     try {
-      await this.r().deleteFact({ user: USER, fact_id: factId })
+      unwrap(await this.r().deleteFact({ user: USER, fact_id: factId }))
       await this.refreshData()
     } catch (err) {
       this.store.set({
         ...this.store.getSnapshot(), lastError: (err as Error)?.message ?? String(err),
       })
+      throw err
     }
   }
 
@@ -397,26 +403,61 @@ export class MemorySettingsController {
 
   private async saveAllFacts(rows: FactEditRow[]): Promise<void> {
     try {
+      // Only the fields the user actually changed are sent. `edit_fact` reads
+      // "present and not None" as "set this column", so passing a value the
+      // editor never showed rewrites it: the modal binds subject/predicate/
+      // object/content but NOT `type`, so every untouched row would have been
+      // re-typed with the draft's empty string, which the store normalises to
+      // `semantic`. That silently flattened SOP / lesson / decision_rule
+      // knowledge — the types the archive pass protects and the ranking reads —
+      // on a save where the user changed nothing at all.
+      const before = this.store.getSnapshot().data.facts
+      const originalById = new Map(before.map(f => [f.fact_id, f]))
       for (const row of rows) {
         if (row.deleted) {
-          await this.r().deleteFact({ user: USER, fact_id: row.fact_id })
-        } else {
-          await this.r().editFact({
-            user: USER,
-            fact_id: row.fact_id,
-            subject: row.subject,
-            predicate: row.predicate,
-            object: row.object,
-            content: row.content,
-            type: row.type,
-          })
+          // `unwrap` for the same reason as the edit below: a `{ok:false}`
+          // deletion would otherwise read as success and the panel would report
+          // a save that silently left the fact in place.
+          unwrap(await this.r().deleteFact({ user: USER, fact_id: row.fact_id }))
+          continue
         }
+        const original = originalById.get(row.fact_id)
+        const patch: {
+          user: string
+          fact_id: string
+          subject?: string
+          predicate?: string
+          object?: string
+          content?: string
+        } = { user: USER, fact_id: row.fact_id }
+        if (original === undefined) {
+          // No snapshot entry to diff against (the list was refreshed away, or
+          // the caller supplied rows directly). Send the editable fields so the
+          // edit still lands rather than being silently dropped — `type` is
+          // still omitted, since the editor never showed it.
+          patch.subject = row.subject
+          patch.predicate = row.predicate
+          patch.object = row.object
+          patch.content = row.content ?? ''
+        } else {
+          if (row.subject !== original.subject) patch.subject = row.subject
+          if (row.predicate !== original.predicate) patch.predicate = row.predicate
+          if (row.object !== original.object) patch.object = row.object
+          if ((row.content ?? '') !== (original.content ?? '')) patch.content = row.content ?? ''
+        }
+        // An untouched row produces an empty patch, and sending it would be a
+        // write with no effect; skip it rather than spend a round trip.
+        if (Object.keys(patch).length <= 2) continue
+        unwrap(await this.r().editFact(patch))
       }
       await this.refreshData()
     } catch (err) {
-      this.store.set({
-        ...this.store.getSnapshot(), lastError: (err as Error)?.message ?? String(err),
-      })
+      const message = (err as Error)?.message ?? String(err)
+      this.store.set({ ...this.store.getSnapshot(), lastError: message })
+      // The panel's save handler closes the modal only on success, so a
+      // re-throw is what lets it keep the editor — and the edits not yet
+      // applied — in front of the user. Mirrors `saveAllProfile`.
+      throw err
     }
   }
 

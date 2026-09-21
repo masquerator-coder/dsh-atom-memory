@@ -1205,11 +1205,31 @@ class ScopeStore:
             )
             return None
         with self.conn:
-            self.conn.execute(
-                "UPDATE scope_candidate SET status = 'promoted' "
-                "WHERE user_id = ? AND scope_type = ? AND canonical_name = ?",
-                (user_id, level.scope_type, level.canonical_name),
-            )
+            # Scope the retirement to the exact candidate that matured. The
+            # unique key is (user_id, scope_type, canonical_name, signal_type,
+            # normalized_value) — a different signal under the same name is a
+            # legitimately separate row that has *not* earned promotion (the
+            # rule the queue's own lookup at `_promote_matured` enforces). A
+            # WHERE that stops at canonical_name retires those siblings too, and
+            # since promotion is only ever offered to `pending` rows, a sibling
+            # marked `promoted` here can never be promoted afterwards.
+            #
+            # Every signal on the level is retired, not just the first: they all
+            # describe the one scope that was just created, so all of them are
+            # now resolved.
+            for signal in level.signals:
+                self.conn.execute(
+                    "UPDATE scope_candidate SET status = 'promoted' "
+                    "WHERE user_id = ? AND scope_type = ? AND canonical_name = ? "
+                    "AND signal_type = ? AND normalized_value = ?",
+                    (
+                        user_id,
+                        level.scope_type,
+                        level.canonical_name,
+                        signal.signal_type,
+                        signal.normalized,
+                    ),
+                )
         record_event(
             self.conn,
             "scope_promoted",

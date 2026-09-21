@@ -253,6 +253,60 @@ def test_a_capped_write_says_it_was_capped(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_a_shortened_write_is_reported_once_not_twice(tmp_path, monkeypatch):
+    """The same loss must not be counted twice in the receipt.
+
+    A loss reaches the receipt from two sides: the calling write shortened the
+    text before enqueueing, and the worker shortened the extracted fields and
+    stored its own records on the candidate. When both cover the same field the
+    naive concatenation reported one shortened field twice, so a model reading
+    the receipt saw double the actual loss.
+    """
+    async def scenario() -> None:
+        mem = _make(tmp_path, monkeypatch, max_content_chars=500, write_ack_timeout_ms=5000)
+        await mem.start()
+        try:
+            receipt = await mem.add("u1", "s1", "长" * 4000)
+            truncated = receipt["outcome"]["truncated"]
+            content_records = [r for r in truncated if r.get("field") == "content"]
+            assert len(content_records) == 1, f"reported {len(content_records)}x: {truncated}"
+
+            # The stored outcome is the other side of the merge, and it must
+            # agree with the receipt rather than carry an extra copy.
+            row = mem.db.execute(
+                "SELECT result_fact_ids FROM fact_candidates WHERE candidate_id = ?",
+                (receipt["candidate_id"],),
+            ).fetchone()
+            import json as _json
+
+            stored = _json.loads(row["result_fact_ids"] or "{}")
+            stored_content = [
+                r for r in (stored.get("truncated") or []) if r.get("field") == "content"
+            ]
+            assert len(stored_content) <= 1, stored
+        finally:
+            await mem.stop()
+
+    asyncio.run(scenario())
+
+
+def test_distinct_truncations_all_survive_the_merge(tmp_path, monkeypatch):
+    """De-duplication must not swallow a genuinely different loss."""
+    from atom_memory.api import _merge_truncation_records
+
+    content = {"field": "content", "original_chars": 400, "kept_chars": 30}
+    obj = {"field": "object", "original_chars": 150, "kept_chars": 20}
+    # Identical records collapse; different fields both stay.
+    assert _merge_truncation_records([content], [content]) == [content]
+    assert _merge_truncation_records([content], [obj]) == [content, obj]
+    # The same field shortened to a *different* length is a different event.
+    other_kept = {"field": "content", "original_chars": 400, "kept_chars": 40}
+    assert _merge_truncation_records([content], [other_kept]) == [content, other_kept]
+    # Missing / empty sides pass the other through unchanged.
+    assert _merge_truncation_records(None, [content]) == [content]
+    assert _merge_truncation_records([content], None) == [content]
+
+
 def test_an_untouched_write_reports_no_truncation(tmp_path, monkeypatch):
     async def scenario() -> None:
         mem = _make(tmp_path, monkeypatch, max_content_chars=500)

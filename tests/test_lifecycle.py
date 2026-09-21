@@ -579,6 +579,70 @@ def test_capacity_protects_fresh_reinforced_and_durable_facts(tmp_path, monkeypa
     _run(scenario())
 
 
+def test_capacity_reports_the_slots_protection_makes_unreachable(tmp_path, monkeypatch):
+    """Protected facts can hold more slots than the cap allows.
+
+    The pass must then archive everything it *can* — the shortfall has to be
+    measured against the archivable rows, not against all active rows, or it
+    under-archives and still reports success. `max_active_facts` is exactly the
+    policy that has to keep working when the store is crowded with facts the
+    policy itself exempts, so this is the case that matters most.
+    """
+    from atom_memory.db import now_ms
+
+    mem = _make(tmp_path, monkeypatch, max_active_facts=3, archive_protect_days=30)
+    fresh = now_ms()
+
+    async def scenario():
+        await mem.start()
+        # 8 protected (fresh), 2 old and unprotected: only 2 are archivable,
+        # while the cap needs 7 slots freed.
+        for i in range(8):
+            _insert_fact(mem, f"fresh{i}", "用户", "城市", f"城{i}",
+                         importance=0.1, created_at=fresh)
+        for i in range(2):
+            _insert_fact(mem, f"old{i}", "用户", "爱好", f"爱好{i}",
+                         importance=0.1, created_at=1)
+
+        result = await mem.maintenance("u1")
+
+        # Everything reachable was archived...
+        assert sorted(a["fact_id"] for a in result["archived"]) == ["old0", "old1"]
+        # ...and the pass says so instead of implying the cap was met.
+        assert mem.stats("u1")["facts"] == 8 > 3
+        event = mem.db.execute(
+            "SELECT payload FROM events WHERE type = 'facts_archived' "
+            "ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        payload = json.loads(event["payload"])
+        assert payload["unreachable"] == 5, "the shortfall it could not close"
+        await mem.stop()
+
+    _run(scenario())
+
+
+def test_capacity_still_reaches_the_cap_when_nothing_is_protected(tmp_path, monkeypatch):
+    """The unreachable accounting must not weaken the ordinary path."""
+    mem = _make(tmp_path, monkeypatch, max_active_facts=3, archive_protect_days=0)
+
+    async def scenario():
+        await mem.start()
+        for i in range(10):
+            _insert_fact(mem, f"f{i}", "用户", "爱好", f"爱好{i}",
+                         importance=0.1, created_at=i + 1)
+        result = await mem.maintenance("u1")
+        assert len(result["archived"]) == 7
+        assert mem.stats("u1")["facts"] == 3
+        event = mem.db.execute(
+            "SELECT payload FROM events WHERE type = 'facts_archived' "
+            "ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        assert json.loads(event["payload"])["unreachable"] == 0
+        await mem.stop()
+
+    _run(scenario())
+
+
 def test_maintenance_prunes_finished_bookkeeping_past_retention(tmp_path, monkeypatch):
     mem = _make(
         tmp_path, monkeypatch,

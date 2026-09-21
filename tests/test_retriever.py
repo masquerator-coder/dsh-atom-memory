@@ -18,6 +18,8 @@ from atom_memory.retriever import (
     rrf_ceiling,
     rrf_merge,
     segment_text,
+    token_cost,
+    truncate_to_tokens,
 )
 
 DIM = 512
@@ -528,4 +530,53 @@ def test_weights_are_configurable():
         assert now_ms() > 0
     finally:
         conn.close()
+
+
+# -- truncate_to_tokens --------------------------------------------------------
+#
+# The function exists to enforce a per-fact ceiling on what gets injected, so
+# the only property that matters is that the *returned* text fits the limit.
+# It previously overshot by one token whenever the non-CJK character count sat
+# on a CHARS_PER_TOKEN boundary, because the ellipsis was appended after the
+# budget check rather than reserved before it.
+
+def test_truncate_to_tokens_never_exceeds_the_limit():
+    """Exhaustive over limits 0..119 and a grid of character shapes."""
+    texts = [
+        "hello world " * 20,      # Latin (the boundary case)
+        "中文" * 50,                # CJK: one char per token
+        "abc中" * 30,              # mixed
+        "a" * 100,                # single long non-CJK run
+        "x",                      # single char
+        "",                       # empty
+        "   ",                    # whitespace only
+        "中",                      # single CJK char
+    ]
+    for limit in range(0, 120):
+        for text in texts:
+            result = truncate_to_tokens(text, limit)
+            assert token_cost(result)[0] <= limit, (
+                f"limit={limit} text={text[:20]!r} -> "
+                f"{result!r} costs {token_cost(result)[0]}"
+            )
+
+
+def test_truncate_to_tokens_leaves_fitting_text_untouched():
+    assert truncate_to_tokens("hello", 100) == "hello"
+    assert truncate_to_tokens("中文", 2) == "中文"
+
+
+def test_truncate_to_tokens_marks_a_real_cut():
+    """A shortened result carries the ellipsis, so the loss is visible."""
+    for limit in (1, 2, 5, 10, 50):
+        result = truncate_to_tokens("hello world " * 20, limit)
+        assert result.endswith("…"), f"limit={limit} produced {result!r}"
+
+
+def test_truncate_to_tokens_edge_limits():
+    assert truncate_to_tokens("hello", 0) == ""
+    assert truncate_to_tokens("", 10) == ""
+    assert truncate_to_tokens("hello", -5) == ""
+    # limit=1 has room only for the ellipsis; it must not exceed 1 token.
+    assert token_cost(truncate_to_tokens("hello world", 1))[0] <= 1
 

@@ -373,6 +373,86 @@ def test_attach_respects_the_per_fact_cap(conn, config):
     assert len(store.labels_of(fact_id)) == 2
 
 
+def test_one_attach_call_cannot_exceed_the_cap(conn):
+    """The cap counts the labels *this call* writes, not just the stored rows.
+
+    The check used to compare against the pre-call snapshot only, so a single
+    assignment carrying more labels than the cap wrote all of them: the snapshot
+    never changed while the loop ran. Reaching the cap through `assign` (which
+    truncates its own list) hid this, because `attach` is also called directly
+    with an assignment built elsewhere.
+    """
+    from atom_memory.domain import DomainAssignment, DomainLabel
+
+    store = DomainStore(conn, MemConfig(scope_aware=True, domain_max_per_fact=2))
+    fact_id = add_fact(conn)
+    ids = [store.create("u", name) for name in ("a", "b", "c", "d")]
+    store.attach(
+        fact_id,
+        DomainAssignment(
+            labels=tuple(
+                DomainLabel(
+                    domain_id=domain_id,
+                    name=store.name_of(domain_id),
+                    confidence=0.8,
+                    is_primary=(index == 0),
+                    source=SOURCE_USER,
+                )
+                for index, domain_id in enumerate(ids)
+            )
+        ),
+    )
+    assert len(store.labels_of(fact_id)) == 2, "the cap holds for a direct attach too"
+
+
+def test_a_fact_never_holds_two_primary_labels(conn, config):
+    """``is_primary`` decides what the fact is *about*, so it must be unique.
+
+    `assign` marks the first label of *every* assignment primary. Applying two
+    such assignments to one fact therefore promoted both rows — the upsert only
+    ever raised the flag (`MAX(is_primary, ...)`) and nothing lowered it — and
+    from then on "the topic of this fact" depended on a confidence tie-break.
+    """
+    store = DomainStore(conn, config)
+    fact_id = add_fact(conn)
+    store.create("u", "teaching")
+    store.create("u", "programming")
+    store.attach(fact_id, store.assign("u", hints=["teaching"], source=SOURCE_USER))
+    store.attach(fact_id, store.assign("u", hints=["programming"], source=SOURCE_USER))
+
+    primaries = [label for label in store.labels_of(fact_id) if label.is_primary]
+    assert len(primaries) == 1, [label.name for label in primaries]
+    rows = conn.execute(
+        "SELECT COUNT(*) AS c FROM fact_domain WHERE fact_id = ? AND is_primary = 1",
+        (fact_id,),
+    ).fetchone()["c"]
+    assert rows == 1, "and the invariant holds in the table, not just the view"
+
+
+def test_the_first_label_keeps_its_standing_across_restatements(conn, config):
+    """A later observation must not silently re-topic a fact.
+
+    Combined with the uniqueness rule above this is the whole policy: the first
+    label a fact gets is its standing, and later labels are additions. Without
+    it every restatement of a stored claim could move the fact to whatever
+    topic the new context happened to resolve to.
+    """
+    store = DomainStore(conn, config)
+    fact_id = add_fact(conn)
+    teaching = store.create("u", "teaching")
+    store.create("u", "programming")
+    store.attach(fact_id, store.assign("u", hints=["teaching"], source=SOURCE_USER))
+    store.attach(fact_id, store.assign("u", hints=["programming"], source=SOURCE_HINT))
+
+    labels = {label.name: label for label in store.labels_of(fact_id)}
+    assert set(labels) == {"teaching", "programming"}, "the new label is still added"
+    assert labels["teaching"].is_primary, "but the incumbent keeps its standing"
+    assert not labels["programming"].is_primary
+    assert labels["teaching"].domain_id == teaching
+    # `fact_domains` is the *filter* view: every label the fact carries.
+    assert store.fact_domains([fact_id])[fact_id] == (teaching, 2)
+
+
 def test_bridges_are_ranking_only(store):
     """A bridge must not widen a filter set: that is exactly how "isolate topics"
     and "reach across topics" begin to contradict each other."""

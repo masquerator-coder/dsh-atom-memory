@@ -628,8 +628,8 @@ def estimate_tokens(text: str) -> int:
     """Estimate the number of tokens in a text for budget trimming.
 
     A simple, deterministic heuristic: CJK characters count as one token each,
-    and every five non-CJK characters count as one word token. Not an exact
-    tokenizer — just a stable proxy for budgeting.
+    and every ``CHARS_PER_TOKEN`` non-CJK characters count as one word token.
+    Not an exact tokenizer — just a stable proxy for budgeting.
 
     Args:
         text: The text to estimate.
@@ -681,19 +681,36 @@ def truncate_to_tokens(text: str, limit: int) -> str:
 
     One pass, not one measurement per prefix: the estimate is a function of the
     CJK count and the non-CJK count, both of which accumulate as the text is
-    walked. The result carries an ellipsis, which is inside the limit.
+    walked.
+
+    The ellipsis is budgeted *before* the walk, not appended afterwards. It is
+    itself a non-CJK character, so adding it on top of a prefix that already
+    spent the whole budget pushed the result one token over the limit — exactly
+    when the non-CJK count sat on a ``CHARS_PER_TOKEN`` boundary, which is the
+    common case for Latin text. Since this function exists to enforce a
+    per-fact ceiling on what is injected, an overrun defeated the cap it was
+    called to apply.
 
     Args:
         text: The text to shorten (returned unchanged when it already fits).
         limit: Maximum estimated tokens.
 
     Returns:
-        The text, cut at the last character that fits.
+        The text, cut at the last character that fits, ellipsis included.
     """
     if limit <= 0 or not text:
         return ""
-    if estimate_tokens(text) <= limit:
+    if token_cost(text)[0] <= limit:
         return text
+    # Reserve what the ellipsis will cost so the returned string — ellipsis
+    # included — respects `limit`.
+    ellipsis_cost = token_cost("…")[0]
+    budget = limit - ellipsis_cost
+    if budget <= 0:
+        # No room for any content alongside the ellipsis. At limit >= 1 the
+        # ellipsis alone still fits (and says more than an empty string); below
+        # that only the empty string does.
+        return "…" if limit >= ellipsis_cost else ""
     cjk = 0
     other = 0
     for index, ch in enumerate(text):
@@ -701,7 +718,7 @@ def truncate_to_tokens(text: str, limit: int) -> str:
             cjk += 1
         else:
             other += 1
-        if cjk + max((other // CHARS_PER_TOKEN) if other else 0, 1 if other else 0) > limit:
+        if cjk + max((other // CHARS_PER_TOKEN) if other else 0, 1 if other else 0) > budget:
             return text[:index].rstrip() + "…" if index > 0 else "…"
     return text
 

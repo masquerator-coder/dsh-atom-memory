@@ -31,7 +31,9 @@ import pytest
 from atom_memory.config import MemConfig
 from atom_memory.context import (
     GLOBAL_SCOPE_ID,
+    ChainLevel,
     context_from_payload,
+    make_signal,
     normalize_conditions,
     normalize_path,
     normalize_remote,
@@ -398,6 +400,59 @@ def test_a_second_different_signal_does_not_promote_the_first(conn, config):
     assert conn.execute(
         "SELECT COUNT(*) AS n FROM scope WHERE scope_type = 'project'"
     ).fetchone()["n"] == 0
+
+
+def test_promotion_retires_only_the_candidate_that_matured(conn, config):
+    """A sibling candidate under the same name must stay promotable.
+
+    The queue's unique key is (user, type, name, signal_type, normalized_value),
+    so two different signals spelling the same name are two independent rows
+    with independent counters. The retirement UPDATE matched on the user, type
+    and name alone, which marked every sibling `promoted` — and since promotion
+    is only ever offered to `pending` rows, those siblings could never be
+    created afterwards, no matter how often they were seen.
+
+    Built at the store level because that is where the two rows coexist: the
+    resolver's own chain walks one signal per level, so a payload-level test
+    cannot put two candidates under one name.
+    """
+    store = ScopeStore(conn, config)
+    now = now_ms()
+    for signal_type in ("path", "folder_path"):
+        conn.execute(
+            "INSERT INTO scope_candidate(user_id, scope_type, canonical_name, "
+            "parent_id, signal_type, signal_value, normalized_value, confidence, "
+            "seen_count, status, first_seen, last_seen) "
+            "VALUES ('u', 'project', 'proj', ?, ?, 'D:/work/proj', 'd:/work/proj', "
+            "0.9, ?, 'pending', ?, ?)",
+            (GLOBAL_SCOPE_ID, signal_type, config.scope_promote_after, now, now),
+        )
+    conn.commit()
+
+    matured = make_signal("path", "D:/work/proj")
+    promoted = store._promote_candidate(
+        ChainLevel(
+            scope_type="project",
+            canonical_name="proj",
+            signals=(matured,),
+            confidence=0.9,
+            display_name="proj",
+        ),
+        "u",
+        GLOBAL_SCOPE_ID,
+    )
+    assert promoted is not None, "the candidate matured into a scope"
+
+    statuses = {
+        row["signal_type"]: row["status"]
+        for row in conn.execute(
+            "SELECT signal_type, status FROM scope_candidate WHERE user_id = 'u'"
+        ).fetchall()
+    }
+    assert statuses["path"] == "promoted", "the matured candidate is retired"
+    assert statuses["folder_path"] == "pending", (
+        "a sibling the promotion never covered stays promotable"
+    )
 
 
 def test_resolution_is_read_only_for_a_query(conn, config):

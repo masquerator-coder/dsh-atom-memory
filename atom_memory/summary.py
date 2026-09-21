@@ -1673,35 +1673,51 @@ def _render_detail(buckets: dict, user_id: str, max_tokens: int) -> str:
     """Render the full fact list with ``fact_id`` references.
 
     The heading is kept here (unlike the compact view): this text is read by a
-    human in a raw ``<pre>`` block, where the title is what orients them. The
-    token budget bounds the **facts**; this depth is a drill-down list whose
-    heading exists to orient a human reader and is therefore not trimmed away.
+    human in a raw ``<pre>`` block, where the title is what orients them.
+
+    ``max_tokens`` bounds the **assembled artifact**, footer included — the same
+    contract :func:`_select` honours for the compact depth, and the one
+    :meth:`~atom_memory.api.AtomMem.summary` documents to its callers. Measuring
+    only the fact lines let the heading and footer be added on top of a full
+    budget, so the render overshot by a fixed amount that grew with the budget
+    (the footer quotes the limit). Since this text is frozen into a session's
+    system prompt, the overshoot was paid on every request of every session.
+
+    A budget below the irreducible heading-plus-one-fact-plus-footer cost cannot
+    be satisfied by any render; that floor is respected rather than pretended
+    away, so the result is non-empty and self-describing at tiny budgets.
     """
     facts: List[dict] = []
     for section in buckets:
         facts.extend(buckets.get(section, []))
     facts.sort(key=_sort_key)
 
-    lines = [f"# 记忆 (Memory) — {user_id}", ""]
-    budget = max_tokens
-    kept = 0
-    budget_exhausted = False
+    head = [f"# 记忆 (Memory) — {user_id}", ""]
 
+    def assemble(kept_lines: List[str], exhausted: bool) -> str:
+        out = list(head) + list(kept_lines)
+        out.append("")
+        out.append(f"> {len(kept_lines)} 条事实 (facts) · 含 fact_id 作为唯一引用")
+        if exhausted:
+            out.append(f"> ⚠ 超出 token 预算，已裁剪（限制 {max_tokens}）")
+        return "\n".join(out)
+
+    # The warning footer is the longest form, so a line is only kept if the
+    # artifact still fits when that footer is present. This is what makes the
+    # measurement conservative in the direction that matters. The first fact is
+    # kept unconditionally: a drill-down list that answers "nothing" for a tiny
+    # budget is less useful than one that shows the top fact and says it was
+    # trimmed, and no budget can fit the framing without at least one fact.
+    kept_lines: List[str] = []
+    budget_exhausted = False
     for fact in facts:
         line = f"- {_format_fact(fact)}"
-        cost = estimate_tokens(line)
-        if cost > budget and kept > 0:
+        if kept_lines and estimate_tokens(assemble(kept_lines + [line], True)) > max_tokens:
             budget_exhausted = True
             break
-        lines.append(line)
-        budget -= cost
-        kept += 1
+        kept_lines.append(line)
 
-    lines.append("")
-    lines.append(f"> {kept} 条事实 (facts) · 含 fact_id 作为唯一引用")
-    if budget_exhausted:
-        lines.append(f"> ⚠ 超出 token 预算，已裁剪（限制 {max_tokens}）")
-    return "\n".join(lines)
+    return assemble(kept_lines, budget_exhausted)
 
 
 def _format_fact(fact: dict) -> str:

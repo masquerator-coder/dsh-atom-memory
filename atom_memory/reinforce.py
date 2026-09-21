@@ -670,9 +670,16 @@ def rebuild_fact_reinforcement(
     Replays ``fact_reinforcements`` in chronological order. Because ``roll`` is
     purely a function of the prior state — and because both the decay and the
     cooldown are dated from the last event that *counted* — this reproduces
-    exactly what the incremental path produced. That is what makes a retuned
-    ``A_MAX`` / ``HALF_LIFE_DAYS`` retro-applicable, and any suspected abuse
-    correctable, without trusting the stored aggregate.
+    what the incremental path produced for the same history. That is what makes
+    a retuned ``A_MAX`` / ``HALF_LIFE_DAYS`` retro-applicable, and any suspected
+    abuse correctable, without trusting the stored aggregate.
+
+    The replay yields the state **as of the last counted event**, and that is
+    exactly what the column is defined to hold: ``adjust`` documents
+    ``facts.reinforce_count`` as "the value as of ``last_used_at``, not now",
+    and every reader decays it forward from there. Persisting a
+    now-decayed value instead would double-count the elapsed decay — the row
+    would age once on write and again on every read.
 
     Args:
         conn: Open SQLite connection.
@@ -680,7 +687,8 @@ def rebuild_fact_reinforcement(
         user_id: Owner of the fact.
 
     Returns:
-        The final :class:`RollResult`, or ``None`` when the fact is missing.
+        The final :class:`RollResult` — the same snapshot the incremental path
+        left, or ``None`` when the fact is missing.
     """
     row = conn.execute(
         "SELECT importance FROM facts WHERE fact_id = ? AND user_id = ?",
@@ -727,6 +735,10 @@ def rebuild_fact_reinforcement(
             last = state.last_used_at
         seen = at
 
+    # Persisted exactly as replayed: the column is the snapshot *as of*
+    # `last_used_at` (see `adjust`), which is the same thing the incremental
+    # write path leaves behind. Decaying here would make the row age twice —
+    # once at write, again at every read.
     conn.execute(
         "UPDATE facts SET reinforce_count = ?, last_used_at = ?, last_seen_at = ? "
         "WHERE fact_id = ?",

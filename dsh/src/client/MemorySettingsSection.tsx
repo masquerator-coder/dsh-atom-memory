@@ -694,13 +694,24 @@ function FactsEditorModal(props: {
     })),
   )
   const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | undefined>(undefined)
 
   const setRow = (index: number, patch: Partial<FactsDraft>) =>
     setRows(prev => prev.map((r, i) => i === index ? { ...r, ...patch } : r))
 
+  // Close only on success. The previous version closed in a `.finally()`, so a
+  // save that failed halfway took the editor — and every edit the user had not
+  // yet applied — with it, leaving only a transient error to say so. Keeping
+  // the modal open is what makes the failure recoverable.
   const save = () => {
     setSaving(true)
-    void Promise.resolve(onSave(withoutUid(rows))).finally(() => { setSaving(false); onClose() })
+    setSaveError(undefined)
+    void Promise.resolve(onSave(withoutUid(rows)))
+      .then(() => { setSaving(false); onClose() })
+      .catch((err: unknown) => {
+        setSaving(false)
+        setSaveError((err as Error)?.message ?? String(err))
+      })
   }
 
   const footer = (
@@ -714,6 +725,9 @@ function FactsEditorModal(props: {
 
   return (
     <Modal t={t} title={t('memoryModalTitle')} footer={footer} onClose={onClose}>
+      {/* The save stayed open precisely so this can be read: the reason a
+          batch was refused would otherwise be lost with the modal. */}
+      {saveError ? <div className={css.hint} style={{ color: '#c0392b' }}>{saveError}</div> : null}
       <table className={css.editor}>
         <thead>
           <tr>
