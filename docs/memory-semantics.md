@@ -365,11 +365,16 @@ the curation prompt.
 
 ## 8. A switch is read when it is used
 
-**Rule.** The live settings (`enabled`, `captureEnabled`, `llmExtractionEnabled`,
+**Rule.** The live settings (`captureEnabled`, `llmExtractionEnabled`,
 `contextInjectionEnabled`, `overviewEnabled`, `injectedSummaryTokens`,
 `extractionModel`) reach their consumers as *getters* and are resolved at the
 moment of use — per message, per prompt assembly, per freeze, per extraction
 call, per scheduled refresh.
+
+**Scope.** Whether the plugin runs *at all* is not part of this set: it is dsh's
+own plugin switch, and disabling the plugin unregisters every hook and tool
+rather than leaving a memory-side master switch to be consulted at each call
+site.
 
 **Why.** A switch captured at registration time applies at the next restart,
 which in practice means "never" for a session already in progress: the settings

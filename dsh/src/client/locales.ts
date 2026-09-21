@@ -2,10 +2,7 @@
 
 const zh = {
   title: '记忆',
-  intro: '管理 dsh-atom-memory 的记忆能力：开关、抽取模型、用户画像、记忆内容与备份恢复。',
-  // 1) master switch
-  masterHeader: '记忆开关',
-  masterDesc: '关闭后停用记忆插件：不再捕获、不再注入上下文，记忆工具也会拒绝调用。打开即时恢复。',
+  intro: '管理 dsh-atom-memory 的记忆能力：抽取模型、用户画像、记忆内容与备份恢复。插件本身的启用与禁用由 dsh 的插件开关负责。',
   // 1b) injected summary budget
   injectHeader: '系统提示词注入体积（记忆摘要）',
   injectSliderLabel: '挡位',
@@ -30,7 +27,7 @@ const zh = {
   overviewOutcomeNoModel: '未配置可用模型，无法生成。',
   overviewOutcomeNothing: '记忆库暂无可叙述的内容。',
   overviewOutcomeEmpty: '模型没有产出内容，缓存保持不变。',
-  overviewOutcomeSkipped: '总览后台生成未启用，或记忆功能已关闭。',
+  overviewOutcomeSkipped: '总览后台生成未启用。',
   overviewOutcomeError: '生成失败（详见日志），缓存保持不变。',
   overviewOutcomeNoChange: '仅细节变化，无需重新生成。',
   overviewOutcomeNoChangeReason: '无需重新生成（{reason}）。',
@@ -121,9 +118,7 @@ const zh = {
 
 const en: Record<keyof typeof zh, string> = {
   title: 'Memory',
-  intro: 'Manage dsh-atom-memory: master switch, extraction model, user profile, memory content, and backup/restore.',
-  masterHeader: 'Memory switch',
-  masterDesc: 'When off the memory plugin is disabled: no capture, no context injection, and memory tools refuse calls. Turning on restores immediately.',
+  intro: 'Manage dsh-atom-memory: extraction model, user profile, memory content, and backup/restore. Enabling or disabling the plugin itself is dsh\'s own plugin switch.',
   injectHeader: 'System-prompt injection size (memory summary)',
   injectSliderLabel: 'Gear',
   injectPresetCompact: 'Compact · {tokens} tokens',
@@ -146,7 +141,7 @@ const en: Record<keyof typeof zh, string> = {
   overviewOutcomeNoModel: 'No usable model is configured, so nothing could be generated.',
   overviewOutcomeNothing: 'There is nothing in the memory store to narrate yet.',
   overviewOutcomeEmpty: 'The model produced no text; the cache is unchanged.',
-  overviewOutcomeSkipped: 'Background overview generation is off, or memory is disabled.',
+  overviewOutcomeSkipped: 'Background overview generation is off.',
   overviewOutcomeError: 'Generation failed (see the logs); the cache is unchanged.',
   overviewOutcomeNoChange: 'Only detail-level changes — no regeneration needed.',
   overviewOutcomeNoChangeReason: 'No regeneration needed ({reason}).',

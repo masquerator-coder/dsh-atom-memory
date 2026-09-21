@@ -2,10 +2,10 @@
  * Controller bridging the `atom-memory` settings namespace and the Host Remote
  * operations onto a reactive snapshot for the settings panel.
  *
- * Features 1 (master switch) & 2 (extraction model) ride the settings document;
- * features 3-5 (profile, facts editing, backup/restore) ride the Remote gateway
- * (`ctx.remote.atomMemory`). The controller owns no model-visible state — it
- * only stages the panel's drafts and forwards writes.
+ * The injected-summary budget and the extraction model ride the settings
+ * document; features 3-5 (profile, facts editing, backup/restore) ride the
+ * Remote gateway (`ctx.remote.atomMemory`). The controller owns no model-visible
+ * state — it only stages the panel's drafts and forwards writes.
  *
  * @module dsh-atom-memory/client/memory-settings-controller
  */
@@ -19,7 +19,6 @@ import {
 
 /** The live settings section this panel edits (mirrors the Host side). */
 export interface MemorySettingsSection {
-  enabled: boolean
   captureEnabled: boolean
   llmExtractionEnabled: boolean
   contextInjectionEnabled: boolean
@@ -85,7 +84,6 @@ export interface MemorySettingsFace {
     /** Section snapshot bound by the renderer as useMemorySettings. */
     memorySettings: SnapshotStore<MemorySettingsState>
   }
-  setEnabled: (enabled: boolean) => Promise<void>
   /**
    * Set the injected memory summary token budget.
    *
@@ -224,7 +222,6 @@ export class MemorySettingsController {
     available: false,
     loading: true,
     section: {
-      enabled: true,
       captureEnabled: true,
       llmExtractionEnabled: true,
       contextInjectionEnabled: true,
@@ -248,7 +245,6 @@ export class MemorySettingsController {
   inject(): MemorySettingsFace {
     return {
       hooks: { memorySettings: this.store },
-      setEnabled: (enabled) => this.scope.set('enabled', enabled),
       setInjectedSummaryTokens: (tokens) =>
         this.scope.set('injectedSummaryTokens', clampInjectedSummaryTokens(tokens)),
       setOverviewEnabled: (enabled) => this.scope.set('overviewEnabled', enabled),
@@ -508,7 +504,6 @@ export class MemorySettingsController {
 /** Fill defaults onto a (possibly partial / identical) section value. */
 function defaulted(value: MemorySettingsSection): MemorySettingsSection {
   return {
-    enabled: value.enabled ?? true,
     captureEnabled: value.captureEnabled ?? true,
     llmExtractionEnabled: value.llmExtractionEnabled ?? true,
     contextInjectionEnabled: value.contextInjectionEnabled ?? true,

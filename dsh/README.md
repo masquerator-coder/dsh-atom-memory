@@ -33,7 +33,6 @@ pnpm build       # -> lib/index.mjs
 | `dbPath` | `~/.dsh/atom-memory/memory.db` | Python 侧 SQLite 路径 |
 | `pythonBin` | `''`（用 PATH 上的 `python`） | 覆盖解释器（如 venv） |
 | `autostart` | `true` | 加载即启动桥接（部署期开关） |
-| `enabled` | `true` | 记忆总开关；关闭则停用捕获/上下文注入/记忆工具（运行时热切换） |
 | `extractionModel` | `{provider:'', model:''}` | LLM 抽取模型覆盖；provider 为空则跟随 dsh 默认模型；非空则手动指定 |
 | `captureEnabled` | `true` | per-message 捕获 |
 | `llmExtractionEnabled` | `true` | 启用以 dsh 默认模型作 LLM-first 抽取 |
@@ -56,16 +55,20 @@ pnpm build       # -> lib/index.mjs
 ## 记忆设置界面（dsh Web）
 
 插件自带浏览器 client-plugin（`src/client/`），在 **dsh 设置**侧边栏贡献独立的
-**「记忆」** 分区。`enabled`/`llmExtractionEnabled`/`contextInjectionEnabled`/
-`captureEnabled`/`extractionModel`/`injectedSummaryTokens` 通过 `installSection`
-注册为 `atom-memory` 设置命名空间，因此**在设置界面改即实时生效、无需重启**；
-其余字段仍走部署期 `schemastery` 配置。
+**「记忆」** 分区。`llmExtractionEnabled`/`contextInjectionEnabled`/
+`captureEnabled`/`extractionModel`/`injectedSummaryTokens`/`overviewEnabled` 通过
+`installSection` 注册为 `atom-memory` 设置命名空间，因此**在设置界面改即实时生效、
+无需重启**；其余字段仍走部署期 `schemastery` 配置。
+
+> **本插件没有自己的总开关。** 整个插件的启用与禁用交给 dsh 自身的插件开关：禁用即
+> 卸载插件，捕获钩子、工具注册、意识段与快照注入随之全部消失，无需第二套开关去模拟
+> 这件事。此前设置面板里的「记忆开关」已删除；旧的设置文档里若残留 `enabled` 键，
+> 只是不再被 schema 声明、读取时忽略，插件保持启用。
 
 面板六大功能（其中 **查看摘要 / user 画像编辑 / 记忆与编辑** 三个动作统一归入同一「记忆内容」区域，区域内的按钮横向排列，各自说明改为鼠标悬停浮层显示）：
 
 | 功能 | 说明 | 走线 |
 | --- | --- | --- |
-| 记忆开关 | `enabled` 主开关，**滑动开关**，实时热切换 | `settings<atom-memory>.enabled` → host `Runtime` |
 | 系统提示词注入体积（记忆摘要） | 注入快照的大小，**滑块 + 固定挡位**（精简 300 / 标准 800 / 详尽 1500 / 充裕 3000 / 宽阔 6000 / 超大 12000 tokens）。预算是**上限而非目标**：记忆没到上限就一条都不丢，所以放大挡位只在记忆确实很多时才多花钱；挡位是离散的，因此不会因少打一个 0 就把每个请求的开销放大十倍。落在挡位之间的旧值（旧「自定义」输入或插件配置）会把滑块停在最接近的挡位并**明示自己不在挡位梯上**，拨动后才切到固定挡位 | `settings<atom-memory>.injectedSummaryTokens` → `context.ts` 冻结时求值 |
 | LLM 抽取模型 | 跟随 dsh 默认 / 手动 provider+model | `settings<atom-memory>.extractionModel` → `llm-extractor` |
 | 查看摘要 | **只读**弹窗以 `<pre>` 原始 markdown 渲染**与注入系统提示词完全相同**的紧凑摘要（按类型分组、不含 `fact_id`），类 `atom-memory-summary-view`——与 `memory_summary` 工具同源 | `remote.atomMemory.summary` |

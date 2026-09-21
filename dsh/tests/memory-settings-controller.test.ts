@@ -21,7 +21,6 @@ function snapshot(over: Partial<SettingsScopeSnapshot<MemorySettingsSection>>): 
   return {
     status: 'ready',
     value: {
-      enabled: true,
       captureEnabled: true,
       llmExtractionEnabled: true,
       contextInjectionEnabled: true,
@@ -73,12 +72,12 @@ function fakeRemote() {
 
 describe('MemorySettingsController', () => {
   it('publishes the initial settings snapshot into the store', () => {
-    const { scope } = fakeScope(snapshot({ value: { enabled: false } as MemorySettingsSection }))
+    const { scope } = fakeScope(snapshot({ value: { overviewEnabled: false } as MemorySettingsSection }))
     const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, [])
     const face = controller.inject()
     const state = face.hooks.memorySettings.getSnapshot()
     expect(state.available).toBe(true)
-    expect(state.section.enabled).toBe(false)
+    expect(state.section.overviewEnabled).toBe(false)
     expect(state.loading).toBe(false)
   })
 
@@ -87,18 +86,18 @@ describe('MemorySettingsController', () => {
     const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, [])
     const face = controller.inject()
     // InjectFace maps hooks -> useX, other members pass through.
-    expect(typeof face.setEnabled).toBe('function')
+    expect(typeof face.setInjectedSummaryTokens).toBe('function')
     expect(typeof face.setExtractionModel).toBe('function')
     expect(typeof face.backup).toBe('function')
     expect(typeof face.restore).toBe('function')
     expect(typeof face.hooks.memorySettings.getSnapshot).toBe('function')
   })
 
-  it('routes setEnabled through the settings scope', async () => {
+  it('routes setOverviewEnabled through the settings scope', async () => {
     const { scope, set } = fakeScope(snapshot({}))
     const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, [])
-    await controller.inject().setEnabled(false)
-    expect(set).toHaveBeenCalledWith('enabled', false)
+    await controller.inject().setOverviewEnabled(false)
+    expect(set).toHaveBeenCalledWith('overviewEnabled', false)
   })
 
   it('routes the extraction model override through the settings scope', async () => {

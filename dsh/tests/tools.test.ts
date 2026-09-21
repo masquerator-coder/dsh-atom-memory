@@ -492,11 +492,6 @@ describe('memory_overview tool', () => {
     expect(bridge.call.mock.calls.at(-1)![0]).toBe('summary')
   })
 
-  it('honours the master switch', async () => {
-    const { tool } = setupOverview({ isEnabled: () => false })
-    await expect(tool.execute({}, execWithSession('s1'))).rejects.toThrow(/disabled/)
-  })
-
   it('honours an explicit user argument', async () => {
     const { bridge, tool } = setupOverview()
     bridge.call.mockResolvedValue({ text: '## 以前做过的工作\n- A' })

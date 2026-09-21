@@ -305,29 +305,7 @@ export function MemorySettingsSection(props: MemorySettingsSectionProps) {
       {state.lastError ? <div className={css.error}>{t('error', { message: state.lastError })}</div> : null}
       {status ? <div className={css.status}>{status}</div> : null}
 
-      {/* 1) master switch — a sliding toggle */}
-      <fieldset className={css.block} disabled={!state.available}>
-        <legend>{t('masterHeader')}</legend>
-        <label className={css.switchRow}>
-          <span className={css.switch}>
-            {/* Native checkbox drives state & a11y; visually replaced by the
-                sliding track. Kept focusable (visually hidden, not display:none)
-                so keyboard focus + screen readers still work. */}
-            <input
-              type="checkbox"
-              className={css.switchInput}
-              checked={state.section.enabled}
-              onChange={(e) => { void props.setEnabled(e.currentTarget.checked) }}
-            />
-            <span className={css.switchTrack} aria-hidden="true">
-              <span className={css.switchThumb} />
-            </span>
-          </span>
-          <span>{t('masterDesc')}</span>
-        </label>
-      </fieldset>
-
-      {/* 2) system-prompt injection size — a slider over fixed gears */}
+      {/* 1) system-prompt injection size — a slider over fixed gears */}
       <fieldset className={css.block} disabled={!state.available}>
         <legend>{t('injectHeader')}</legend>
         <div className={css.field}>

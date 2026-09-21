@@ -26,7 +26,8 @@
  *  - **Every switch is read when it is used.** The live toggles (capture,
  *    context injection, LLM extraction) reach their consumers as getters, so
  *    flipping one in the settings panel takes effect on the next event instead
- *    of on the next restart.
+ *    of on the next restart. Whether the plugin runs at all is dsh's own plugin
+ *    switch: this module has no master switch of its own.
  *  - **The Python side is probed before the bridge is trusted.** A child that
  *    cannot import `atom_memory` exits immediately; without a preflight the
  *    plugin would look healthy and fail every call. A permanent failure (wrong
@@ -149,7 +150,6 @@ export function buildStartParams(config: ConfigShape): Record<string, unknown> {
  */
 function seedRuntime(config: ConfigShape): LiveRuntime {
   return createRuntime({
-    enabled: config.enabled !== false,
     captureEnabled: config.captureEnabled !== false,
     llmExtractionEnabled: config.llmExtractionEnabled !== false,
     contextInjectionEnabled: config.contextInjectionEnabled !== false,
@@ -161,8 +161,6 @@ function seedRuntime(config: ConfigShape): LiveRuntime {
 
 /** Everything the ingestion point needs, so it can be exercised without a child. */
 export interface CaptureWiring {
-  /** Master/durability gate: false makes the capture a no-op. */
-  isEnabled: () => boolean
   /**
    * Whether the Python bridge is up. A down bridge means *no* RPC at all rather
    * than a failed one: the message stays uncaptured and the nudge retries it.
@@ -197,7 +195,6 @@ export function createCapture(
   deps: CaptureWiring,
 ): (text: string, sessionId: string, cwd?: string) => Promise<void> {
   return async (text: string, sessionId: string, cwd?: string): Promise<void> => {
-    if (!deps.isEnabled()) return
     // Built once per capture and shared by both paths: the payload answers
     // "where is this session", which cannot differ between them.
     const scope = deps.scopeContextAt(cwd)
@@ -260,7 +257,7 @@ export function apply(ctx: Context, config: ConfigShape): void {
     onExit: () => {
       state.value = false
       state.attempt = 0
-      if (config.autostart !== false && runtime.isEnabled()) void tryStart()
+      if (config.autostart !== false) void tryStart()
     },
   })
 
@@ -319,11 +316,11 @@ export function apply(ctx: Context, config: ConfigShape): void {
   if (config.autostart !== false) void tryStart()
 
   // LLM-first extraction (optional): prefers a manual extractionModel override,
-  // else follows the dsh default model. Both the master switch and the
-  // extraction switch are read per call, so the panel's toggles apply
-  // immediately in either direction.
+  // else follows the dsh default model. The extraction switch is read per call,
+  // so the panel's toggle applies immediately in either direction. Enabling and
+  // disabling the whole plugin is dsh's own plugin switch, not a memory-side one.
   const llmEnabled = () =>
-    runtime.isEnabled() && runtime.get().llmExtractionEnabled !== false
+    runtime.get().llmExtractionEnabled !== false
   const extract: ExtractFn | undefined = buildLlmExtractor(ctx, {
     maxTokens: config.extractionMaxTokens ?? 2048,
     modelOverride: () => runtime.get().extractionModel,
@@ -334,32 +331,28 @@ export function apply(ctx: Context, config: ConfigShape): void {
   // "turn memory into structured entries" job at a different granularity, and
   // making the user configure a second model for it would be a second thing to
   // get wrong. Unlike extraction this is user-triggered, so it is not gated on
-  // `llmExtractionEnabled` (which governs the automatic capture path): the
-  // master switch still applies.
+  // `llmExtractionEnabled` (which governs the automatic capture path).
   const synthesizeProfile = buildLlmCompleter(ctx, {
     maxTokens: config.extractionMaxTokens ?? 2048,
     modelOverride: () => runtime.get().extractionModel,
-    enabled: () => runtime.isEnabled(),
     label: 'profile synthesis',
   })
 
   // Work-overview synthesis runs out of band: it is triggered by a write and
   // executes after a quiet window, never while a prompt is being frozen. It
   // shares the extraction model for the same reason profile synthesis does —
-  // it is the same "turn memory into prose" job — and is likewise governed by
-  // the master switch rather than `llmExtractionEnabled`, which is about
-  // automatic capture.
+  // it is the same "turn memory into prose" job — and is likewise not gated on
+  // `llmExtractionEnabled`, which is about automatic capture.
   const synthesizeOverview = buildLlmCompleter(ctx, {
     maxTokens: OVERVIEW_COMPLETION_TOKENS,
     modelOverride: () => runtime.get().extractionModel,
-    enabled: () => runtime.isEnabled(),
     label: 'overview synthesis',
   })
   const overview = createOverviewRefresher({
     bridge,
     completer: () => synthesizeOverview,
     userScope: FALLBACK_SCOPE,
-    enabled: () => runtime.isEnabled() && runtime.get().overviewEnabled,
+    enabled: () => runtime.get().overviewEnabled,
     isReady: () => state.value,
     idleMs: (config.overviewIdleSeconds ?? 90) * 1000,
     minIntervalMs: (config.overviewRefreshMinutes ?? 15) * 60_000,
@@ -412,7 +405,6 @@ export function apply(ctx: Context, config: ConfigShape): void {
   // the rescue sweeps pass none and the write falls back to the plugin's own
   // directory.
   const capture = createCapture({
-    isEnabled: () => runtime.isEnabled(),
     isReady: () => state.value,
     extract,
     call: (method, params) => bridge.call(method, params),
@@ -425,9 +417,9 @@ export function apply(ctx: Context, config: ConfigShape): void {
   // handle: "what the model is currently being told" has to be the same cache
   // the prompt is served from, or the audit view is a re-render that can drift.
   //
-  // `isEnabled` is the master switch: when off, the awareness section resolves
-  // to empty (so no "You have persistent long-term memory…" text reaches the
-  // system prompt) and snapshot injection stops entirely.
+  // `snapshotEnabled` and the injection budget are read when they are used: the
+  // awareness section always ships (the plugin exists only while dsh has it
+  // enabled) and snapshot injection follows the panel's own switch.
   //
   // The injected snapshot uses its own (smaller) budget and the compact render
   // depth: it is paid for on every request and is the view that must stay short
@@ -446,7 +438,6 @@ export function apply(ctx: Context, config: ConfigShape): void {
     // Read per assembly: turning injection off must stop paying for it now, and
     // turning it back on must work without a restart.
     snapshotEnabled: () => runtime.get().contextInjectionEnabled,
-    isEnabled: () => runtime.isEnabled(),
     scopeContext: scopeContextOf,
   })
 
@@ -462,7 +453,6 @@ export function apply(ctx: Context, config: ConfigShape): void {
     maxRecalledFacts: config.maxRecalledFacts ?? 10,
     summaryTokens: config.summaryTokens ?? 1500,
     extract,
-    isEnabled: () => runtime.isEnabled(),
     resolveSummaryBudget: () =>
       clampInjectedSummaryTokens(runtime.get().injectedSummaryTokens),
     writeAckTimeoutMs: config.writeAckTimeoutMs ?? 0,
@@ -496,8 +486,11 @@ export function apply(ctx: Context, config: ConfigShape): void {
   ).forEach((d) => ctx.effect(() => d))
 
   // Settings namespace: the composition entry seeds the runtime; a settings
-  // write replaces it live. This powers the memory master switch (feature 1)
-  // and the LLM extraction model override (feature 2) without a restart.
+  // write replaces it live. This powers the injected-summary budget, the LLM
+  // extraction model override and the per-feature switches without a restart.
+  // There is deliberately no "memory master switch" here: enabling or disabling
+  // the plugin itself is dsh's own plugin switch, and a second one in this
+  // namespace would be two answers to the same question.
   //
   // Registration runs on `inject(['settings'], …)` rather than a synchronous
   // `ctx.get('settings')`: `get` returns `undefined` while the settings provider's
@@ -533,7 +526,7 @@ export function apply(ctx: Context, config: ConfigShape): void {
   runtime.subscribe(() => {
     const live = runtime.get()
     ctx.logger(
-      `[atom-memory] live switches: enabled=${live.enabled} capture=${live.captureEnabled} `
+      `[atom-memory] live switches: capture=${live.captureEnabled} `
       + `llm=${live.llmExtractionEnabled} inject=${live.contextInjectionEnabled} `
       + `budget=${live.injectedSummaryTokens}`,
     )
@@ -545,9 +538,13 @@ export function apply(ctx: Context, config: ConfigShape): void {
 /**
  * Schemastery schema for the live settings namespace. This mirrors only the
  * runtime-toggleable fields so a settings write maps 1:1 onto the Runtime.
+ *
+ * A settings document written by an older version may still carry a `memory
+ * master switch` key; it is simply not declared here any more and is ignored on
+ * read, so such a deployment keeps memory enabled rather than being silently
+ * half-disabled.
  */
 const LiveSettingsSchema: z<LiveRuntime> = z.object({
-  enabled: z.boolean().default(true),
   captureEnabled: z.boolean().default(true),
   llmExtractionEnabled: z.boolean().default(true),
   contextInjectionEnabled: z.boolean().default(true),

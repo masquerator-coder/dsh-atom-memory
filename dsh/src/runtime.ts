@@ -30,8 +30,6 @@ export interface ExtractionModelOverride {
 
 /** The live fields the settings panel can toggle at runtime. */
 export interface LiveRuntime {
-  /** Master switch: when false the plugin is inert (no writes, no context, no tools). */
-  enabled: boolean
   /** Whether per-message / rescue / nudge capture runs. */
   captureEnabled: boolean
   /** Whether the LLM-first extractor is used (rule fallback stays). */
@@ -69,7 +67,6 @@ export interface LiveRuntimeSeed extends Partial<Omit<LiveRuntime, 'extractionMo
 /** Resolve a seed into a complete runtime value (defaults applied, budget clamped). */
 export function createRuntime(seed: LiveRuntimeSeed): LiveRuntime {
   return {
-    enabled: seed.enabled ?? true,
     captureEnabled: seed.captureEnabled ?? true,
     llmExtractionEnabled: seed.llmExtractionEnabled ?? true,
     contextInjectionEnabled: seed.contextInjectionEnabled ?? true,
@@ -93,15 +90,9 @@ export class Runtime {
     return { ...this.value }
   }
 
-  /** Whether the plugin master switch is on. */
-  isEnabled(): boolean {
-    return this.value.enabled
-  }
-
   /** Replace the whole live runtime (from a settings write). */
   set(next: LiveRuntime): void {
     const changed =
-      this.value.enabled !== next.enabled ||
       this.value.captureEnabled !== next.captureEnabled ||
       this.value.llmExtractionEnabled !== next.llmExtractionEnabled ||
       this.value.contextInjectionEnabled !== next.contextInjectionEnabled ||

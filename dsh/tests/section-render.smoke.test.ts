@@ -4,7 +4,7 @@
  * Rebuilds the exact props the ui-renderer hands a registered section:
  *   - `t` locale seat
  *   - `useMemorySettings` selector hook bound over the controller store
- *   - top-level action props (setEnabled / refreshData / etc.)
+ *   - top-level action props (setInjectedSummaryTokens / refreshData / etc.)
  * and renders to a string with react-dom/server to surface any render-time
  * crash that SlotErrorBoundary would otherwise swallow into a blank panel.
  */

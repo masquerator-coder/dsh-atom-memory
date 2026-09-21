@@ -22,10 +22,10 @@ function fakeBridge(result: unknown = '', alive = true) {
   return { bridge, call }
 }
 
-/** Build a controller with a live bridge and an enabled runtime. */
-function makeController(options: { result?: unknown; alive?: boolean; enabled?: boolean } = {}) {
+/** Build a controller with a live bridge. */
+function makeController(options: { result?: unknown; alive?: boolean } = {}) {
   const { bridge, call } = fakeBridge(options.result ?? '', options.alive ?? true)
-  const runtime = new Runtime(createRuntime({ enabled: options.enabled ?? true }))
+  const runtime = new Runtime(createRuntime({}))
   const controller = new AtomMemoryController(new Context(), bridge, runtime)
   return { controller, call }
 }
@@ -68,12 +68,6 @@ describe('AtomMemoryController.summary', () => {
   it('refuses to render while the bridge is down', async () => {
     const { controller, call } = makeController({ alive: false })
     await expect(controller.summary({ user: 'global' })).rejects.toThrow('bridge is not running')
-    expect(call).not.toHaveBeenCalled()
-  })
-
-  it('refuses to render while the plugin master switch is off', async () => {
-    const { controller, call } = makeController({ enabled: false })
-    await expect(controller.summary({ user: 'global' })).rejects.toThrow('memory is disabled')
     expect(call).not.toHaveBeenCalled()
   })
 })

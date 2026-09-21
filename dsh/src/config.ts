@@ -15,8 +15,6 @@ export interface Config {
   pythonBin?: string
   /** Auto-start the bridge on plugin load (deployment-time switch). */
   autostart?: boolean
-  /** Master memory switch: when false the plugin is inert (no capture/context/tools). */
-  enabled?: boolean
   /** Manual LLM extraction model override; omit or leave provider empty to follow dsh default. */
   extractionModel?: {
     provider?: string
@@ -211,7 +209,6 @@ export const Config: z<Config> = z.object({
   dbPath: z.string().default('~/.dsh/atom-memory/memory.db'),
   pythonBin: z.string().default(''),
   autostart: z.boolean().default(true),
-  enabled: z.boolean().default(true),
   extractionModel: z.object({
     provider: z.string().default(''),
     model: z.string().default(''),

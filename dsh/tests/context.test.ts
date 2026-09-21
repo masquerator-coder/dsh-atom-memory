@@ -48,39 +48,23 @@ describe('registerMemoryContext', () => {
     expect(sections.map(s => s.name)).toEqual(['atom-memory-awareness'])
   })
 
-  it('drops the awareness text from the system prompt when the master switch is off', () => {
-    const { ctx, sections } = makeCtx()
-    const isEnabled = vi.fn(() => false)
-    registerMemoryContext({
-      ctx, bridge: { call: vi.fn() } as any,
-      userScope: 'global', resolveMaxTokens: () => 1500, snapshotEnabled: () => true,
-      isEnabled,
-    })
-    const awareness = sections.find(s => s.name === 'atom-memory-awareness')!
-    const text = (awareness.text as (c: unknown) => string)({} as any)
-    expect(text).toBe('')
-    expect(isEnabled).toHaveBeenCalled()
-  })
-
-  it('keeps the awareness text when the master switch is on (or unset)', () => {
+  it('always ships the awareness text: the plugin is loaded, so the capability exists', () => {
     const { ctx, sections } = makeCtx()
     registerMemoryContext({
       ctx, bridge: { call: vi.fn() } as any,
       userScope: 'global', resolveMaxTokens: () => 1500, snapshotEnabled: () => true,
-      isEnabled: () => true,
     })
     const awareness = sections.find(s => s.name === 'atom-memory-awareness')!
     const text = (awareness.text as (c: unknown) => string)({} as any)
     expect(text).toContain('You have persistent long-term memory')
   })
 
-  it('injects no memory into the assembly when the master switch is off', async () => {
+  it('injects no memory into the assembly when snapshot injection is off', async () => {
     const bridge = { call: vi.fn(async () => '# Memory\n- fact') }
     const { ctx, handlers } = makeCtx()
     registerMemoryContext({
       ctx, bridge: bridge as any,
-      userScope: 'global', resolveMaxTokens: () => 1500, snapshotEnabled: () => true,
-      isEnabled: () => false,
+      userScope: 'global', resolveMaxTokens: () => 1500, snapshotEnabled: () => false,
     })
     const handler = assembleHandler(handlers)
     const result = await handler(assembly(), agentCtx('s1'), next(assembly()))

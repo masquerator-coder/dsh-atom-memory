@@ -202,29 +202,16 @@ describe('MemorySettingsSection client render', () => {
     expect(screen.queryByText(LOCALE_NS + ':title')).toBeNull()
   })
 
-  it('renders the master switch as a sliding toggle driven by the settings value', async () => {
+  it('renders no memory master switch: enabling the plugin is dsh\'s own switch', async () => {
     const controller = buildController()
     const { props } = bind(controller)
-    const enabledWrites: boolean[] = []
-    const real = props.setEnabled as (v: boolean) => Promise<void>
-    props.setEnabled = (async (v: boolean) => { enabledWrites.push(v); await real(v) }) as never
     await act(async () => {
       render(createElement(MemorySettingsSection, props))
     })
-
-    const block = screen.getByText('记忆开关').closest('fieldset')!
-    const row = within(block).getByRole('checkbox') as HTMLInputElement
-    // The native checkbox stays the state/accessibility root of the toggle.
-    expect(row.className).toBe('atom-memory-switch-input')
-    expect(row.checked).toBe(true) // buildController seeds enabled: true
-    // It is visually replaced by a track + thumb, not a bare checkbox.
-    expect(block.querySelector('.atom-memory-switch-track')).toBeTruthy()
-    expect(block.querySelector('.atom-memory-switch-thumb')).toBeTruthy()
-
-    await act(async () => {
-      fireEvent.click(row)
-    })
-    expect(enabledWrites).toEqual([false])
+    // The panel keeps its own live switches (injection budget, overview), but
+    // there is no second, memory-side answer to "is this plugin enabled".
+    expect(screen.queryByText('记忆开关')).toBeNull()
+    expect((props as Record<string, unknown>).setEnabled).toBeUndefined()
   })
 
   it('opens the memory summary in a read-only modal', async () => {

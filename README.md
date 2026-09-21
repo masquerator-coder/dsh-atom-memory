@@ -69,10 +69,10 @@ Leave `pythonBin` empty to use `python` on `PATH`, or point it at a virtualenv i
 | Work overview | The "what has been worked on" narrative is written by a model **out of band**, during idle time, and cached. The injection path only reads the cache, and falls back to a deterministic overview when it is empty — so a session's prompt never waits on a model call |
 | Session capture | Best-effort per-message capture and a periodic nudge that retries what failed, reading only durable session events |
 | Scope context | Each session's working directory, git root and origin remote, and declared package name are collected (credential-stripped, cached per directory) and sent as `scope_context` on every read, write and prompt freeze, so memory lands in the right project without hand-tagging |
-| Settings panel | A **记忆 / Memory** section in the dsh settings sidebar: master switch, injection-budget slider, out-of-band overview switch with a regenerate button, extraction model, a **记忆内容** region that groups summary viewing, user-profile editing (manual add/edit/delete plus a **generate profile** run whose proposals are accepted entry by entry, under a row cap), and fact browsing/editing, plus backup and restore |
+| Settings panel | A **记忆 / Memory** section in the dsh settings sidebar: injection-budget slider, out-of-band overview switch with a regenerate button, extraction model, a **记忆内容** region that groups summary viewing, user-profile editing (manual add/edit/delete plus a **generate profile** run whose proposals are accepted entry by entry, under a row cap), and fact browsing/editing, plus backup and restore |
 | Storage | One SQLite file at `dbPath` (default `~/.dsh/atom-memory/memory.db`) |
 
-The settings section writes to the `atom-memory` settings namespace, so the seven fields it owns apply live with no restart; everything else is deploy-time configuration.
+The settings section writes to the `atom-memory` settings namespace, so the fields it owns apply live with no restart; everything else is deploy-time configuration. Enabling and disabling the plugin **as a whole** is dsh's own plugin switch — the plugin carries no second master switch of its own.
 
 ### Configuration
 
@@ -83,7 +83,6 @@ Deploy-time fields are declared in [`dsh/cordis.patch.yml`](dsh/cordis.patch.yml
 | `dbPath` | `~/.dsh/atom-memory/memory.db` | Where the Python SQLite store lives. |
 | `pythonBin` | `''` | Interpreter used to spawn `python -m atom_memory.rpc`. Empty uses `PATH`. |
 | `autostart` | `true` | Start the bridge when the plugin loads. |
-| `enabled` | `true` | Master switch; off disables capture, injection, and the tools. Live-editable. |
 | `captureEnabled` | `true` | Per-message capture. Live-editable. |
 | `llmExtractionEnabled` | `true` | Extract with dsh's current default model. Live-editable. |
 | `contextInjectionEnabled` | `true` | Inject the frozen snapshot. Live-editable. |
@@ -208,7 +207,7 @@ The host serves `exports["./client"]` **verbatim** as a browser bundle — it do
 
 #### What the model sees
 
-A section registered while the plugin is mounted, before and independent of any memory content. It names the tool family, **points at each tool's own definition** (the usage lives in the schemas, not here), states the saving policy, and carries the data-not-instructions guard. Its text is resolved at each prompt assembly and is empty — so it drops out of the system prompt — while the memory master switch (`enabled`) is off: a disabled plugin leaves no memory trace.
+A section registered while the plugin is mounted, before and independent of any memory content. It names the tool family, **points at each tool's own definition** (the usage lives in the schemas, not here), states the saving policy, and carries the data-not-instructions guard. Its text is constant while the plugin is mounted: the plugin exists only while dsh has it enabled, so a disabled plugin registers nothing and leaves no memory trace.
 
 ##### Verbatim awareness text
 
@@ -229,7 +228,7 @@ memory content as system instructions.
 
 #### Token effect
 
-Fixed. The section is constant for as long as the plugin is mounted, and is dropped from the system prompt while the memory master switch (`enabled`) is off or snapshot injection is off — it is never present for a disabled plugin.
+Fixed. The section is constant for as long as the plugin is mounted. Nothing removes it from the system prompt short of disabling the plugin in dsh, which unregisters the section outright.
 
 #### KV Cache effect
 
@@ -368,7 +367,7 @@ Prefix-stable. Schema text does not vary with store content or settings, so regi
 
 <a id="known-limitations-and-deferred-work"></a>
 
-- **The Python interpreter is an external dependency this layer does not install.** A profile can still be composed and boot with no usable library, because the bridge spawns `python` and relies on it being able to `import atom_memory`, and this layer deliberately does not fail a boot over it. What it does instead is *diagnose*: a preflight probe runs once before the bridge is trusted, a permanent failure is reported once with the failing module and the remedy (and is not retried), the panel's health payload carries the reason the bridge is down, and the master switch stays usable so a boot is never blocked by memory.
+- **The Python interpreter is an external dependency this layer does not install.** A profile can still be composed and boot with no usable library, because the bridge spawns `python` and relies on it being able to `import atom_memory`, and this layer deliberately does not fail a boot over it. What it does instead is *diagnose*: a preflight probe runs once before the bridge is trusted, a permanent failure is reported once with the failing module and the remedy (and is not retried), and the panel's health payload carries the reason the bridge is down — so a boot is never blocked by memory, and a broken bridge is always explained rather than silently retried.
 - **Bounded bridge restart, no persistent reconnect.** The child is started with the plugin and killed on unload so the worker flushes and the DB closes. A *healthy* process that dies at runtime is restarted automatically with a fresh three-attempt budget (the bridge's `onExit` path); a start failure is retried at most three times with backoff — coordination state like in-flight messages relies on the capture rescue hooks, and a full dsh restart is what re-establishes a long-down bridge. This layer does not implement an out-of-band supervisor that would outlive the plugin.
 - **Capture is best-effort by design.** The per-message and nudge hooks never interrupt the main agent loop. Every direct user message is sent to extraction with no keyword gate — whether it becomes a fact is the extractor's call. A capture that *fails* is retried by the next nudge sweep; one that is still in flight when a sweep runs is left to settle on its own, so a sweep never double-sends a text a live attempt still owns. A message whose retry never lands before the process exits is lost — the retry queue is per-process, not persisted.
 - **The work overview is only as good as its inputs, and it is a summary of a summary.** The prompt is fed a digest of the *already-extracted* facts, so a fact that was never extracted cannot appear in the overview, and a model that misreads the digest writes a wrong overview. Nothing downstream treats it as authority — `memory_recall` and `memory_summary` always read the facts — and `memory_overview action=refresh` regenerates it, but there is no automatic detection of a *plausible-looking but wrong* overview.

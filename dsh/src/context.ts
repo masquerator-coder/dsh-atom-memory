@@ -5,9 +5,9 @@
  *
  *  1. **Awareness section** — a capability description telling the model it has
  *     persistent memory and which tools save/recall it. Never a
- *     personality/role. Its text is a *dynamic* provider that resolves to empty
- *     while the master switch is off, so a disabled plugin leaves no memory
- *     trace in the system prompt.
+ *     personality/role. It is present for exactly as long as the plugin is
+ *     mounted: whether the plugin runs at all is dsh's own plugin switch, not a
+ *     memory-side one.
  *  2. **Frozen memory snapshot** — at the first prompt assembly of a session the
  *     current `summary` is read once from the Python store and injected as a
  *     section, wrapped by {@link renderMemoryDataBlock} so the content is
@@ -29,11 +29,10 @@
  * frozen for good.
  *
  * Every switch this module consults is read **at the moment it is used**, not
- * captured at registration: `snapshotEnabled` and the master switch are called
- * on each assembly and the budget at each freeze. A settings change therefore
- * takes effect immediately in the direction it was flipped (an already-frozen
- * session keeps its byte-identical text either way, which is what protects the
- * prefix).
+ * captured at registration: `snapshotEnabled` is called on each assembly and the
+ * budget at each freeze. A settings change therefore takes effect immediately in
+ * the direction it was flipped (an already-frozen session keeps its
+ * byte-identical text either way, which is what protects the prefix).
  *
  * @module dsh-atom-memory/context
  */
@@ -87,12 +86,8 @@ export interface MemoryContextDeps {
    */
   snapshotEnabled: () => boolean
   /**
-   * Master-switch gate: when it returns false neither the awareness text nor the
-   * snapshot is surfaced to the model — the awareness section resolves to empty
-   * (and is dropped at render) and the snapshot hook stops injecting.
+   * Max sessions whose frozen snapshot is retained (oldest evicted first).
    */
-  isEnabled?: () => boolean
-  /** Max sessions whose frozen snapshot is retained (oldest evicted first). */
   maxFrozenSessions?: number
   /**
    * Build the `scope_context` payload for the session being frozen.
@@ -137,15 +132,12 @@ export interface FrozenSnapshotHandle {
 export function registerMemoryContext(deps: MemoryContextDeps): FrozenSnapshotHandle {
   const { ctx, bridge, userScope } = deps
 
-  // The awareness section is *dynamic*: its text is resolved at each assembly
-  // and returns empty while the master switch is off, so `renderPrompt` drops
-  // it. Without this, a disabled plugin would still leak "You have persistent
-  // long-term memory…" into the system prompt even though it refuses all
-  // memory writes and reads.
+  // The awareness section names the tool family and its saving policy. It is
+  // registered unconditionally: the plugin is loaded, so the capability exists.
   ctx.systemPrompt.section({
     name: AWARENESS_SECTION,
     order: ctx.systemPrompt.getSectionOrder('TOOL_SESSION_QUERY'),
-    text: () => (deps.isEnabled?.() === false ? '' : AWARENESS_TEXT),
+    text: () => AWARENESS_TEXT,
   })
 
   const maxFrozen = deps.maxFrozenSessions ?? 200
@@ -235,10 +227,9 @@ export function registerMemoryContext(deps: MemoryContextDeps): FrozenSnapshotHa
     next: () => Promise<PromptAssembly>,
   ): Promise<PromptAssembly> => {
     const assembly = await next()
-    // Master switch off, or injection switched off: do not surface memory to the
-    // model at all. Both are read now, so flipping either one takes effect on
-    // the next assembly instead of the next restart.
-    if (deps.isEnabled?.() === false) return assembly
+    // Injection switched off: do not surface memory to the model at all. Read
+    // now, so flipping the switch takes effect on the next assembly instead of
+    // the next restart.
     if (deps.snapshotEnabled() === false) return assembly
     const agent = context.agent as { session?: { id?: string } } | undefined
     const sessionId = agent?.session?.id
@@ -257,7 +248,7 @@ export function registerMemoryContext(deps: MemoryContextDeps): FrozenSnapshotHa
     ensure: async (sessionId: string) => {
       // `snapshotFor` is the single freeze path, so asking here and reading
       // during assembly can never produce different text.
-      if (deps.snapshotEnabled() === false || deps.isEnabled?.() === false) {
+      if (deps.snapshotEnabled() === false) {
         return ''
       }
       // No assembly context here, so no session header: the builder falls back

@@ -2,6 +2,48 @@
 
 ## [Unreleased]
 
+### Removed (第二十四轮：取消「记忆总开关」，启停交给 dsh 的插件开关)
+
+**问题**：插件自带一个贯穿全局的 `enabled` 总开关——配置项、运行时字段、设置面板
+滑动开关、以及散落在工具/上下文/捕获/总览/LLM 五处的 `isEnabled` 闸门。但 dsh 本身
+已经集成了插件启用/禁用能力，于是同一个问题有了两个答案，且两者语义**并不等价**：
+
+- dsh 禁用插件 = 卸载。钩子注销、工具不再出现在工具清单里、意识段从系统提示词中消失。
+- 本插件的总开关 = 仍然挂载、工具仍在清单里，只是每次调用都抛 `memory is disabled`；
+  意识段虽置空但 `systemPrompt.section()` 仍注册着。
+
+留着这个开关的代价是实打实的：模型会看到一个"存在但永远报错"的工具族；两条启停路径
+需要各自保证"每处调用点都读了它"（这正是本轮要删的 12 处闸门 + 2 处渲染闸门）；而且
+它还是 review 记录里 F04「声明为活开关、实际失效」那类问题的温床。
+
+**改法**：彻底移除，不做保留。
+
+- `config.ts` / `runtime.ts`：删 `Config.enabled`、`LiveRuntime.enabled`、`createRuntime`
+  的默认值、`Runtime.isEnabled()`，以及 `set()` 变更比对里的那一项。
+- `index.ts`：删 `seedRuntime` 的播种、`CaptureWiring.isEnabled` 与其在 `createCapture`
+  的提前返回、`onExit` 重启条件里的 `runtime.isEnabled()`、LLM 抽取/画像合成/总览合成
+  三处 `enabled` 回调（后两者直接去掉，前者收紧为只读 `llmExtractionEnabled`）、
+  `registerMemoryContext` 与 `registerMemoryTools` 的 `isEnabled` 注入、
+  `LiveSettingsSchema.enabled`，以及审计日志里的 `enabled=` 字段。
+- `tools.ts`：删 `ToolDeps.isEnabled`、`disabledError()` 与 **12 处**
+  `if (deps.isEnabled?.() === false) throw disabledError()`。
+- `context.ts`：删 `MemoryContextDeps.isEnabled`；意识段由「每次装配解析、开关关时为
+  空」改为常量 `text: () => AWARENESS_TEXT`（仍然带 `isEnabled` 时的那份文本，逐字节
+  不变），装配与 `ensure()` 里的两道闸门收敛为 `snapshotEnabled` 一道。
+- `controller.ts`：`assertReady()` 不再检查开关，`health()` 不再返回 `enabled`。
+- `client/`：删面板的「记忆开关」fieldset、`MemorySettingsFace.setEnabled`、
+  `MemorySettingsSection.enabled`、`setEnabled` 走线，以及中英文 `masterHeader`/
+  `masterDesc` 两条文案；`intro` 与 `overviewOutcomeSkipped` 里"或记忆功能已关闭"
+  这类已经没有指代对象的措辞一并改掉。
+
+**兼容**：设置文档里残留的 `enabled` 键不再被 schema 声明，读取时静默忽略——插件保持
+启用，而不是被一个已经无人读取的字段**静默半禁用**。
+
+**测试**：删掉 8 个专测总开关的用例，把依赖它构造的辅助函数改掉，并新增两例护栏：
+`context.test.ts` 断言意识段始终为常量且带原文，`section-render.client.test.ts` 断言面板
+不再渲染「记忆开关」且 face 上不存在 `setEnabled`——防止它日后被顺手加回来。
+（308 passed。）
+
 ### Changed (第二十三轮：`memory_summary` 合并两个深度；`memory_recall` 的截断提示补全调用形)
 
 **问题**：`memory_summary` 与 `memory_summary_detail` 是同一个 Python RPC 方法（`summary`）

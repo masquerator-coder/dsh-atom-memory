@@ -104,9 +104,8 @@ export class AtomMemoryController extends TypertRemoteService {
     super(ctx, 'atomMemoryController', { namespace: 'atomMemory' })
   }
 
-  /** Whether the bridge is alive and the plugin master switch is on. */
+  /** Whether the bridge is alive and therefore able to serve a call. */
   private assertReady(): void {
-    if (!this.runtime.isEnabled()) throw new Error('memory is disabled')
     if (!this.bridge.alive) {
       const reason = this.startupError()
       throw new Error(
@@ -129,7 +128,6 @@ export class AtomMemoryController extends TypertRemoteService {
     const startupError = this.startupError()
     const payload = await this.bridge.healthDetail()
     return {
-      enabled: this.runtime.isEnabled(),
       bridgeAlive: this.bridge.alive,
       startupError: startupError ?? null,
       startup: payload ?? null,
@@ -385,7 +383,7 @@ export class AtomMemoryController extends TypertRemoteService {
     }) as Promise<Record<string, unknown>>
   }
 
-  /** Read the current live runtime (enabled / capture / model override). */
+  /** Read the current live runtime (capture / injection switches, model override). */
   @Remote
   async getRuntime(): Promise<LiveRuntime> {
     return this.runtime.get()

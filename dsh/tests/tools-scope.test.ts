@@ -19,7 +19,6 @@ interface SetupOptions {
   extract?: (text: string) => Promise<unknown[]>
   /** The payload builder call sites get; absent means a scope-blind deployment. */
   scopeContext?: (source?: SessionCwdSource) => ScopeContextPayload | undefined
-  isEnabled?: () => boolean
 }
 
 function setup(opts: SetupOptions = {}) {
@@ -35,7 +34,6 @@ function setup(opts: SetupOptions = {}) {
     writeAckTimeoutMs: 2500,
     extract: opts.extract as any,
     scopeContext: opts.scopeContext,
-    isEnabled: opts.isEnabled,
   })
   const tool = (name: string) => registered.find(d => d.name === name)!
   const render = (name: string, value: unknown, args: unknown = {}): string => {
@@ -159,12 +157,10 @@ describe('the automatic capture path carries the same context', () => {
     extract?: (text: string) => Promise<unknown[]>
     scopeContextAt?: (cwd?: string) => ScopeContextPayload | undefined
     ready?: boolean
-    enabled?: boolean
   } = {}) => {
     const call = vi.fn(async () => ({}))
     const scopeContextAt = vi.fn(opts.scopeContextAt ?? (() => PAYLOAD))
     const capture = createCapture({
-      isEnabled: () => opts.enabled !== false,
       isReady: () => opts.ready !== false,
       extract: opts.extract as any,
       call,
@@ -203,13 +199,6 @@ describe('the automatic capture path carries the same context', () => {
     })
     await capture('随便说的', 's1')
     expect('scope_context' in lastParams()).toBe(false)
-  })
-
-  it('does not build a context, or call anything, while the memory switch is off', async () => {
-    const { capture, call, scopeContextAt } = wiring({ enabled: false })
-    await capture('随便说的', 's1', '/repo')
-    expect(call).not.toHaveBeenCalled()
-    expect(scopeContextAt).not.toHaveBeenCalled()
   })
 
   it('does not call the bridge while it is down', async () => {
@@ -389,13 +378,6 @@ describe('memory_scope: argument validation', () => {
       expect(bridge.call).not.toHaveBeenCalled()
     })
   }
-
-  it('refuses every action while the memory master switch is off', async () => {
-    const { bridge, tool } = setup({ isEnabled: () => false })
-    await expect(tool('memory_scope').execute({ action: 'list' }, execWithSession()))
-      .rejects.toThrow(/disabled/)
-    expect(bridge.call).not.toHaveBeenCalled()
-  })
 })
 
 describe('memory_scope: render fallbacks', () => {
