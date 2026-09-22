@@ -3,14 +3,21 @@
  * operations onto a reactive snapshot for the settings panel.
  *
  * The injected-summary budget and the extraction model ride the settings
- * document; features 3-5 (profile, facts editing, backup/restore) ride the
- * Remote gateway (`ctx.remote.atomMemory`). The controller owns no model-visible
- * state — it only stages the panel's drafts and forwards writes.
+ * document through the `atom-memory` **ConfigForm** the ui-settings provider owns
+ * (`ctx.configForms.get(NAMESPACE)`); features 3-5 (profile, facts editing,
+ * backup/restore) ride the Remote gateway (`ctx.remote.atomMemory`). The
+ * controller owns no model-visible state — it only stages the panel's drafts and
+ * forwards writes.
+ *
+ * HISTORY: the settings side used to be a `SettingsScope` obtained from the
+ * deleted client `settingsScope` service. `ConfigForm` exposes the same
+ * `getSnapshot` / `subscribe` / `set` trio for the same `{ status, value, ... }`
+ * snapshot shape, so only the parameter type changed here.
  *
  * @module dsh-atom-memory/client/memory-settings-controller
  */
 
-import type { SettingsScope, SettingsScopeSnapshot } from '@deepseek-ai/dsh-client-ui-settings/client'
+import type { ConfigForm, ConfigFormSnapshot } from '@deepseek-ai/dsh-client-ui-settings/client'
 import { createSnapshotStore, type SnapshotStore } from '@deepseek-ai/dsh-client-store'
 import {
   DEFAULT_INJECTED_SUMMARY_TOKENS,
@@ -89,10 +96,16 @@ export interface MemorySettingsFace {
    *
    * Clamped by the caller (`clampInjectedSummaryTokens`) before it gets here so the
    * panel and the Host agree on the bounds; the Host clamps again on the way in.
+   *
+   * `ConfigForm.set` resolves whether the Host ACCEPTED the write (`false` for a
+   * refusal or a memory-mode skip), whereas the old `SettingsScope.set` resolved
+   * `void`. The panel treats a settings write as fire-and-forget — the mirror
+   * publishes the real state either way — so the boolean is surfaced rather than
+   * dropped, and callers are free to ignore it.
    */
-  setInjectedSummaryTokens: (tokens: number) => Promise<void>
+  setInjectedSummaryTokens: (tokens: number) => Promise<boolean>
   /** Turn the out-of-band work-overview synthesis on or off. */
-  setOverviewEnabled: (enabled: boolean) => Promise<void>
+  setOverviewEnabled: (enabled: boolean) => Promise<boolean>
   /**
    * Ask the store to regenerate the work overview now.
    *
@@ -102,9 +115,9 @@ export interface MemorySettingsFace {
    * wording and the host owns the vocabulary.
    */
   refreshOverview: () => Promise<string>
-  setExtractionModel: (provider: string, model: string) => Promise<void>
+  setExtractionModel: (provider: string, model: string) => Promise<boolean>
   /** Write the whole extraction-model override (provider/model/baseURL/protocol/apiKey). */
-  setExtractionModelOverride: (override: NonNullable<MemorySettingsSection['extractionModel']>) => Promise<void>
+  setExtractionModelOverride: (override: NonNullable<MemorySettingsSection['extractionModel']>) => Promise<boolean>
   refreshData: () => Promise<void>
   saveFact: (fact: MemoryData['facts'][number]) => Promise<void>
   deleteFact: (factId: string) => Promise<void>
@@ -234,7 +247,7 @@ export class MemorySettingsController {
   private readonly unsubscribe: () => void
 
   constructor(
-    private readonly scope: SettingsScope<MemorySettingsSection>,
+    private readonly scope: ConfigForm<MemorySettingsSection>,
     private readonly remote: unknown,
   ) {
     this.unsubscribe = scope.subscribe(() => this.publish())

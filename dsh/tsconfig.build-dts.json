@@ -1,0 +1,12 @@
+{
+  "//": "Declaration-only emit for the node half (lib/index.d.mts). Extends the typecheck project, which sets noEmit, so emission is enabled here instead. Used by scripts/build-rolldown.mjs when tsdown's own dts pass cannot run.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "rootDir": "src"
+  },
+  "include": ["src"],
+  "exclude": ["src/client"]
+}

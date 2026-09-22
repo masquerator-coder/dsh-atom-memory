@@ -30,6 +30,9 @@ function selectorHook<T>(store: { getSnapshot(): T; subscribe(fn: () => void): (
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function buildProps(): Record<string, any> {
+  // A `ConfigForm` stub (the service DSH 0.1.7-alpha.1 replaced the deleted
+  // client `settingsScope` with). Its writes resolve `boolean` — whether the
+  // Host accepted — where the old scope resolved `void`.
   const scope = {
     getSnapshot: () => ({
       status: 'ready' as const,
@@ -41,7 +44,7 @@ function buildProps(): Record<string, any> {
       base: undefined, user: undefined, revision: 1, writable: true, mode: 'host' as const,
     }),
     subscribe: () => () => {},
-    set: async () => {}, unset: async () => {}, mutate: async () => {},
+    set: async () => true, unset: async () => true, mutate: async () => true,
   }
   const remote = {
     listFacts: async () => ({ ok: true, value: { facts: [], total: 0 } }),

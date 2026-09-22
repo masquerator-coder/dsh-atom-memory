@@ -2,11 +2,14 @@
  * Unit tests for the browser settings controller (`src/client/`).
  *
  * The controller is plain TS (no DOM), so it runs in the node vitest env. It
- * bridges the `atom-memory` settings scope (features 1 & 2) and the Remote
+ * bridges the `atom-memory` settings ConfigForm (features 1 & 2) and the Remote
  * operations (features 3-5) onto a snapshot store for the settings panel.
+ *
+ * The stub below is a `ConfigForm`, the service DSH 0.1.7-alpha.1 replaced the
+ * deleted client `settingsScope` with; only the method names changed.
  */
 import { describe, expect, it, vi } from 'vitest'
-import type { SettingsScope, SettingsScopeSnapshot } from '@deepseek-ai/dsh-client-ui-settings/client'
+import type { ConfigForm, ConfigFormSnapshot } from '@deepseek-ai/dsh-client-ui-settings/client'
 import {
   MemorySettingsController,
   type MemorySettingsSection,
@@ -17,7 +20,7 @@ import {
   MIN_INJECTED_SUMMARY_TOKENS,
 } from '../src/injection-budget.ts'
 
-function snapshot(over: Partial<SettingsScopeSnapshot<MemorySettingsSection>>): SettingsScopeSnapshot<MemorySettingsSection> {
+function snapshot(over: Partial<ConfigFormSnapshot<MemorySettingsSection>>): ConfigFormSnapshot<MemorySettingsSection> {
   return {
     status: 'ready',
     value: {
@@ -38,13 +41,13 @@ function snapshot(over: Partial<SettingsScopeSnapshot<MemorySettingsSection>>): 
   }
 }
 
-function fakeScope(initial: SettingsScopeSnapshot<MemorySettingsSection>) {
-  const set = vi.fn(async (_field: string, _value: unknown) => {})
-  const unset = vi.fn(async (_field: string) => {})
-  const scope: SettingsScope<MemorySettingsSection> = {
+function fakeScope(initial: ConfigFormSnapshot<MemorySettingsSection>) {
+  const set = vi.fn(async (_field: string, _value: unknown) => true)
+  const unset = vi.fn(async (_field: string) => true)
+  const scope: ConfigForm<MemorySettingsSection> = {
     getSnapshot: () => initial,
     subscribe: () => () => {},
-    mutate: vi.fn(async () => {}),
+    mutate: vi.fn(async () => true),
     set,
     unset,
   }
@@ -73,7 +76,7 @@ function fakeRemote() {
 describe('MemorySettingsController', () => {
   it('publishes the initial settings snapshot into the store', () => {
     const { scope } = fakeScope(snapshot({ value: { overviewEnabled: false } as MemorySettingsSection }))
-    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, [])
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, [])
     const face = controller.inject()
     const state = face.hooks.memorySettings.getSnapshot()
     expect(state.available).toBe(true)
@@ -83,7 +86,7 @@ describe('MemorySettingsController', () => {
 
   it('exposes top-level face actions alongside the memorySettings hook', () => {
     const { scope } = fakeScope(snapshot({}))
-    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, [])
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, [])
     const face = controller.inject()
     // InjectFace maps hooks -> useX, other members pass through.
     expect(typeof face.setInjectedSummaryTokens).toBe('function')
@@ -95,21 +98,21 @@ describe('MemorySettingsController', () => {
 
   it('routes setOverviewEnabled through the settings scope', async () => {
     const { scope, set } = fakeScope(snapshot({}))
-    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, [])
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, [])
     await controller.inject().setOverviewEnabled(false)
     expect(set).toHaveBeenCalledWith('overviewEnabled', false)
   })
 
   it('routes the extraction model override through the settings scope', async () => {
     const { scope, set } = fakeScope(snapshot({}))
-    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, [])
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, [])
     await controller.inject().setExtractionModel('deepseek', 'deepseek-chat')
     expect(set).toHaveBeenCalledWith('extractionModel', { provider: 'deepseek', model: 'deepseek-chat' })
   })
 
   it('routes the full extraction-model override (provider/model/baseURL/protocol/apiKey)', async () => {
     const { scope, set } = fakeScope(snapshot({}))
-    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, [])
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, [])
     await controller.inject().setExtractionModelOverride({
       provider: 'custom', model: 'gpt-4o-mini',
       baseURL: 'https://api.example.com/v1', protocol: 'openai', apiKey: 'sk-test',
@@ -122,7 +125,7 @@ describe('MemorySettingsController', () => {
 
   it('routes the injection budget through the settings scope, clamped', async () => {
     const { scope, set } = fakeScope(snapshot({}))
-    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, [])
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, [])
     const face = controller.inject()
 
     await face.setInjectedSummaryTokens(1200)
@@ -140,7 +143,7 @@ describe('MemorySettingsController', () => {
 
   it('defaults a missing injection budget instead of exposing undefined', () => {
     const { scope } = fakeScope(snapshot({ value: { injectedSummaryTokens: undefined } as never }))
-    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, [])
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, [])
     expect(controller.inject().hooks.memorySettings.getSnapshot().section.injectedSummaryTokens)
       .toBe(DEFAULT_INJECTED_SUMMARY_TOKENS)
   })
@@ -148,7 +151,7 @@ describe('MemorySettingsController', () => {
   it('calls the Remote namespace for backup and restore', async () => {
     const { scope } = fakeScope(snapshot({}))
     const { remote, backup, restore } = fakeRemote()
-    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, remote)
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, remote)
     const face = controller.inject()
     const exported = await face.backup()
     expect(backup).toHaveBeenCalledWith({ user: 'global' })
@@ -166,7 +169,7 @@ describe('MemorySettingsController', () => {
       ok: true,
       value: { facts: [{ fact_id: 'f1', subject: 's', predicate: 'p', object: 'o' }], total: 1 },
     })
-    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, remote)
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, remote)
     await controller.inject().refreshData()
     expect(listFacts).toHaveBeenCalledWith({ user: 'global', limit: 200 })
     expect(listProfile).toHaveBeenCalledWith({ user: 'global' })
@@ -184,7 +187,7 @@ describe('MemorySettingsController', () => {
     const { remote, listFacts, listProfile } = fakeRemote()
     listFacts.mockResolvedValue({ ok: true, value: { facts: undefined, total: 0 } } as never)
     listProfile.mockResolvedValue({ ok: true, value: { profile: undefined } } as never)
-    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, remote)
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, remote)
     await controller.inject().refreshData()
     const snap = controller.inject().hooks.memorySettings.getSnapshot()
     expect(snap.data.facts).toEqual([])
@@ -199,7 +202,7 @@ describe('MemorySettingsController', () => {
       ok: true,
       value: { facts: [], total: 0 },
     })
-    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, remote)
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, remote)
     await controller.inject().deleteFact('f1')
     expect(deleteFact).toHaveBeenCalledWith({ user: 'global', fact_id: 'f1' })
   })
@@ -207,7 +210,7 @@ describe('MemorySettingsController', () => {
   it('fetches and stores the rendered summary view', async () => {
     const { scope } = fakeScope(snapshot({}))
     const { remote, summary } = fakeRemote()
-    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, remote)
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, remote)
     const face = controller.inject()
     const text = await face.fetchSummary()
     expect(summary).toHaveBeenCalledWith({ user: 'global' })
@@ -222,7 +225,7 @@ describe('MemorySettingsController', () => {
     const deleteFact = remote.deleteFact as ReturnType<typeof vi.fn>
     const listFacts = remote.listFacts as ReturnType<typeof vi.fn>
     listFacts.mockResolvedValue({ ok: true, value: { facts: [], total: 0 } })
-    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, remote)
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, remote)
     await controller.inject().saveAllFacts([
       { fact_id: 'f1', subject: 'a', predicate: 'b', object: 'c', deleted: false },
       { fact_id: 'f2', subject: 'x', predicate: 'y', object: 'z', deleted: true },
@@ -247,7 +250,7 @@ describe('MemorySettingsController', () => {
         total: 1,
       },
     })
-    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, remote)
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, remote)
     const face = controller.inject()
     await face.refreshData()
     await face.saveAllFacts([
@@ -272,7 +275,7 @@ describe('MemorySettingsController', () => {
       ok: true,
       value: { facts: [{ fact_id: 'f1', subject: 'a', predicate: 'b', object: 'c', content: 'x' }], total: 1 },
     })
-    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, remote)
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, remote)
     const face = controller.inject()
     await face.refreshData()
     await face.saveAllFacts([
@@ -291,7 +294,7 @@ describe('MemorySettingsController', () => {
       value: { facts: [{ fact_id: 'f1', subject: 'a', predicate: 'b', object: 'c', content: 'x' }], total: 1 },
     })
     editFact.mockResolvedValue({ ok: false, error: new Error('edit refused') })
-    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, remote)
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, remote)
     const face = controller.inject()
     await face.refreshData()
     await expect(
@@ -308,7 +311,7 @@ describe('MemorySettingsController', () => {
     const { remote } = fakeRemote()
     const deleteFact = remote.deleteFact as ReturnType<typeof vi.fn>
     deleteFact.mockResolvedValue({ ok: false, error: new Error('delete refused') })
-    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, remote)
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, remote)
     await expect(
       controller.inject().saveAllFacts([
         { fact_id: 'f1', subject: 'a', predicate: 'b', object: 'c', deleted: true },
@@ -320,7 +323,7 @@ describe('MemorySettingsController', () => {
     const { scope } = fakeScope(snapshot({}))
     const { remote, writeProfile } = fakeRemote()
     const listProfile = remote.listProfile as ReturnType<typeof vi.fn>
-    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, remote)
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, remote)
     await controller.inject().saveAllProfile([
       { section: '背景', key: '职业', value: '工程师', deleted: false },
       { section: '偏好', key: '语言', value: 'Python', deleted: true },
@@ -342,7 +345,7 @@ describe('MemorySettingsController', () => {
     const { scope } = fakeScope(snapshot({}))
     const { remote, writeProfile } = fakeRemote()
     writeProfile.mockResolvedValueOnce({ ok: false, error: { message: '用户画像已达上限（50/50 条）' } })
-    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, remote)
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, remote)
     const face = controller.inject()
 
     await expect(face.saveAllProfile([{ section: '背景', key: '职业', value: '工程师' }]))
@@ -362,7 +365,7 @@ describe('MemorySettingsController', () => {
         full: false,
       },
     })
-    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, remote)
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, remote)
     const result = await controller.inject().generateProfile()
 
     expect(generateProfile).toHaveBeenCalledWith({ user: 'global' })
@@ -376,7 +379,7 @@ describe('MemorySettingsController', () => {
     const { scope } = fakeScope(snapshot({}))
     const { remote, generateProfile } = fakeRemote()
     generateProfile.mockResolvedValueOnce({ ok: true, value: {} })
-    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, remote)
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, remote)
     const result = await controller.inject().generateProfile()
     expect(result.suggestions).toEqual([])
     expect(result.full).toBe(false)
@@ -386,7 +389,7 @@ describe('MemorySettingsController', () => {
     const { scope } = fakeScope(snapshot({}))
     const { remote } = fakeRemote()
     const upsertProfile = remote.upsertProfile as ReturnType<typeof vi.fn>
-    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, remote)
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, remote)
     const face = controller.inject()
 
     await face.upsertProfile('背景', '职业', '工程师')
@@ -400,7 +403,7 @@ describe('MemorySettingsController', () => {
   it('routes setOverviewEnabled through the settings scope', async () => {
     const { scope, set } = fakeScope(snapshot({}))
     const { remote } = fakeRemote()
-    const controller = new MemorySettingsController(scope as unknown as SettingsScope<MemorySettingsSection>, remote)
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, remote)
     await controller.inject().setOverviewEnabled(false)
     expect(set).toHaveBeenLastCalledWith('overviewEnabled', false)
   })
@@ -412,7 +415,7 @@ describe('MemorySettingsController', () => {
     delete value.overviewEnabled
     const { scope } = fakeScope({ ...snapshot({}), value: value as MemorySettingsSection })
     const face = new MemorySettingsController(
-      scope as unknown as SettingsScope<MemorySettingsSection>, fakeRemote().remote,
+      scope as unknown as ConfigForm<MemorySettingsSection>, fakeRemote().remote,
     ).inject()
     expect(face.hooks.memorySettings.getSnapshot().section.overviewEnabled).toBe(true)
   })
@@ -421,7 +424,7 @@ describe('MemorySettingsController', () => {
     const { scope } = fakeScope(snapshot({}))
     const { remote, refreshOverview } = fakeRemote()
     const face = new MemorySettingsController(
-      scope as unknown as SettingsScope<MemorySettingsSection>, remote,
+      scope as unknown as ConfigForm<MemorySettingsSection>, remote,
     ).inject()
     await expect(face.refreshOverview()).resolves.toBe('refreshed')
     expect(refreshOverview).toHaveBeenLastCalledWith({ user: 'global' })
@@ -433,7 +436,7 @@ describe('MemorySettingsController', () => {
     const { scope } = fakeScope(snapshot({}))
     const { remote } = fakeRemote()
     const face = new MemorySettingsController(
-      scope as unknown as SettingsScope<MemorySettingsSection>, remote,
+      scope as unknown as ConfigForm<MemorySettingsSection>, remote,
     ).inject()
     await face.fetchSummary()
     expect(face.hooks.memorySettings.getSnapshot().data.summary).toBeTruthy()
@@ -447,7 +450,7 @@ describe('MemorySettingsController', () => {
     const { remote, refreshOverview } = fakeRemote()
     refreshOverview.mockResolvedValueOnce({ ok: false, error: { message: 'bridge down' } })
     const face = new MemorySettingsController(
-      scope as unknown as SettingsScope<MemorySettingsSection>, remote,
+      scope as unknown as ConfigForm<MemorySettingsSection>, remote,
     ).inject()
     await expect(face.refreshOverview()).rejects.toThrow(/bridge down/)
   })

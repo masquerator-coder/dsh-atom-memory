@@ -10,13 +10,13 @@
  * @module dsh-atom-memory/client
  */
 import type { Context } from '@deepseek-ai/cordis'
-// Type-only: pulls the client Context merges (ctx.locale, ctx.settingsScope,
+// Type-only: pulls the client Context merges (ctx.locale, ctx.configForms,
 // ctx.slots, ctx.remote) from the composed packages.
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type {} from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-api-remotes/client'
-import { MemorySettingsController } from './memory-settings-controller.ts'
+import { MemorySettingsController, type MemorySettingsSection as MemorySection } from './memory-settings-controller.ts'
 import { MemorySettingsSection } from './MemorySettingsSection.tsx'
 import { dicts, LOCALE_NS } from './locales.ts'
 import { ATOM_MEMORY_REMOTE } from './remote.ts'
@@ -24,8 +24,25 @@ import { ATOM_MEMORY_REMOTE } from './remote.ts'
 /** The settings namespace registered by the Host plugin. */
 const SETTINGS_NAMESPACE = 'atom-memory'
 
-/** Required services (cordis fiber inject). */
-export const inject = ['slots', 'locale', 'settingsScope', 'remote'] as const
+/**
+ * Required services (cordis fiber inject).
+ *
+ * WHY `configForms` AND NOT `settingsScope`: DSH 0.1.7-alpha.1 rewrote the
+ * settings layer as "profile-owned live Config + form projection" and DELETED
+ * the client `settingsScope` service outright. Cordis does not error on an
+ * unsatisfied `inject` — the fiber simply parks in `pending` forever — but the
+ * Web client boot audit (`packages/client/web/src/boot-client.ts`,
+ * `assertEntriesActive`) requires EVERY entry to be `active` and otherwise
+ * throws, which the boot page renders as "Failed to load plugins". So the stale
+ * name did not merely degrade this panel; it took down the whole client boot.
+ *
+ * The replacement is `ctx.configForms.get(namespace)`, provided by
+ * `@deepseek-ai/dsh-client-ui-settings`. Its `ConfigForm` exposes
+ * `getSnapshot()` / `subscribe()` / `set()` — the same three calls the
+ * controller already made against the old scope, so the form body needed no
+ * rewrite.
+ */
+export const inject = ['slots', 'locale', 'configForms', 'remote'] as const
 
 /**
  * Mount the memory settings section.
@@ -52,7 +69,12 @@ export async function apply(ctx: Context): Promise<() => void> {
   }
 
   const controller = new MemorySettingsController(
-    ctx.settingsScope.bind({ namespace: SETTINGS_NAMESPACE }),
+    // The shared form for THIS bundle's settings namespace, owned by the
+    // ui-settings provider (so this plugin never declares `remote.settings`).
+    // `get` is idempotent per namespace and takes the namespace directly —
+    // unlike the deleted `settingsScope.bind({ namespace })` there is no
+    // binding step, and the provider disposes every form when it unloads.
+    ctx.configForms.get<MemorySection>(SETTINGS_NAMESPACE),
     memoryRemote,
   )
   ctx.effect(() => () => { controller.dispose() }, 'atom-memory: controller')
