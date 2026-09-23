@@ -84,48 +84,16 @@ export function createRuntime(seed: LiveRuntimeSeed): LiveRuntime {
  * volatile config, and nothing in the plugin mutates runtime state itself.
  * Keeping the narrow shape means the controller, tools and capture hooks are
  * unchanged by where the values come from.
+ *
+ * This replaced a mutable `Runtime` class that held a value and notified
+ * subscribers. Once the settings document became the single source of truth
+ * (read live through `dsh-settings`' volatile refs), the holder had no writer
+ * and no subscribers left — keeping it would have been a second, silent place
+ * the live values could have come from.
  */
 export interface RuntimeReader {
   /** Snapshot of the current live values. */
   get(): LiveRuntime
-}
-
-/** Mutable holder with a subscribe API for the settings `onChange` wiring. */
-export class Runtime implements RuntimeReader {
-  private value: LiveRuntime
-  private readonly listeners = new Set<() => void>()
-
-  constructor(seed: LiveRuntime) {
-    this.value = { ...seed }
-  }
-
-  /** Snapshot of the current live values. */
-  get(): LiveRuntime {
-    return { ...this.value }
-  }
-
-  /** Replace the whole live runtime (from a settings write). */
-  set(next: LiveRuntime): void {
-    const changed =
-      this.value.captureEnabled !== next.captureEnabled ||
-      this.value.llmExtractionEnabled !== next.llmExtractionEnabled ||
-      this.value.contextInjectionEnabled !== next.contextInjectionEnabled ||
-      this.value.overviewEnabled !== next.overviewEnabled
-    // The injection budget is deliberately *not* part of `changed`: nothing
-    // subscribes to re-wire it. It is read at each snapshot freeze (see
-    // context.ts), which is exactly the moment a larger/smaller budget should
-    // take effect, so no notification is needed.
-    this.value = { ...next, injectedSummaryTokens: clampInjectedSummaryTokens(next.injectedSummaryTokens) }
-    if (changed) {
-      for (const listener of this.listeners) listener()
-    }
-  }
-
-  /** Subscribe to runtime changes (returns the disposer). */
-  subscribe(listener: () => void): () => void {
-    this.listeners.add(listener)
-    return () => this.listeners.delete(listener)
-  }
 }
 
 /** Namespace id used for the plugin's settings section on the Host. */

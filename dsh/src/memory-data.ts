@@ -40,8 +40,13 @@ export const MEMORY_LINE_PREFIX = '| '
  * BOM/soft hyphen/invisible-operator family, and Unicode tag characters (an
  * invisible ASCII alphabet).
  *
- * Kept in sync with the ingest list in `atom_memory/sanitize.py` — both layers
- * must agree on what "invisible" means or one of them becomes decorative.
+ * This list is the *documented* core — it names the shapes a reviewer should
+ * recognise. It is deliberately not the whole rule: {@link isStripped} also
+ * removes anything Unicode categorises as `Cf`/`Cc`, because a hand-maintained
+ * list is always behind the standard and the Python ingest layer
+ * (`atom_memory/sanitize.py`) already decides by category. Reviewing this list
+ * and the categories, the two layers agree on what "invisible" means — which is
+ * what stops one of them from being decorative.
  */
 const STRIPPED_CODEPOINTS: ReadonlyArray<[number, number]> = [
   [0x00ad, 0x00ad], // SOFT HYPHEN
@@ -64,15 +69,47 @@ const STRIPPED_CODEPOINTS: ReadonlyArray<[number, number]> = [
   [0xe0020, 0xe0080], // TAG characters
 ]
 
+/**
+ * The two format characters both layers deliberately keep.
+ *
+ * ZWNJ/ZWJ are the only format characters with a load-bearing typographic role
+ * (emoji sequences, Indic/Persian letter joining) and the only ones that carry
+ * no glyph of their own, so keeping them costs no safety. Mirrors
+ * `_FORMAT_KEEP` in `atom_memory/sanitize.py`.
+ */
+const FORMAT_KEEP = new Set([0x200c, 0x200d])
+
+/**
+ * Unicode property escapes for the two categories the ingest layer rejects
+ * wholesale (`sanitize.py`: `_is_stripped_format` / `_is_stripped_control`).
+ *
+ * These are the real rule; {@link STRIPPED_CODEPOINTS} is the readable subset.
+ * Without this, the host layer was strictly weaker than the ingest layer: it
+ * let through every `Cf` the list forgot — Arabic/Syriac number signs
+ * (U+0600..U+0605, U+06DD, U+070F), Egyptian hieroglyph format controls
+ * (U+13430..U+1343F), Kaithi number signs (U+1BCA0..U+1BCA3), musical symbol
+ * controls (U+1D173..U+1D17A) and the higher variation selectors
+ * (U+FE02..FE0F, U+E0100..E01EF). All are invisible and none is whitespace, so
+ * they survived the whitespace collapse and reached the prompt — exactly the
+ * "an instruction that hides from a human reviewer" shape the fence exists to
+ * remove. A store written before the ingest layer existed, or through a path
+ * that bypassed it, is caught here rather than only there.
+ */
+const FORMAT_OR_CONTROL = /[\p{Cf}\p{Cc}]/u
+
 function isStripped(code: number): boolean {
+  // Checked first: the category rule below would otherwise remove them.
+  if (FORMAT_KEEP.has(code)) return false
   for (const [lo, hi] of STRIPPED_CODEPOINTS) {
     if (code >= lo && code <= hi) return true
   }
   // Control characters other than tab/newline: a bare \x00 or \x1b has no
   // place in a prompt and is a classic way to smuggle a terminal escape.
   if (code < 0x20 && code !== 0x09 && code !== 0x0a) return true
-  if (code >= 0x7f && code <= 0x9f) return true
-  return false
+  // The category catch-all. Tab and newline are `Cc` and are structural, so
+  // they are exempted here exactly as the ingest layer exempts them.
+  if (code === 0x09 || code === 0x0a) return false
+  return FORMAT_OR_CONTROL.test(String.fromCodePoint(code))
 }
 
 /**

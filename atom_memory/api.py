@@ -27,6 +27,7 @@ from .db import index_orphans, now_ms, open_db, record_event
 from .domain import GENERAL_DOMAIN, DomainStore, normalize_canonical
 from .embedder import Embedder
 from .profile import (
+    MAX_PROFILE_VALUE_CHARS,
     SOURCE_USER,
     ProfileLimitExceeded,
     delete_profile_row,
@@ -1823,9 +1824,14 @@ class AtomMem:
         """
         if self.db is None:
             raise RuntimeError("AtomMem is not started; call start() first")
+        # Sanitised here as well as inside `write_profile_rows`, because this is
+        # the surface that reports *truncation* back to the caller: a value cut
+        # to fit is information the user needs, and it has to be observed on the
+        # text this call cleaned. The store repeats the clean (idempotent) so a
+        # row can never reach the table unsanitised, whichever path it takes.
         section_clean = clean_field_meta(section, 200)
         key_clean = clean_field_meta(key, 200)
-        value_clean = clean_body_meta(value, self.config.max_content_chars)
+        value_clean = clean_body_meta(value, MAX_PROFILE_VALUE_CHARS)
         section = section_clean.text
         key = key_clean.text
         value = value_clean.text

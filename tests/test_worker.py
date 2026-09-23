@@ -16,7 +16,7 @@ from atom_memory.models import (
     TYPE_SEMANTIC,
     FactCandidate,
 )
-from atom_memory.worker import TASK_PENDING, TASK_RUNNING, Worker
+from atom_memory.worker import TASK_DEAD, TASK_PENDING, TASK_RUNNING, Worker
 from atom_memory.db import connect_for_tests
 
 
@@ -216,5 +216,150 @@ def test_a_detail_write_is_recorded_as_its_own_type():
             next(r for r in rows if r["type"] == "fact_written")["payload"]
         )
         assert payload["type"] == TYPE_SEMANTIC
+    finally:
+        conn.close()
+
+
+# ---- the failure path --------------------------------------------------------
+
+
+def test_a_failed_task_closes_its_candidate_in_the_same_transaction():
+    """The candidate's terminal state and the task's must not be split.
+
+    They used to be two commits. A crash between them left a candidate marked
+    ``error`` against a task still ``running`` — and since the retry re-runs the
+    extraction while `_finish_candidate` is terminal-only, the candidate row
+    could never be transitioned again. Whatever the outcome, the two rows must
+    agree.
+    """
+    conn = connect_for_tests()
+    try:
+        worker = Worker(
+            conn=conn,
+            embed_func=lambda _text: b"\x00" * (512 * 4),
+            poll_interval_sec=0.01,
+            max_retries=1,
+            config=MemConfig(),
+        )
+        # A task whose handler cannot succeed: the extractor raises, which is the
+        # realistic failure this path exists for.
+        tid = _task_id()
+        conn.execute(
+            "INSERT INTO fact_candidates(candidate_id, user_id, session_id, "
+            "turn_id, status, created_at) VALUES ('c1', 'u1', 's1', 1, 'pending', 1)"
+        )
+        conn.execute(
+            "INSERT INTO task_queue(task_id, task_type, payload, status, priority, "
+            "retry_count, max_retries, created_at) VALUES (?, 'extract', ?, 'running', "
+            "5, 0, 1, 1)",
+            (
+                tid,
+                json.dumps(
+                    {
+                        "candidate_id": "c1",
+                        "user_id": "u1",
+                        "session_id": "s1",
+                        "turn_id": 1,
+                        "raw_text": "whatever",
+                    }
+                ),
+            ),
+        )
+        conn.commit()
+
+        class _Exploding:
+            def extract(self, *_args, **_kwargs):
+                raise RuntimeError("extractor blew up")
+
+        worker.extractor = _Exploding()
+        row = conn.execute(
+            "SELECT * FROM task_queue WHERE task_id = ?", (tid,)
+        ).fetchone()
+        asyncio.run(worker._handle_task(row))
+
+        task = conn.execute(
+            "SELECT status, error FROM task_queue WHERE task_id = ?", (tid,)
+        ).fetchone()
+        candidate = conn.execute(
+            "SELECT status, reject_kind FROM fact_candidates WHERE candidate_id = 'c1'"
+        ).fetchone()
+
+        # max_retries=1 means the first failure is already terminal for the task.
+        assert task["status"] == TASK_DEAD
+        assert "extractor blew up" in task["error"]
+        # And the candidate agrees, rather than sitting at `pending`/`running`.
+        assert candidate["status"] == "error"
+        assert candidate["reject_kind"] == "task_error"
+
+        # The alarm is emitted only *after* the state it describes is durable.
+        # `record_event` commits unconditionally, so emitting it while the
+        # caller still held the transaction open would have been what persisted
+        # both rows — putting a "task is dead" event in the log ahead of the row
+        # saying so, and making the caller's own commit a no-op.
+        events = conn.execute(
+            "SELECT type FROM events WHERE type = 'task_dead'"
+        ).fetchall()
+        assert len(events) == 1
+    finally:
+        conn.close()
+
+
+# ---- capacity archiving: its own transaction ---------------------------------
+
+
+def _age(conn, fact_id: str, created_at: int) -> None:
+    conn.execute("UPDATE facts SET created_at = ? WHERE fact_id = ?", (created_at, fact_id))
+    conn.commit()
+
+
+def test_capacity_archiving_commits_its_own_work_and_logs_it():
+    """Archiving and its changelog entry must land together, atomically.
+
+    The archiving UPDATEs run in an implicit transaction. Before this was its own
+    unit, that transaction stayed open across the rest of the maintenance pass —
+    and `record_event` commits unconditionally, so any later event would flush a
+    half-finished archival to disk while `facts_archived` was never written. The
+    archive happened and the audit trail did not.
+    """
+    conn = connect_for_tests()
+    try:
+        worker = Worker(
+            conn=conn,
+            embed_func=lambda _text: b"\x00" * (512 * 4),
+            poll_interval_sec=0.01,
+            config=MemConfig(max_active_facts=1, archive_protect_days=0),
+        )
+        # Two plain semantic facts, old enough to be archivable.
+        for i in range(2):
+            candidate = FactCandidate(
+                candidate_id=str(uuid.uuid4()),
+                user_id="u1",
+                session_id="s1",
+                subject=f"项目{i}",
+                predicate="属性",
+                object=f"值{i}",
+                type=TYPE_SEMANTIC,
+            )
+            asyncio.run(worker._apply_candidates([candidate], "u1", "s1"))
+        for row in conn.execute("SELECT fact_id FROM facts WHERE user_id = 'u1'").fetchall():
+            _age(conn, row["fact_id"], 1)
+
+        archived = worker.enforce_capacity("u1")
+        assert len(archived) == 1, archived
+
+        # The archive is committed, so it is visible without any further commit.
+        active = conn.execute(
+            "SELECT COUNT(*) AS n FROM facts WHERE user_id = 'u1' AND status = 'active'"
+        ).fetchone()["n"]
+        assert active == 1
+
+        # And the audit entry is present, with the fact it archived.
+        events = conn.execute(
+            "SELECT payload FROM events WHERE type = 'facts_archived'"
+        ).fetchall()
+        assert len(events) == 1
+        payload = json.loads(events[0]["payload"])
+        assert payload["cap"] == 1
+        assert [a["fact_id"] for a in payload["archived"]] == [archived[0]["fact_id"]]
     finally:
         conn.close()

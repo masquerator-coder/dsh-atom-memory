@@ -159,6 +159,12 @@ memory_summary（概览：总览段 + 紧凑明细）
 > 保证不超 `injectedSummaryTokens`。`fact_id` 仍可经 `memory_recall`、
 > `memory_summary detail=true` 与设置界面取得。
 >
+> **预算口径**：`injectedSummaryTokens` 约束的是**摘要正文本身**（渲染器自己的字符预算，
+> 含页脚）。宿主把它放进围栏块时还会加行前缀与 `===== BEGIN/END MEMORY-DATA =====`
+> 边界，实测这部分**另需 55–134 tokens**（随行数增长；811 字符摘要 → 正文 808 tokens，
+> 成块后 863 tokens）。所以最终进入提示词的字节数会**略高于**该配置值：它是正文预算，
+> 不是整个注入块的硬上限。若要按整块计费，按每行约 +1 token 预留即可。
+>
 > **每行长度上限（保证记忆精炼）**：注入版**每一条渲染行整体**不超过
 > **80 字符**（`_MAX_COMPACT_LINE_CHARS`，`- ` 前缀、`[when]`、`predicate:` 与值都算在内，
 > 省略号也计入上限），因此任何行形都逃不出这个唯一的收口点；折叠行里的**单个值**先各自

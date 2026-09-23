@@ -7,27 +7,38 @@ class FakeProc {
   out = new Readable({ read() {} })
   err = new Readable({ read() {} })
   write = vi.fn((_chunk: string) => true)
+  end = vi.fn(() => {})
   stdinOn = vi.fn()
   kill = vi.fn(() => true)
   letHandlers = new Map<string, (...a: any[]) => void>()
+  /** Handlers registered via `once` — dispose() waits on these. */
+  onceHandlers = new Map<string, (...a: any[]) => void>()
   on = vi.fn((evt: string, cb: (...a: any[]) => void) => {
     this.letHandlers.set(evt, cb)
+    return () => {}
+  })
+  once = vi.fn((evt: string, cb: (...a: any[]) => void) => {
+    this.onceHandlers.set(evt, cb)
     return () => {}
   })
   pid = 1
   asProcess(): ProcessLike {
     return {
-      stdin: { write: this.write, on: this.stdinOn },
+      stdin: { write: this.write, end: this.end, on: this.stdinOn },
       stdout: this.out,
       stderr: this.err,
       kill: this.kill,
       on: this.on,
+      once: this.once,
       pid: this.pid,
     } as unknown as ProcessLike
   }
   feedOut(line: string): void { this.out.push(line + '\n') }
   feedErr(line: string): void { this.err.push(line + '\n') }
-  emitExit(code: number | null, signal: unknown): void { this.letHandlers.get('exit')?.(code, signal) }
+  emitExit(code: number | null, signal: unknown): void {
+    this.letHandlers.get('exit')?.(code, signal)
+    this.onceHandlers.get('exit')?.(code, signal)
+  }
   lastRequest(): { id: string; method: string; params: Record<string, unknown> } {
     const calls = this.write.mock.calls
     return JSON.parse(calls[calls.length - 1][0])
@@ -82,14 +93,54 @@ describe('PythonBridge', () => {
     const { bridge, proc } = await startBridge()
     const p = bridge.call('stats', { user_id: 'u1' })
     void proc.lastRequest() // consume
-    await bridge.dispose()
+    // Let the fake child honour the stop request, so dispose() does not sit out
+    // the full grace period (the bridged process exits when asked).
+    const disposed = bridge.dispose()
+    proc.emitExit(0, null)
+    await disposed
     await expect(p).rejects.toThrow('disposed')
   })
 
   it('rejects calls after dispose', async () => {
-    const { bridge } = await startBridge()
-    await bridge.dispose()
+    const { bridge, proc } = await startBridge()
+    const disposed = bridge.dispose()
+    proc.emitExit(0, null)
+    await disposed
     await expect(bridge.call('stats', {})).rejects.toThrow('disposed')
+  })
+
+  it('asks the child to stop and gives it the chance to exit on its own', async () => {
+    // The comment on dispose() promises the worker flushes before exit. That is
+    // only true if the stop frame is actually delivered and the child is allowed
+    // to act on it — writing the frame and killing on the next line made an
+    // unflushed WAL the normal outcome rather than a rare one.
+    const { bridge, proc } = await startBridge()
+    const exitSoon = new Promise<void>((resolve) => {
+      // Exit as soon as the child has been asked to stop.
+      setTimeout(() => { proc.emitExit(0, null); resolve() }, 10)
+    })
+    await bridge.dispose()
+    await exitSoon
+
+    expect(proc.lastRequest().method).toBe('stop')
+    // stdin is closed so the child sees EOF even if it misses the frame.
+    expect(proc.end).toHaveBeenCalled()
+    // It left on its own, so there was nothing to kill.
+    expect(proc.kill).not.toHaveBeenCalled()
+  })
+
+  it('kills a child that does not exit within the grace period', async () => {
+    const { bridge, proc } = await startBridge()
+    // Fake timers so the bounded wait is exercised without a real 2s delay.
+    vi.useFakeTimers()
+    try {
+      const disposed = bridge.dispose()
+      await vi.advanceTimersByTimeAsync(2_100)
+      await disposed
+    } finally {
+      vi.useRealTimers()
+    }
+    expect(proc.kill).toHaveBeenCalled()
   })
 
   it('forwards tagged background events via onEvent', async () => {

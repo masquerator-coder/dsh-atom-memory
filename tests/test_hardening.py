@@ -177,6 +177,49 @@ def test_a_reworded_body_within_the_gate_is_also_folded(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_a_duplicate_is_found_behind_other_users_nearer_facts(tmp_path, monkeypatch):
+    """The probe's `k` is a global truncation; the owner filter must not lose to it.
+
+    `facts_vec` has no owner column, so "same owner" can only be checked after
+    the join — which means the candidate set is the nearest rows in the *whole
+    store*, not the nearest rows of this owner. With a small pool, another user's
+    facts fill it and the genuine duplicate is never examined: dedup silently
+    stops happening and the store grows a redundant row per restatement. The
+    failure is invisible, because the write succeeds and looks like a new fact.
+    """
+    async def scenario() -> None:
+        mem = _make(
+            tmp_path, monkeypatch, dedup_min_body_chars=50, dedup_probe_k=0
+        )
+        await mem.start()
+        try:
+            body = "部署前必须完成备份。" * 30
+            await _candidates(mem, [_knowledge(body)])
+
+            # Bury it: 40 other owners each store a fact that is *equally* close
+            # (same marker → identical vector), so they occupy the front of the
+            # global neighbour list.
+            for i in range(40):
+                other = _knowledge("别人的备份文档。" * 30)
+                other.user_id = f"other-{i}"
+                await mem._worker._apply_candidates([other], f"other-{i}", "s")
+
+            reworded = _knowledge("发布之前一定要先备份完整数据。" * 30)
+            outcome = await _candidates(mem, [reworded])
+
+            assert outcome["written"] == [], (
+                "a reworded copy must still be found with other owners in front"
+            )
+            assert outcome["reinforced"][0]["on"] == "embedding"
+            assert mem.list_facts("u1")["total"] == 1
+            # And it did not merge across owners: each other user keeps its own.
+            assert mem.list_facts("other-0")["total"] == 1
+        finally:
+            await mem.stop()
+
+    asyncio.run(scenario())
+
+
 def test_a_different_document_is_still_a_different_memory(tmp_path, monkeypatch):
     """The gate must not merge two genuinely distinct bodies."""
     async def scenario() -> None:

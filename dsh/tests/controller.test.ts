@@ -13,7 +13,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import type { PythonBridge } from '../src/bridge.ts'
 import { AtomMemoryController } from '../src/controller.ts'
-import { Runtime, createRuntime } from '../src/runtime.ts'
+import { createRuntime } from '../src/runtime.ts'
 
 /** A bridge double whose `call` resolves `result` and records every call. */
 function fakeBridge(result: unknown = '', alive = true) {
@@ -25,7 +25,9 @@ function fakeBridge(result: unknown = '', alive = true) {
 /** Build a controller with a live bridge. */
 function makeController(options: { result?: unknown; alive?: boolean } = {}) {
   const { bridge, call } = fakeBridge(options.result ?? '', options.alive ?? true)
-  const runtime = new Runtime(createRuntime({}))
+  // The production reader is exactly this: a closure over the live config. The
+  // controller only ever calls `get()`, so a literal is the honest double.
+  const runtime = { get: () => createRuntime({}) }
   const controller = new AtomMemoryController(new Context(), bridge, runtime)
   return { controller, call }
 }

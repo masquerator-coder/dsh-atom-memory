@@ -24,7 +24,7 @@ import hashlib
 import pytest
 
 from atom_memory import AtomMem, MemConfig
-from atom_memory.db import connect_for_tests, index_orphans, now_ms
+from atom_memory.db import connect_for_tests, index_orphans, now_ms, open_db
 from atom_memory.embedder import serialize_float32
 from atom_memory.rpc import RpcServer
 from atom_memory.worker import _candidate_from_rpc_dict, Worker
@@ -162,6 +162,98 @@ def test_a_restatement_inside_one_scope_folds_instead_of_duplicating():
         assert again["written"] == []
         assert again["reinforced"][0]["fact_id"] == first["written"][0]
         assert conn.execute("SELECT COUNT(*) AS n FROM facts").fetchone()["n"] == 1
+    finally:
+        conn.close()
+
+
+def test_a_claim_committed_during_the_write_is_folded_not_duplicated(tmp_path):
+    """The identity check-then-act spans a real suspension point.
+
+    `_persist_fact` asks "does this owner already have this claim?" and then
+    INSERTs, but the embedding is computed in between via
+    `await asyncio.to_thread(...)` — a genuine yield, so another writer on the
+    same store can commit the same claim inside that window. Both would see "no
+    existing row" and both would insert, leaving two identical active facts:
+    exactly what the content fingerprint exists to prevent, and invisible to
+    every repair pass (the index check compares `facts` against its FTS and
+    vector indexes, not against itself).
+
+    The competing commit has to land *inside* that window to reproduce it. It is
+    therefore performed from the embed callback, which runs on the worker thread
+    at exactly the point the first fingerprint check has already returned "no
+    row" and the INSERT has not yet run. A competing row that already existed
+    before the call would be caught by that first check and would prove nothing.
+
+    A file-backed database is used rather than the usual ``:memory:`` one because
+    the competing writer is a *second connection* to the same store — which is
+    what "two writers" means here, and is also why sqlite refuses to share one
+    connection across threads.
+
+    The competing row is created by first letting the real worker write it, so it
+    carries a proper scope binding. The fingerprint check is windowed by scope,
+    so a hand-inserted winner with no binding would sit outside this write's
+    window and the re-check would legitimately ignore it.
+    """
+    config = MemConfig(scope_aware=True, db_path=str(tmp_path / "race.db"))
+    conn = open_db(config)
+    try:
+        seeded = _write(_worker(conn, config), "团队", "约定", "提交信息用中文", PROJECT_A)
+        assert len(seeded["written"]) == 1
+        winner = seeded["written"][0]
+        # The winner is retired, so the store looks exactly as it did before the
+        # racing write: an active claim with this identity must be *created* by
+        # the competing commit, not found by the first check.
+        conn.execute("UPDATE facts SET status = 'archived' WHERE fact_id = ?", (winner,))
+        conn.commit()
+
+        def embed_that_reinstates_the_winner(text: str) -> bytes:
+            """Re-activate the claim on a second connection while we are in flight.
+
+            Opened, used and closed on this thread — sqlite refuses to hand a
+            connection across threads, which is also why a separate connection
+            (rather than a second cursor) is the honest model of a concurrent
+            writer.
+            """
+            other = open_db(config)
+            try:
+                other.execute(
+                    "UPDATE facts SET status = 'active' WHERE fact_id = ?", (winner,)
+                )
+                other.commit()
+            finally:
+                other.close()
+            return embed(text)
+
+        racer = Worker(
+            conn=conn, embed_func=embed_that_reinstates_the_winner, config=config
+        )
+        outcome = _write(racer, "团队", "约定", "提交信息用中文", PROJECT_A)
+
+        assert outcome["written"] == [], "a concurrent restatement must not add a row"
+        assert outcome["reinforced"][0]["fact_id"] == winner
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM facts WHERE status = 'active'"
+        ).fetchone()["n"] == 1
+    finally:
+        conn.close()
+
+
+def test_the_race_fold_still_respects_scope_identity():
+    """The re-check must not collapse the deliberate cross-scope duplicate.
+
+    Identity is per scope *window*, so the same claim committed in another
+    project during the write window is still a second fact — that independent
+    restatement is what the abstraction pass promotes.
+    """
+    config = MemConfig(scope_aware=True)
+    conn = connect_for_tests(config)
+    try:
+        worker = _worker(conn, config)
+        first = _write(worker, "团队", "约定", "提交信息用中文", PROJECT_A)
+        second = _write(worker, "团队", "约定", "提交信息用中文", PROJECT_B)
+
+        assert len(first["written"]) == 1 and len(second["written"]) == 1
+        assert first["written"] != second["written"]
     finally:
         conn.close()
 

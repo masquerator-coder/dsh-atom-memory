@@ -99,6 +99,13 @@ TASK_RUNNING = "running"
 TASK_DONE = "done"
 TASK_DEAD = "dead"
 
+# How many vector neighbours the near-duplicate probe examines before filtering.
+# The probe's `k` is a global truncation (the vector index has no owner column),
+# and every acceptance test is applied afterwards in Python, so this has to be
+# comfortably larger than the number of *matches* we expect — see
+# `Worker._near_duplicate`.
+_NEAR_DUP_PROBE_MIN_K = 50
+
 # Fact statuses that a capacity pass may move a row *into*. Everything else
 # (``active``) is what the read paths see.
 FACT_STATUS_ARCHIVED = "archived"
@@ -263,6 +270,11 @@ class Worker:
         self.privacy_filter = privacy_filter
         self._task: Optional[asyncio.Task] = None
         self._last_maintenance: Optional[int] = None
+        # Dead-task alarms awaiting the caller's commit. `record_event` commits
+        # unconditionally, so an alarm emitted while a caller is deliberately
+        # holding a transaction open (see `_record_failure(commit=False)`) would
+        # persist that transaction early. They are flushed by whoever closes it.
+        self._pending_dead_logs: list = []
         # Identity of this consumer. A claim records who holds it, so a second
         # consumer over the same file can tell "abandoned" from "someone else is
         # working on it" instead of guessing from timestamps alone.
@@ -467,13 +479,38 @@ class Worker:
             self._safe_rollback()
             candidate_id = payload.get("candidate_id")
             if candidate_id:
+                # The candidate's terminal state and the task's are written as one
+                # unit: `commit=False` defers the former, the call below closes
+                # both. Split across two commits, a crash in between left the
+                # candidate marked `error` against a task still `running` — so the
+                # retry re-ran an extraction whose candidate had already been
+                # closed out, and the candidate row could never be transitioned
+                # again (`_finish_candidate` is terminal-only).
                 self._finish_candidate(
                     candidate_id,
                     CAND_STATUS_ERROR,
                     reject_kind="task_error",
                     reject_reason=str(exc)[:500],
+                    commit=False,
                 )
-            await self._record_failure(task_id, row["retry_count"], exc)
+                await self._record_failure(
+                    task_id, row["retry_count"], exc, commit=True
+                )
+                self._flush_dead_logs()
+            else:
+                await self._record_failure(task_id, row["retry_count"], exc)
+                self._flush_dead_logs()
+
+    def _flush_dead_logs(self) -> None:
+        """Emit the dead-task alarms that were deferred until the commit landed.
+
+        Each `record_event` commits, so these must run *after* the transaction
+        they describe is durable — that ordering is the whole point of deferring
+        them.
+        """
+        pending, self._pending_dead_logs = self._pending_dead_logs, []
+        for task_id, exc in pending:
+            self._log_dead(task_id, exc)
 
     def _safe_rollback(self) -> None:
         """Roll back any open implicit transaction, best-effort."""
@@ -483,13 +520,21 @@ class Worker:
             logger.exception("Failed to roll back after a task failure")
 
     async def _record_failure(
-        self, task_id: str, retry_count: int, exc: Exception
+        self, task_id: str, retry_count: int, exc: Exception, *, commit: bool = True
     ) -> None:
         """Apply the retry / dead policy after a failed task.
 
         A task is allowed ``max_retries`` attempts in total; after that many
         failures it is marked ``dead``. Retries in between are spaced by an
         exponential backoff (1s, 2s, 4s, ... capped at 60s).
+
+        Args:
+            task_id: The task that failed.
+            retry_count: Attempts so far, before this failure.
+            exc: The error that ended the attempt.
+            commit: Whether to commit the bookkeeping here. The caller passes
+                ``False`` when it is also closing out the candidate, so the
+                task's terminal state and the candidate's reach disk as one unit.
         """
         retry_count = int(retry_count) + 1
         if retry_count >= self.max_retries:
@@ -499,8 +544,19 @@ class Worker:
                 "WHERE task_id = ?",
                 (TASK_DEAD, retry_count, str(exc)[:2000], now_ms(), task_id),
             )
-            self.conn.commit()
-            self._log_dead(task_id, exc)
+            if commit:
+                self.conn.commit()
+                # Logged only once the state is durable: `record_event` commits,
+                # so emitting the alarm first would flush the task (and, on the
+                # combined path, the candidate) before this call was allowed to.
+                self._log_dead(task_id, exc)
+            else:
+                # Deferred: the caller's commit closes this transaction, so the
+                # alarm has to wait for it — otherwise `record_event`'s
+                # unconditional commit would be the thing that persists the
+                # state, making the caller's `commit=True` a no-op and putting a
+                # "task is dead" event in the log ahead of the row saying so.
+                self._pending_dead_logs.append((task_id, exc))
             return
 
         # Requeue for the next poll after the backoff delay. The claim is
@@ -514,7 +570,8 @@ class Worker:
             "WHERE task_id = ?",
             (TASK_PENDING, retry_count, str(exc)[:2000], task_id),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         logger.warning(
             "Task %s failed (%d/%d): %s; retrying in %ss",
             task_id, retry_count, self.max_retries, exc, delay,
@@ -1084,6 +1141,7 @@ class Worker:
         outcome: Optional[dict] = None,
         reject_kind: Optional[str] = None,
         reject_reason: Optional[str] = None,
+        commit: bool = True,
     ) -> None:
         """Record a candidate's terminal state and what it produced.
 
@@ -1098,6 +1156,11 @@ class Worker:
             outcome: The write outcome, when the task produced one.
             reject_kind: Explicit refusal category (used by the error path).
             reject_reason: Human-readable refusal reason.
+            commit: Whether to commit here. ``False`` lets a caller that is also
+                writing the *task's* terminal state put both in one transaction
+                — otherwise a crash in between leaves a candidate marked failed
+                against a task still ``running``, so the retry re-runs work whose
+                candidate has already been closed out.
         """
         outcome = outcome or {}
         rejected = list(outcome.get("rejected") or [])
@@ -1121,7 +1184,8 @@ class Worker:
                 candidate_id,
             ),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     async def _persist_fact(
         self,
@@ -1228,86 +1292,175 @@ class Worker:
             self._attach_domains(near, domains)
             return self._fold_into(near, candidate, "embedding")
 
+        # Re-check the identity *inside* the write transaction.
+        #
+        # The check above is not a decision, because a real suspension point
+        # sits between it and the INSERT: the embedding ran on another thread
+        # (`asyncio.to_thread`), and any coroutine on this event loop could have
+        # run in that window. Two candidates carrying the same claim, arriving
+        # close together, would both see "no existing row" and both insert —
+        # leaving two identical active facts, which is precisely what the
+        # fingerprint exists to prevent. No repair pass looks for that: the
+        # index-consistency check compares `facts` against its FTS and vector
+        # indexes, not against itself.
+        #
+        # This re-read happens after `BEGIN`, so on the single-writer model the
+        # row it sees is the row the INSERT will coexist with. It cannot be a
+        # storage-level constraint instead: identity here is *per scope window*
+        # (see the docstring above — the same claim in a second project is
+        # deliberately a second fact, because that independent restatement is
+        # what the abstraction pass promotes), and a fact's own scope binding is
+        # what its window is computed from. A partial unique index on
+        # `(user_id, content_fingerprint)` would forbid the cross-scope case the
+        # design requires, so the invariant has to be maintained in code.
         with self.conn:
-            self.conn.execute(
-                "INSERT INTO facts(fact_id, user_id, session_id, subject, predicate, "
-                "object, qualifiers, confidence, importance, privacy, source_type, "
-                "status, superseded_by, observed_at, created_at, trace_id, version, type, "
-                "content, content_fingerprint) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    fact_id,
-                    candidate.user_id,
-                    candidate.session_id,
-                    candidate.subject,
-                    candidate.predicate,
-                    candidate.object,
-                    candidate.qualifiers,
-                    candidate.confidence,
-                    candidate.importance,
-                    candidate.privacy,
-                    "user_explicit",
-                    "active",
-                    None,
-                    created_at,
-                    created_at,
-                    trace_id,
-                    1,
-                    getattr(candidate, "type", "semantic") or "semantic",
-                    content or None,
-                    fingerprint,
-                ),
-            )
-            # FTS index uses jieba-segmented text so Chinese queries can match
-            # individual words (unicode61 treats a CJK span as a single token).
-            # The body content is indexed too so knowledge facts are findable by
-            # their full text, not only the SPO title.
-            self.conn.execute(
-                "INSERT INTO facts_fts(fact_id, text) VALUES (?, ?)",
-                (fact_id, " ".join(segment_text(searchable))),
-            )
-            self.conn.execute(
-                "INSERT INTO facts_vec(fact_id, embedding) VALUES (?, ?)",
-                (fact_id, blob),
-            )
-            # The scope binding and the conditions belong to the same
-            # transaction as the row: a fact that exists but is unbound would be
-            # read as a global fact (the compatibility rule), which is the one
-            # wrong answer that looks normal.
-            if bind_scope_id is not None:
-                self.conn.execute(
-                    "INSERT INTO fact_scope(fact_id, scope_id, priority) "
-                    "VALUES (?, ?, 0) ON CONFLICT(fact_id, scope_id) DO NOTHING",
-                    (fact_id, int(bind_scope_id)),
+            raced = self.conn.execute(
+                "SELECT fact_id FROM facts WHERE user_id = ? AND content_fingerprint = ? "
+                "AND status = 'active' " + scope_sql + "ORDER BY created_at ASC LIMIT 1",
+                [candidate.user_id, fingerprint, *scope_args],
+            ).fetchone()
+            if raced is not None:
+                # Lost the race. That is the same outcome as losing the check
+                # above — the claim is already stored — so this candidate is a
+                # restatement and folds into the winner.
+                won_by = str(raced["fact_id"])
+            else:
+                self._insert_fact_row(
+                    candidate, fact_id, fingerprint, content, searchable, blob,
+                    created_at, trace_id, bind_scope_id, conditions, domains,
                 )
-            for key, value in conditions:
-                self.conn.execute(
-                    "INSERT INTO fact_condition(fact_id, key, value) VALUES (?, ?, ?)",
-                    (fact_id, key, value),
-                )
-            # Topic labels share the transaction for the same reason the scope
-            # binding does: a fact whose topic was decided but not stored would be
-            # read as unlabelled (the compatibility rule) and silently escape
-            # every topic filter once one exists.
-            if domains is not None and domains.labels:
-                for label in domains.labels:
-                    self.conn.execute(
-                        "INSERT INTO fact_domain(fact_id, domain_id, confidence, "
-                        "is_primary, source, created_at) VALUES (?, ?, ?, ?, ?, ?) "
-                        "ON CONFLICT(fact_id, domain_id) DO UPDATE SET "
-                        "confidence = MAX(confidence, excluded.confidence), "
-                        "is_primary = MAX(is_primary, excluded.is_primary), "
-                        "source = excluded.source",
-                        (
-                            fact_id,
-                            int(label.domain_id),
-                            float(label.confidence),
-                            1 if label.is_primary else 0,
-                            str(label.source),
-                            created_at,
-                        ),
-                    )
+                won_by = None
+
+        if won_by is not None:
+            self._attach_domains(won_by, domains)
+            return self._fold_into(won_by, candidate, "fingerprint")
+
         return PersistResult(fact_id)
+
+    def _insert_fact_row(
+        self,
+        candidate: FactCandidate,
+        fact_id: str,
+        fingerprint: str,
+        content: str,
+        searchable: str,
+        blob: bytes,
+        created_at: int,
+        trace_id: Optional[str],
+        bind_scope_id: Optional[int],
+        conditions: Tuple[Tuple[str, str], ...],
+        domains: Optional[DomainAssignment],
+    ) -> None:
+        """Write a fact and everything that makes it visible, in one transaction.
+
+        Split out of :meth:`_persist_fact` so the identity race has somewhere to
+        be caught: the caller wraps this in a `try` for
+        :class:`sqlite3.IntegrityError`, and a `try` cannot span the `with
+        self.conn:` block it has to enclose.
+
+        Args:
+            candidate: The validated candidate being persisted.
+            fact_id: The id generated for this attempt.
+            fingerprint: The candidate's content identity.
+            content: The knowledge body (possibly empty).
+            searchable: The text indexed for full-text search.
+            blob: The serialized embedding.
+            created_at: The timestamp for the row.
+            trace_id: Optional trace id.
+            bind_scope_id: Scope to file the fact under, or ``None``.
+            conditions: Normalised conditions to store.
+            domains: Topic labels the batch decided on, or ``None``.
+
+        Raises:
+            sqlite3.IntegrityError: A row-level constraint was violated (a
+                duplicate primary key, or a vector whose dimensions do not match
+                the `vec0` column).
+        """
+        # No `with self.conn:` here on purpose: the caller opens the transaction
+        # so that the identity re-check and this INSERT are one unit — a
+        # transaction opened here would begin *after* the check it is meant to
+        # guard.
+        self.conn.execute(
+            "INSERT INTO facts(fact_id, user_id, session_id, subject, predicate, "
+            "object, qualifiers, confidence, importance, privacy, source_type, "
+            "status, superseded_by, observed_at, created_at, trace_id, version, type, "
+            "content, content_fingerprint) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                fact_id,
+                candidate.user_id,
+                candidate.session_id,
+                candidate.subject,
+                candidate.predicate,
+                candidate.object,
+                candidate.qualifiers,
+                candidate.confidence,
+                candidate.importance,
+                candidate.privacy,
+                "user_explicit",
+                "active",
+                None,
+                created_at,
+                created_at,
+                trace_id,
+                1,
+                getattr(candidate, "type", "semantic") or "semantic",
+                content or None,
+                fingerprint,
+            ),
+        )
+            # FTS index uses jieba-segmented text so Chinese queries can match
+        # individual words (unicode61 treats a CJK span as a single token).
+        # The body content is indexed too so knowledge facts are findable by
+        # their full text, not only the SPO title.
+        self.conn.execute(
+            "INSERT INTO facts_fts(fact_id, text) VALUES (?, ?)",
+            (fact_id, " ".join(segment_text(searchable))),
+        )
+        self.conn.execute(
+            "INSERT INTO facts_vec(fact_id, embedding) VALUES (?, ?)",
+            (fact_id, blob),
+        )
+        # The scope binding and the conditions belong to the same transaction as
+        # the row: a fact that exists but is unbound would be read as a global
+        # fact (the compatibility rule), which is the one wrong answer that looks
+        # normal.
+        if bind_scope_id is not None:
+            self.conn.execute(
+                "INSERT INTO fact_scope(fact_id, scope_id, priority) "
+                "VALUES (?, ?, 0) ON CONFLICT(fact_id, scope_id) DO NOTHING",
+                (fact_id, int(bind_scope_id)),
+            )
+        for key, value in conditions:
+            self.conn.execute(
+                "INSERT INTO fact_condition(fact_id, key, value) VALUES (?, ?, ?)",
+                (fact_id, key, value),
+            )
+        # Topic labels share the transaction for the same reason the scope
+        # binding does: a fact whose topic was decided but not stored would be
+        # read as unlabelled (the compatibility rule) and silently escape every
+        # topic filter once one exists.
+        if domains is not None and domains.labels:
+            for label in domains.labels:
+                self.conn.execute(
+                    "INSERT INTO fact_domain(fact_id, domain_id, confidence, "
+                    "is_primary, source, created_at) VALUES (?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(fact_id, domain_id) DO UPDATE SET "
+                    "confidence = MAX(confidence, excluded.confidence), "
+                    "is_primary = MAX(is_primary, excluded.is_primary), "
+                    "source = excluded.source",
+                    (
+                        fact_id,
+                        int(label.domain_id),
+                        float(label.confidence),
+                        1 if label.is_primary else 0,
+                        str(label.source),
+                        created_at,
+                    ),
+                )
+        # No return value and no commit: the caller owns both the transaction and
+        # the result, so that the identity re-check, this INSERT and the rest of
+        # the fact's rows are one atomic unit.
 
     def _fingerprint(self, candidate: FactCandidate) -> str:
         """Content identity of a candidate (polarity included).
@@ -1389,10 +1542,23 @@ class Worker:
         if len(body) < int(self.config.dedup_min_body_chars or 0):
             return None
         fact_type = getattr(candidate, "type", "semantic") or "semantic"
+        # Ask for more neighbours than we will accept.
+        #
+        # The `k` here is a *global* truncation — the vector index is not
+        # partitioned by owner, and every filter below (status, owner, type,
+        # subject, predicate, scope) is applied in Python afterwards. So the
+        # candidate set was the 5 nearest rows in the whole store, and in a
+        # multi-user store those 5 can all belong to other people: the genuine
+        # duplicate sits at rank 6 and is never examined, so dedup silently stops
+        # happening and the store grows a redundant row per restatement. Widening
+        # the pool makes the owner filter a filter rather than a lottery; the
+        # per-row filters below are unchanged, so this can only find *more*
+        # legitimate merges, never a wrong one.
+        probe_k = max(5, int(self.config.dedup_probe_k or 0), _NEAR_DUP_PROBE_MIN_K)
         try:
             neighbours = self.conn.execute(
-                "SELECT fact_id, distance FROM facts_vec WHERE embedding MATCH ? AND k = 5",
-                (blob,),
+                "SELECT fact_id, distance FROM facts_vec WHERE embedding MATCH ? AND k = ?",
+                (blob, probe_k),
             ).fetchall()
         except sqlite3.Error:
             logger.exception("Near-duplicate probe failed; storing as a new fact")
@@ -1403,11 +1569,17 @@ class Worker:
             if distance is None or float(distance) > threshold:
                 continue
             fact = self.conn.execute(
-                "SELECT fact_id, status, type, subject, predicate FROM facts "
+                "SELECT fact_id, status, type, subject, predicate, user_id FROM facts "
                 "WHERE fact_id = ?",
                 (neighbour["fact_id"],),
             ).fetchone()
             if fact is None or fact["status"] != "active":
+                continue
+            # The owner check belongs here with the other per-row filters. It is
+            # not in the query because `facts_vec` holds no owner column, so it
+            # can only be applied after the join — which is exactly why the pool
+            # above has to be wider than the number of matches we expect.
+            if str(fact["user_id"] or "") != str(candidate.user_id or ""):
                 continue
             if (fact["type"] or "semantic") != fact_type:
                 continue
@@ -1973,6 +2145,14 @@ class Worker:
             result["archived"] = self.enforce_capacity(user_id)
             result["promoted"] = await self.promote_abstractions(user_id)
         except Exception:  # pragma: no cover - maintenance must not kill the loop
+            # Roll back whatever the failing step left uncommitted. Maintenance
+            # deliberately swallows its errors, but swallowing them with an open
+            # transaction is how a partial write becomes permanent: every
+            # `record_event` commits, so the *next* event written anywhere on
+            # this connection would flush the half-applied step to disk and the
+            # audit trail would not mention it. Each step is responsible for
+            # committing its own work; anything still open here is abandoned.
+            self._safe_rollback()
             logger.exception("Maintenance pass failed")
         self.last_maintenance_result = result
         return result
@@ -2326,6 +2506,18 @@ class Worker:
                     }
                 )
         if archived or unreachable_total:
+            # Commit the archiving *here*, as its own unit, before anything else
+            # can commit on this connection.
+            #
+            # The UPDATEs above run inside an implicit transaction that this
+            # `commit()` closes. Leaving that commit to the end and letting the
+            # maintenance pass swallow exceptions in between (see
+            # `run_maintenance`) was the real hazard: the archive writes were
+            # already applied but uncommitted, and `record_event` commits
+            # unconditionally. Any event written later in the same pass — by this
+            # call or the next maintenance step — would therefore flush a
+            # half-finished archival to disk, with `facts_archived` never
+            # recorded, so the archive happened and its audit trail did not.
             self.conn.commit()
             record_event(
                 self.conn,

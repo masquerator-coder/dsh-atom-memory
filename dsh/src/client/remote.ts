@@ -82,7 +82,24 @@ function jsonArgsMethod(method: string, hasArgs: boolean): InvocationDescriptor 
   }
 }
 
-/** The `atomMemory` contribution mounted by this browser half. */
+/**
+ * The `atomMemory` contribution mounted by this browser half.
+ *
+ * Deliberately *not* a mirror of every `@Remote` method on the Host controller.
+ * A descriptor here exists so the browser can call it; mounting one the UI never
+ * calls only widens the stub surface, and every entry has to be kept in step
+ * with the Host's argument names or `assertExactArguments` throws at mount time
+ * (host descriptors derive parameter names from the method's source text). So
+ * the list is "what the settings panel actually uses":
+ *
+ *  - `getRuntime` / `overviewStatus` — the panel reads live values and overview
+ *    state through `memory-settings-controller.ts`, which uses the settings
+ *    namespace and cached snapshot rather than a direct RPC;
+ *  - `health` — polled by the Host's own composition (`index.ts`), which calls
+ *    the bridge directly and never goes through a browser stub;
+ *  - `unarchive` — no UI affordance exists for it yet. The Host method and its
+ *    Python RPC stay; add a descriptor here when a control is added.
+ */
 export const ATOM_MEMORY_REMOTE: TypertRemoteContribution = {
   package: 'dsh-atom-memory',
   descriptors: [
@@ -97,11 +114,7 @@ export const ATOM_MEMORY_REMOTE: TypertRemoteContribution = {
     jsonArgsMethod('generateProfile', true),
     jsonArgsMethod('backup', true),
     jsonArgsMethod('restore', true),
-    jsonArgsMethod('getRuntime', false),
-    jsonArgsMethod('health', false),
-    jsonArgsMethod('unarchive', true),
     jsonArgsMethod('changes', true),
-    jsonArgsMethod('overviewStatus', true),
     jsonArgsMethod('refreshOverview', true),
   ],
 }

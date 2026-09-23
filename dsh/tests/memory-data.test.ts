@@ -32,6 +32,31 @@ describe('sanitizeMemoryText', () => {
     expect(sanitizeMemoryText('می\u200Cرود')).toBe('می\u200Cرود')
   })
 
+  it('removes format characters by category, not only the ones on the list', () => {
+    // These are all Unicode `Cf` (invisible, non-whitespace) but are NOT in the
+    // hand-written STRIPPED_CODEPOINTS list. The host layer used to let every
+    // one of them through while the Python ingest layer removed it — a strictly
+    // weaker second layer, which is the failure mode the fence's own comment
+    // warns about. Sampled across the script blocks that carry them.
+    const missedCf = [
+      0x0600, // ARABIC NUMBER SIGN
+      0x0601, 0x0602, 0x0603, 0x0604, 0x0605, // other Arabic number signs
+      0x06dd, // ARABIC END OF AYAH
+      0x070f, // SYRIAC ABBREVIATION MARK
+      0x0890, 0x0891, // ARABIC POUND/PIASTRE MARK ABOVE
+      0x08e2, // ARABIC DISPUTED END OF AYAH
+      0x110bd, 0x110cd, // KAITHI NUMBER SIGNS
+      0x13430, 0x1343f, // EGYPTIAN HIEROGLYPH FORMAT CONTROLS
+      0x1bca0, 0x1bca3, // SHORTHAND FORMAT control
+      0x1d173, 0x1d17a, // MUSICAL SYMBOL BEGIN/END controls
+    ]
+    for (const cp of missedCf) {
+      const ch = String.fromCodePoint(cp)
+      const clean = sanitizeMemoryText(`a${ch}b`)
+      expect(clean, `U+${cp.toString(16).toUpperCase()} should be stripped`).toBe('ab')
+    }
+  })
+
   it('keeps newlines and normalises tabs and CRLF', () => {
     expect(sanitizeMemoryText('a\r\nb\tc')).toBe('a\nb c')
   })

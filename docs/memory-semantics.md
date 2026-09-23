@@ -455,6 +455,15 @@ gate covers a *reworded* body: for bodies long enough to be a document
 active facts sharing owner, type, subject and predicate, and a distance inside
 `dedup_max_distance` (0.10) also folds the write.
 
+Identity is per **scope window**, which is why the fingerprint is not enforced by
+a database constraint: the same claim captured independently in a second project
+is deliberately a *second fact* (linked through `fact_origin`), because that
+independent restatement is what the abstraction pass promotes. The invariant
+lives in the write path instead, and the re-check is performed *inside* the
+write transaction — the embedding is computed on a worker thread between the
+lookup and the `INSERT`, so checking only before that `await` would leave a
+window in which two writers both see "no existing row".
+
 **Why.** Before this, only an exact SPO repeat of a *single-valued* predicate was
 recognised. Knowledge and multi-valued facts could be stored again and again —
 the single largest source of noise in the store, and the reason "the same thing
@@ -463,13 +472,28 @@ deliberately asymmetric in strictness because the failure modes are: a false mer
 removes a distinct memory from the working set (recoverable only from the
 reinforcement log), while a missed merge costs one redundant row.
 
+**Probe depth.** The embedding comparison is a k-nearest-neighbour query whose
+`k` is a *global* truncation: `facts_vec` carries no owner column, so every
+acceptance test (status, owner, type, subject, predicate, scope) is applied
+afterwards in Python. `dedup_probe_k` sets how many neighbours are examined
+before those tests run, with a floor of 50. This matters in a multi-user store:
+with a pool of 5, another owner's nearer facts can fill it and the genuine
+duplicate is never examined, so dedup silently stops happening — and the failure
+is invisible, because the write succeeds and simply looks like a new fact.
+Raising the pool can only find *more* legitimate merges; the tests themselves
+are unchanged.
+
 **Owner.** `atom_memory/fingerprint.py`, `atom_memory/worker.py`
-(`_persist_fact` → `_fold_into`, `_near_duplicate`), migration 008.
+(`_persist_fact` → `_insert_fact_row`, `_fold_into`, `_near_duplicate`),
+migration 008.
 
 **Tests.** `tests/test_hardening.py` — same body/two titles folds on the
 fingerprint; a reworded body folds on the embedding; a different document does
 not; `dedup_max_distance = 0` disables only the semantic half; polarity and owner
-are part of the identity; the fingerprint is persisted on the row.
+are part of the identity; the fingerprint is persisted on the row; a duplicate is
+still found when other owners' nearer facts would fill a shallow pool.
+`tests/test_scope_writes.py` — the same claim in two scopes stays two facts, and
+a claim committed during the write window is folded rather than duplicated.
 
 ---
 

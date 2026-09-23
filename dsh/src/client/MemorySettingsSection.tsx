@@ -248,9 +248,18 @@ export function MemorySettingsSection(props: MemorySettingsSectionProps) {
   // `extractionModel {provider, model}`, so tracking the user's mode choice
   // locally lets the manual radio stay selected even while provider is still
   // empty (the user is about to type one).
+  //
+  // It is seeded from the document and then re-adopted whenever the document
+  // says something it could not have said before — otherwise a settings reload
+  // (or another client's write) would leave this radio disagreeing with the
+  // stored value, and the panel would show a mode the store is not in.
+  const storedModel = state.section.extractionModel
   const [modelManual, setModelManual] = useState<boolean>(
-    () => Boolean(state.section.extractionModel?.provider || state.section.extractionModel?.model),
+    () => Boolean(storedModel?.provider || storedModel?.model),
   )
+  useEffect(() => {
+    if (storedModel?.provider || storedModel?.model) setModelManual(true)
+  }, [storedModel?.provider, storedModel?.model])
 
   /** The committed injection budget (the Host clamps it on the way in). */
   const tokens = state.section.injectedSummaryTokens
@@ -802,10 +811,20 @@ function ProfileEditorModal(props: {
    * added a step that could be skipped by accident, leaving the choice silently
    * discarded when the modal closed. A ticked suggestion whose (section, key) is
    * already an editable row defers to that row, which may carry the user's edits.
+   *
+   * **Deleted rows travel in the envelope.** Ticking a row for deletion only
+   * marks it here; the store is what actually removes it, and the only thing
+   * that tells it which row to remove is the `deleted` flag (with the
+   * `section`/`key` that identify it). Filtering marked rows out of the envelope
+   * — as this used to — meant a deletion never left the browser: the row came
+   * back on the next refresh and the delete button looked broken. The filter is
+   * therefore over *identity*, not over `deleted`.
    */
   const saveEnvelope = (): Omit<ProfileDraft, 'uid'>[] => {
-    const draft = withoutUid(rows).filter(r => !r.deleted)
-    const present = new Set(draft.map(r => `${r.section}\u0000${r.key}`))
+    const draft = withoutUid(rows)
+    const present = new Set(
+      draft.filter(r => !r.deleted).map(r => `${r.section}\u0000${r.key}`),
+    )
     const additions = (suggestions ?? [])
       .filter(s => picked.has(suggestionId(s)))
       .filter(s => !present.has(suggestionId(s)))

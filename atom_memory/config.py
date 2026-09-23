@@ -171,6 +171,16 @@ class MemConfig:
     # only: a two-word object is a phrase, and two facts sharing a short phrase
     # are usually two facts.
     dedup_min_body_chars: int = 200
+    # How many vector neighbours the reworded-body probe examines before it
+    # applies its acceptance tests. This is a *global* truncation — the vector
+    # index carries no owner column, so "same owner" can only be checked after
+    # the join — and the tests are deliberately narrow (status, owner, type,
+    # subject, predicate, scope). A small pool therefore means those tests never
+    # see the row they would have accepted: in a multi-user store the nearest
+    # neighbours can all belong to other owners, and dedup silently stops
+    # happening. Raising it only ever finds *more* legitimate merges. `0` uses
+    # the built-in floor; values below it are raised to it.
+    dedup_probe_k: int = 0
 
     # -- retrieval ------------------------------------------------------------
     rrf_k: int = 60

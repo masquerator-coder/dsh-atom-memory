@@ -77,6 +77,26 @@ _INVISIBLE = "".join(
 # Cf category that is not already listed is removed as a catch-all.
 _FORMAT_KEEP = {0x200C, 0x200D}
 
+# -- What this deliberately does NOT remove, and why ---------------------------
+# Variation selectors are `Mn` (nonspacing mark), not `Cf`, so the category
+# catch-all above does not reach them. Only VS-1/VS-2 (U+FE00/U+FE01) are listed
+# explicitly, which means U+FE02-U+FE0F and U+E0100-U+E01EF survive.
+#
+# That is a considered decision, not an oversight:
+#   * They cannot hide an instruction. A variation selector is a *suffix* on the
+#     preceding visible character — it selects a glyph variant or forces emoji
+#     presentation. It carries no alphabet, unlike the tag block
+#     (U+E0020-U+E007F), which is an invisible encoding of ASCII and is stripped
+#     above in full. So "human sees X, model reads Y" does not have a path here.
+#   * The realistic effect is string inequality: `"A"` and `"A\uFE0F"` differ
+#     byte-wise, which can make an exact-match check miss. That is a
+#     normalisation concern, not an injection one.
+#   * Stripping them would corrupt legitimate content. U+FE0F is how a text
+#     character is asked to render as emoji (`❤` vs `❤️`), and dropping it
+#     changes what the user actually wrote.
+# The cost of removing them is a real editing of user data; the cost of keeping
+# them is a narrow matching edge case. So they stay.
+
 _ZERO_WIDTH = "".join(chr(cp) for cp in (0x200B, 0x200C, 0x200D, 0x2060))
 
 # Line / paragraph separators: they can inject structure into a rendered line.

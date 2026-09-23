@@ -267,6 +267,7 @@ class MemConfig:
     max_content_chars: int = 20000
     dedup_max_distance: float = 0.10
     dedup_min_body_chars: int = 200
+    dedup_probe_k: int = 0
     max_fact_tokens: int = 600
     task_lease_sec: float = 600.0
     reinforce_a_max: float = 0.5

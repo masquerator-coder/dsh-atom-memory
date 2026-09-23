@@ -199,11 +199,14 @@ export interface DeployTimeConfig {
   /**
    * Hard cap on the number of user-profile rows. `0` disables the cap.
    *
-   * The profile is rendered into the session system prompt through `user_md`,
-   * so every row is a cost paid on every request: this is what keeps that cost
-   * bounded. A write that would exceed it is refused with the count and the
-   * limit (editing an existing row is always allowed), rather than silently
-   * dropping the oldest entry.
+   * The profile is model-visible text: it is served by the `memory_user_md`
+   * tool, so a full read enters the *conversation*, and the settings panel
+   * renders it for the user. It is not part of the frozen session system
+   * prompt — that block is the compact summary alone — but it is still a cost
+   * paid whenever it is read and a body of text the model may act on, so every
+   * row is bounded. A write that would exceed this cap is refused with the count
+   * and the limit (editing an existing row is always allowed), rather than
+   * silently dropping the oldest entry.
    */
   maxProfileRows?: number
   /**

@@ -28,6 +28,7 @@ from typing import Iterable, Optional
 
 from .db import now_ms
 from .retriever import estimate_tokens
+from .sanitize import clean_body, clean_field
 from .validator import PREFERENCE_PREDICATES
 
 # Provenance stored in `user_profile.source`. Distinct from the credibility
@@ -41,7 +42,12 @@ SOURCE_GENERATED = "generated"
 # runaway value must not be able to push the render budget out on its own.
 _MAX_SECTION_CHARS = 200
 _MAX_KEY_CHARS = 200
-_MAX_VALUE_CHARS = 2000
+# Exported because the single-row write path (`AtomMem.upsert_profile`) cleans
+# *before* calling into here, in order to observe and report truncation. Two
+# independent caps would mean the value is measured against one number and
+# stored at another; this constant is the one authority.
+MAX_PROFILE_VALUE_CHARS = 2000
+_MAX_VALUE_CHARS = MAX_PROFILE_VALUE_CHARS
 
 
 class ProfileLimitExceeded(Exception):
@@ -70,8 +76,31 @@ def profile_row_count(conn: sqlite3.Connection, user_id: str) -> int:
 
 
 def _clean(text: object, limit: int) -> str:
-    """Normalise one stored field: stripped, single-spaced, length-bounded."""
-    return " ".join(str(text or "").split())[:limit]
+    """Normalise one stored field: stripped, single-spaced, length-bounded.
+
+    Runs the shared ingest sanitiser rather than collapsing whitespace alone.
+    The profile is rendered for the model (`profile_md`), so a value is
+    model-visible text and falls under the same rule as every other write path:
+    invisible characters are stripped before they are stored. Collapsing whitespace
+    by hand — as this used to — left bidi overrides (U+202E) and zero-width
+    characters intact, which is exactly the "instruction that a human reviewer
+    cannot see" shape the sanitiser exists to remove. The dsh host fences the
+    profile on the way out too, but a defence that only works when the caller
+    remembers to apply it is not a structural one: the *store* must not hold the
+    disguised text, or every future reader inherits the problem.
+    """
+    return clean_field(str(text or ""), limit)
+
+
+def _clean_body(text: object, limit: int) -> str:
+    """Normalise a multi-line stored field: sanitised, line structure kept.
+
+    Kept separate from :func:`_clean` because a profile *value* may legitimately
+    be a short list (a preference is often several lines) while a section name or
+    key is a headline that must stay on one line. Sanitising is identical; only
+    the line-structure decision differs, which is what ``multiline`` selects.
+    """
+    return clean_body(str(text or ""), limit)
 
 
 def upsert_profile(
@@ -146,7 +175,9 @@ def write_profile_rows(
     for row in rows:
         section = _clean(row.get("section"), _MAX_SECTION_CHARS)
         key = _clean(row.get("key"), _MAX_KEY_CHARS)
-        value = _clean(row.get("value"), _MAX_VALUE_CHARS)
+        # A value may be a short list, so it keeps its line structure; section
+        # and key are headlines and collapse to one line.
+        value = _clean_body(row.get("value"), _MAX_VALUE_CHARS)
         deleted = bool(row.get("deleted"))
         # Every row — including a deletion — has to identify its target.
         if not section or not key:

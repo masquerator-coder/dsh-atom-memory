@@ -57,7 +57,7 @@ import {
   type SessionCwdSource,
 } from './scope.ts'
 import {
-  createRuntime, SETTINGS_NAMESPACE, type LiveRuntime, Runtime,
+  createRuntime, SETTINGS_NAMESPACE, type LiveRuntime,
 } from './runtime.ts'
 import { AtomMemoryController } from './controller.ts'
 

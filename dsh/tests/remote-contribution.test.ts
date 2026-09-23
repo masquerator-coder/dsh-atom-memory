@@ -30,7 +30,7 @@ interface RuntimeStrictCodec {
 const asRuntimeStrict = (codec: unknown): RuntimeStrictCodec => codec as RuntimeStrictCodec
 
 describe('ATOM_MEMORY_REMOTE', () => {
-  it('targets the atomMemory namespace with all Host-exposed methods', () => {
+  it('targets the atomMemory namespace with the methods the panel calls', () => {
     expect(REMOTE_NAMESPACE).toBe('atomMemory')
     expect(ATOM_MEMORY_REMOTE.package).toBe('dsh-atom-memory')
     const methods = ATOM_MEMORY_REMOTE.descriptors.map(d => d.method)
@@ -46,11 +46,7 @@ describe('ATOM_MEMORY_REMOTE', () => {
       'generateProfile',
       'backup',
       'restore',
-      'getRuntime',
-      'health',
-      'unarchive',
       'changes',
-      'overviewStatus',
       'refreshOverview',
     ])
     for (const descriptor of ATOM_MEMORY_REMOTE.descriptors) {
@@ -83,27 +79,37 @@ describe('ATOM_MEMORY_REMOTE', () => {
     }
   })
 
-  it('gives every arg-carrying method a single named wire field for `args`', () => {
+  it('gives every method a single named wire field for `args`', () => {
     for (const descriptor of ATOM_MEMORY_REMOTE.descriptors) {
-      if (descriptor.method === 'getRuntime' || descriptor.method === 'health') {
-        expect(descriptor.parameters).toHaveLength(0)
-        continue
-      }
       expect(descriptor.parameters).toHaveLength(1)
       expect(descriptor.parameters[0]?.name).toBe('args')
       expect(descriptor.parameters[0]?.wire).toBe('args')
     }
   })
 
-  it('matches the Host @Remote marker set exactly', async () => {
+  it('mounts a subset of the Host @Remote methods, never one the Host lacks', async () => {
     // Independent source-of-truth: parse the Host controller source for @Remote.
+    //
+    // An equality assertion would be wrong in both directions. A descriptor the
+    // Host does not have is a real defect (the stub would call a method that is
+    // not served). A Host method with no descriptor is fine and intentional:
+    // `getRuntime`, `health`, `unarchive` and `overviewStatus` are reachable
+    // from the Host side and simply have no browser caller. Mounting them anyway
+    // would widen the stub surface and add four more argument-name contracts
+    // that `assertExactArguments` enforces at mount time.
     const source = await import('node:fs/promises').then(m =>
       m.readFile(new URL('../src/controller.ts', import.meta.url), 'utf8'))
     const marked: string[] = []
     for (const match of source.matchAll(/@Remote[\s\S]*?\n\s*(?:async\s+)?([A-Za-z_$][\w$]*)\s*\(/g)) {
       marked.push(match[1])
     }
-    expect([...ATOM_MEMORY_REMOTE.descriptors].map(d => d.method).sort())
-      .toEqual([...marked].sort())
+    const mounted = ATOM_MEMORY_REMOTE.descriptors.map(d => d.method)
+    // Every mounted method is served by the Host...
+    expect(mounted.filter(m => !marked.includes(m))).toEqual([])
+    // ...and the four known-unreachable ones stay unmounted until a UI exists.
+    expect(mounted).not.toContain('unarchive')
+    expect(mounted).not.toContain('overviewStatus')
+    expect(mounted).not.toContain('getRuntime')
+    expect(mounted).not.toContain('health')
   })
 })

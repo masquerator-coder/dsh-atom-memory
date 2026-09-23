@@ -470,6 +470,41 @@ describe('MemorySettingsSection client render', () => {
     ])
   })
 
+  it('sends marked profile rows in the save envelope so a deletion actually lands', async () => {
+    const controller = buildController(false, true)
+    const { props } = bind(controller)
+    const saved: ProfileEditRow[][] = []
+    props.saveAllProfile = (async (rows: ProfileEditRow[]) => { saved.push(rows) }) as never
+    await act(async () => {
+      render(createElement(MemorySettingsSection, props))
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.click(screen.getByText('编辑画像'))
+    })
+    await act(async () => {})
+
+    // Mark the one stored row for deletion. The row goes grey but is NOT
+    // removed from the table — the store is what removes it.
+    await act(async () => {
+      fireEvent.click(within(screen.getAllByRole('row')[1]!).getByText(zh.factDelete))
+    })
+    await act(async () => {})
+
+    await act(async () => {
+      fireEvent.click(screen.getAllByText('保存全部')[0]!)
+    })
+    await act(async () => {})
+
+    // The envelope must still carry the row, flagged `deleted` with the
+    // section/key that identify it — dropping it here is what made the delete
+    // button a no-op (the row came back on the next refresh).
+    expect(saved).toHaveLength(1)
+    expect(saved[0]).toEqual([
+      { section: '偏好', key: '回答语言', value: '中文', deleted: true },
+    ])
+  })
+
   it('writes the ticked suggestions on save, with no separate accept step', async () => {
     const controller = buildController(false, false)
     const { props } = bind(controller)

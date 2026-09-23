@@ -238,6 +238,49 @@ def test_write_profile_batch_is_all_or_nothing(tmp_path, monkeypatch):
     _run(scenario())
 
 
+def test_profile_writes_strip_invisible_characters(tmp_path, monkeypatch):
+    """Both profile write paths sanitise, so the store never holds a hidden instruction.
+
+    A profile value is rendered for the model, so it is model-visible text and
+    falls under the same ingest rule as a fact body. The batch path used to
+    collapse whitespace only, which left bidi overrides and zero-width
+    characters intact — the exact "instruction a human reviewer cannot see"
+    shape. The host fences the profile on the way out too, but a defence that
+    depends on every caller remembering to apply it is not a structural one.
+    """
+    mem = _make(tmp_path, monkeypatch)
+    # U+202E (RLO) reorders how a line reads; U+200B is invisible; U+2066 (LRI)
+    # is a bidi isolate. All are category Cf and most are not on the host's
+    # hand-maintained list, so the ingest layer is the one that must remove them.
+    hostile = "工程\u202e师\u200b\u2066值"
+
+    async def scenario():
+        await mem.start()
+
+        # The batch path (the settings panel's one "save all").
+        mem.write_profile("u1", [{"section": "职业", "key": "value", "value": hostile}])
+        rows = {r["section"]: r["value"] for r in mem.list_profile("u1")["profile"]}
+        assert rows["职业"] == "工程师值"
+
+        # The single-row path reports what it cleaned, and stores the same text.
+        mem.upsert_profile("u1", "城市", "value", hostile)
+        rows = {r["section"]: r["value"] for r in mem.list_profile("u1")["profile"]}
+        assert rows["城市"] == "工程师值"
+
+        # Section and key are headlines: they sanitise and stay single-line.
+        mem.write_profile("u1", [{"section": f"备注{hostile}\n下一行", "key": "k", "value": "v"}])
+        sections = [r["section"] for r in mem.list_profile("u1")["profile"]]
+        assert any(s == "备注工程师值 下一行" for s in sections), sections
+
+        # The rendered form the model would read carries no invisible character.
+        for row in mem.list_profile("u1")["profile"]:
+            for ch in row["section"] + row["key"] + row["value"]:
+                assert ch not in "\u202e\u200b\u2066\u200e\u200f\u2069"
+        await mem.stop()
+
+    _run(scenario())
+
+
 def test_backup_restore_roundtrip(tmp_path, monkeypatch):
     mem = _make(tmp_path, monkeypatch)
 

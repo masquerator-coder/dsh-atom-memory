@@ -24,14 +24,32 @@ import { randomUUID } from 'node:crypto'
 
 /** Shape of the process we drive — injectable so tests can fake it. */
 export interface ProcessLike {
-  stdin: { write(chunk: string): boolean; on(event: 'error', listener: () => void): unknown }
+  stdin: {
+    write(chunk: string): boolean
+    /** Flush and close the child's stdin — the signal that no more requests follow. */
+    end(): unknown
+    on(event: 'error', listener: () => void): unknown
+  }
   stdout: NodeJS.ReadableStream
   stderr: NodeJS.ReadableStream
   kill(signal?: NodeJS.Signals): boolean
   on(event: 'error', listener: (err: Error) => void): unknown
   on(event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown
+  once(event: 'error', listener: (err: Error) => void): unknown
+  once(event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown
   pid?: number
 }
+
+/**
+ * How long a child gets to answer the `stop` request and exit on its own.
+ *
+ * Bounded rather than open-ended: `dispose()` runs from an effect disposer
+ * during plugin unload, so a child that is wedged (a stuck database lock, a
+ * model process that will not die) must not be able to block teardown. Two
+ * seconds is comfortably more than a flush needs and short enough that unload
+ * still feels immediate.
+ */
+const GRACEFUL_STOP_MS = 2_000
 
 export interface BridgeDeps {
   /** Spawn the Python child process (injectable for tests). */
@@ -237,6 +255,16 @@ export class PythonBridge {
   /**
    * Stop the Python memory (flushing the worker / DB) and kill the process.
    * Idempotent and safe to call from an effect disposer.
+   *
+   * The stop frame is a *request*, not a kill: the child answers it by flushing
+   * its worker and closing the database, then exiting. This used to write the
+   * frame and call `kill()` on the very next line, which meant the SIGTERM
+   * could land before the child had read the frame at all — so the comment
+   * promising a flush described something that did not happen, and an unflushed
+   * WAL was the normal outcome rather than a rare one. Now the child is given
+   * {@link GRACEFUL_STOP_MS} to exit on its own, and only a child that has not
+   * gone by then is killed. The wait is bounded, so a wedged child still cannot
+   * hold up teardown.
    */
   async dispose(): Promise<void> {
     if (this.disposed) return
@@ -245,18 +273,36 @@ export class PythonBridge {
     const proc = this.proc
     this.proc = undefined
     if (proc !== undefined) {
-      // Best-effort graceful stop so the worker flushes before exit.
+      // Ask the child to stop, then let it finish. `exit` is the only reliable
+      // signal here: the child closes the database as its last act, so any
+      // earlier observation would be guessing.
+      let gone = false
+      const exited = new Promise<void>((resolve) => {
+        const done = (): void => { gone = true; resolve() }
+        proc.once('exit', done)
+        proc.once('error', done)
+      })
       try {
         proc.stdin.write(JSON.stringify({ id: 'shutdown', method: 'stop' }) + '\n')
+        // The write is buffered; end() flushes it and closes the child's stdin,
+        // which is what tells the child no further requests are coming.
+        proc.stdin.end()
       } catch {
         /* the child may already be gone */
       }
+      await Promise.race([
+        exited,
+        new Promise<void>((resolve) => setTimeout(resolve, GRACEFUL_STOP_MS)),
+      ])
       try {
         this.onReadyClose()
       } catch {
         /* ignore */
       }
-      proc.kill()
+      // Only a child still running after the grace period is killed — killing a
+      // process that has already exited is pointless, and (on a pid that the OS
+      // has meanwhile reused) actively harmful.
+      if (!gone) proc.kill()
     }
     this.rejectAll(new Error('bridge disposed'))
   }

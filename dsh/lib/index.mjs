@@ -96,6 +96,14 @@ let _initProto;function _applyDecs(e,t,n,r,o,i){var a,c,u,s,f,l,p,d=Symbol.metad
 *
 * @module dsh-atom-memory/bridge
 *//**
+* How long a child gets to answer the `stop` request and exit on its own.
+*
+* Bounded rather than open-ended: `dispose()` runs from an effect disposer
+* during plugin unload, so a child that is wedged (a stuck database lock, a
+* model process that will not die) must not be able to block teardown. Two
+* seconds is comfortably more than a flush needs and short enough that unload
+* still feels immediate.
+*/const GRACEFUL_STOP_MS=2e3;/**
 * Environment for the Python child: the host env minus secret-bearing variables.
 *
 * The child only genuinely needs `PATH` (to locate the interpreter) plus the
@@ -135,7 +143,17 @@ let _initProto;function _applyDecs(e,t,n,r,o,i){var a,c,u,s,f,l,p,d=Symbol.metad
 	*/async healthDetail(timeoutMs=5e3){if(this.proc===void 0)return void 0;try{return await this.call("health",{},timeoutMs);}catch{return;}}/** Send the Python `start`/config had already been acked lazily. */async health(){return(await this.healthDetail())?.ok===true;}/**
 	* Stop the Python memory (flushing the worker / DB) and kill the process.
 	* Idempotent and safe to call from an effect disposer.
-	*/async dispose(){if(this.disposed)return;this.disposed=true;this.ready=false;const proc=this.proc;this.proc=void 0;if(proc!==void 0){try{proc.stdin.write(JSON.stringify({id:"shutdown",method:"stop"})+"\n");}catch{}try{this.onReadyClose();}catch{}proc.kill();}this.rejectAll(/* @__PURE__ */new Error("bridge disposed"));}wireStreams(){const proc=this.proc;const quiet=()=>{};proc.stdin.on("error",quiet);proc.stdout.on("error",quiet);proc.stderr.on("error",quiet);this.incoming=createInterface({input:proc.stdout,crlfDelay:Infinity});this.outgoing=proc.stdin;this.incoming.on("line",line=>{if(!line)return;this.handleLine(line);});createInterface({input:proc.stderr,crlfDelay:Infinity}).on("line",line=>{this.handleStderr(line);});}handleLine(line){let msg;try{msg=JSON.parse(line);}catch{return;}const id=msg.id;if(id===void 0)return;const pending=this.pending.get(String(id));if(pending===void 0)return;clearTimeout(pending.timer);this.pending.delete(String(id));if(msg.ok===true)pending.resolve(msg.result);else pending.reject(new Error(String(msg.error??"RPC error")));}handleStderr(line){if(line.startsWith("EVT ")){try{this.onEvent?.(JSON.parse(line.slice(4)));}catch{}return;}if(line.startsWith("LOG ")){this.onLog?.(line.slice(4));return;}}onReadyClose(){try{this.incoming?.close();}catch{}}rejectAll(err){for(const p of this.pending.values()){clearTimeout(p.timer);p.reject(err);}this.pending.clear();}handleExit(code,signal){if(this.disposed)return;const wasReady=this.ready;this.ready=false;const proc=this.proc;this.proc=void 0;this.onReadyClose();if(proc!==void 0)this.onLog?.(`[atom-memory] python bridge exited (code=${code}, signal=${signal})`);this.rejectAll(/* @__PURE__ */new Error(`python bridge exited (code=${code}, signal=${signal})`));if(wasReady)this.onExit?.();}};//#endregion
+	*
+	* The stop frame is a *request*, not a kill: the child answers it by flushing
+	* its worker and closing the database, then exiting. This used to write the
+	* frame and call `kill()` on the very next line, which meant the SIGTERM
+	* could land before the child had read the frame at all — so the comment
+	* promising a flush described something that did not happen, and an unflushed
+	* WAL was the normal outcome rather than a rare one. Now the child is given
+	* {@link GRACEFUL_STOP_MS} to exit on its own, and only a child that has not
+	* gone by then is killed. The wait is bounded, so a wedged child still cannot
+	* hold up teardown.
+	*/async dispose(){if(this.disposed)return;this.disposed=true;this.ready=false;const proc=this.proc;this.proc=void 0;if(proc!==void 0){let gone=false;const exited=new Promise(resolve=>{const done=()=>{gone=true;resolve();};proc.once("exit",done);proc.once("error",done);});try{proc.stdin.write(JSON.stringify({id:"shutdown",method:"stop"})+"\n");proc.stdin.end();}catch{}await Promise.race([exited,new Promise(resolve=>setTimeout(resolve,GRACEFUL_STOP_MS))]);try{this.onReadyClose();}catch{}if(!gone)proc.kill();}this.rejectAll(/* @__PURE__ */new Error("bridge disposed"));}wireStreams(){const proc=this.proc;const quiet=()=>{};proc.stdin.on("error",quiet);proc.stdout.on("error",quiet);proc.stderr.on("error",quiet);this.incoming=createInterface({input:proc.stdout,crlfDelay:Infinity});this.outgoing=proc.stdin;this.incoming.on("line",line=>{if(!line)return;this.handleLine(line);});createInterface({input:proc.stderr,crlfDelay:Infinity}).on("line",line=>{this.handleStderr(line);});}handleLine(line){let msg;try{msg=JSON.parse(line);}catch{return;}const id=msg.id;if(id===void 0)return;const pending=this.pending.get(String(id));if(pending===void 0)return;clearTimeout(pending.timer);this.pending.delete(String(id));if(msg.ok===true)pending.resolve(msg.result);else pending.reject(new Error(String(msg.error??"RPC error")));}handleStderr(line){if(line.startsWith("EVT ")){try{this.onEvent?.(JSON.parse(line.slice(4)));}catch{}return;}if(line.startsWith("LOG ")){this.onLog?.(line.slice(4));return;}}onReadyClose(){try{this.incoming?.close();}catch{}}rejectAll(err){for(const p of this.pending.values()){clearTimeout(p.timer);p.reject(err);}this.pending.clear();}handleExit(code,signal){if(this.disposed)return;const wasReady=this.ready;this.ready=false;const proc=this.proc;this.proc=void 0;this.onReadyClose();if(proc!==void 0)this.onLog?.(`[atom-memory] python bridge exited (code=${code}, signal=${signal})`);this.rejectAll(/* @__PURE__ */new Error(`python bridge exited (code=${code}, signal=${signal})`));if(wasReady)this.onExit?.();}};//#endregion
 //#region src/tools.ts
 /**
 * Minimum trimmed length (characters) for the raw knowledge fallback. Below
@@ -286,9 +304,36 @@ let _initProto;function _applyDecs(e,t,n,r,o,i){var a,c,u,s,f,l,p,d=Symbol.metad
 * BOM/soft hyphen/invisible-operator family, and Unicode tag characters (an
 * invisible ASCII alphabet).
 *
-* Kept in sync with the ingest list in `atom_memory/sanitize.py` — both layers
-* must agree on what "invisible" means or one of them becomes decorative.
-*/const STRIPPED_CODEPOINTS=[[173,173],[847,847],[1564,1564],[4447,4448],[6068,6069],[6155,6158],[8203,8203],[8206,8207],[8232,8233],[8234,8238],[8288,8292],[8294,8303],[65024,65025],[65279,65279],[65440,65440],[65529,65532],[917505,917505],[917536,917632]];function isStripped(code){for(const[lo,hi]of STRIPPED_CODEPOINTS)if(code>=lo&&code<=hi)return true;if(code<32&&code!==9&&code!==10)return true;if(code>=127&&code<=159)return true;return false;}/**
+* This list is the *documented* core — it names the shapes a reviewer should
+* recognise. It is deliberately not the whole rule: {@link isStripped} also
+* removes anything Unicode categorises as `Cf`/`Cc`, because a hand-maintained
+* list is always behind the standard and the Python ingest layer
+* (`atom_memory/sanitize.py`) already decides by category. Reviewing this list
+* and the categories, the two layers agree on what "invisible" means — which is
+* what stops one of them from being decorative.
+*/const STRIPPED_CODEPOINTS=[[173,173],[847,847],[1564,1564],[4447,4448],[6068,6069],[6155,6158],[8203,8203],[8206,8207],[8232,8233],[8234,8238],[8288,8292],[8294,8303],[65024,65025],[65279,65279],[65440,65440],[65529,65532],[917505,917505],[917536,917632]];/**
+* The two format characters both layers deliberately keep.
+*
+* ZWNJ/ZWJ are the only format characters with a load-bearing typographic role
+* (emoji sequences, Indic/Persian letter joining) and the only ones that carry
+* no glyph of their own, so keeping them costs no safety. Mirrors
+* `_FORMAT_KEEP` in `atom_memory/sanitize.py`.
+*/const FORMAT_KEEP=/* @__PURE__ */new Set([8204,8205]);/**
+* Unicode property escapes for the two categories the ingest layer rejects
+* wholesale (`sanitize.py`: `_is_stripped_format` / `_is_stripped_control`).
+*
+* These are the real rule; {@link STRIPPED_CODEPOINTS} is the readable subset.
+* Without this, the host layer was strictly weaker than the ingest layer: it
+* let through every `Cf` the list forgot — Arabic/Syriac number signs
+* (U+0600..U+0605, U+06DD, U+070F), Egyptian hieroglyph format controls
+* (U+13430..U+1343F), Kaithi number signs (U+1BCA0..U+1BCA3), musical symbol
+* controls (U+1D173..U+1D17A) and the higher variation selectors
+* (U+FE02..FE0F, U+E0100..E01EF). All are invisible and none is whitespace, so
+* they survived the whitespace collapse and reached the prompt — exactly the
+* "an instruction that hides from a human reviewer" shape the fence exists to
+* remove. A store written before the ingest layer existed, or through a path
+* that bypassed it, is caught here rather than only there.
+*/const FORMAT_OR_CONTROL=/[\p{Cf}\p{Cc}]/u;function isStripped(code){if(FORMAT_KEEP.has(code))return false;for(const[lo,hi]of STRIPPED_CODEPOINTS)if(code>=lo&&code<=hi)return true;if(code<32&&code!==9&&code!==10)return true;if(code===9||code===10)return false;return FORMAT_OR_CONTROL.test(String.fromCodePoint(code));}/**
 * Remove invisible and control characters, normalise line endings, and
 * neutralise the fence markers so the block cannot be terminated early.
 *

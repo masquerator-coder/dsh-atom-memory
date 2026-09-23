@@ -845,7 +845,11 @@ window.__ModuleLoader__.load({
 			const [modal, setModal] = (0, react.useState)();
 			const [summaryBusy, setSummaryBusy] = (0, react.useState)(false);
 			const [summaryError, setSummaryError] = (0, react.useState)();
-			const [modelManual, setModelManual] = (0, react.useState)(() => Boolean(state.section.extractionModel?.provider || state.section.extractionModel?.model));
+			const storedModel = state.section.extractionModel;
+			const [modelManual, setModelManual] = (0, react.useState)(() => Boolean(storedModel?.provider || storedModel?.model));
+			(0, react.useEffect)(() => {
+				if (storedModel?.provider || storedModel?.model) setModelManual(true);
+			}, [storedModel?.provider, storedModel?.model]);
 			/** The committed injection budget (the Host clamps it on the way in). */
 			const tokens = state.section.injectedSummaryTokens;
 			const rungIndex = nearestInjectedSummaryPresetIndex(tokens);
@@ -1433,10 +1437,18 @@ window.__ModuleLoader__.load({
 			* added a step that could be skipped by accident, leaving the choice silently
 			* discarded when the modal closed. A ticked suggestion whose (section, key) is
 			* already an editable row defers to that row, which may carry the user's edits.
+			*
+			* **Deleted rows travel in the envelope.** Ticking a row for deletion only
+			* marks it here; the store is what actually removes it, and the only thing
+			* that tells it which row to remove is the `deleted` flag (with the
+			* `section`/`key` that identify it). Filtering marked rows out of the envelope
+			* — as this used to — meant a deletion never left the browser: the row came
+			* back on the next refresh and the delete button looked broken. The filter is
+			* therefore over *identity*, not over `deleted`.
 			*/
 			const saveEnvelope = () => {
-				const draft = withoutUid(rows).filter((r) => !r.deleted);
-				const present = new Set(draft.map((r) => `${r.section}\u0000${r.key}`));
+				const draft = withoutUid(rows);
+				const present = new Set(draft.filter((r) => !r.deleted).map((r) => `${r.section}\u0000${r.key}`));
 				const additions = (suggestions ?? []).filter((s) => picked.has(suggestionId(s))).filter((s) => !present.has(suggestionId(s))).map((s) => ({
 					section: s.section,
 					key: s.key,
@@ -1705,7 +1717,24 @@ window.__ModuleLoader__.load({
 				result: JSON_CODEC
 			};
 		}
-		/** The `atomMemory` contribution mounted by this browser half. */
+		/**
+		* The `atomMemory` contribution mounted by this browser half.
+		*
+		* Deliberately *not* a mirror of every `@Remote` method on the Host controller.
+		* A descriptor here exists so the browser can call it; mounting one the UI never
+		* calls only widens the stub surface, and every entry has to be kept in step
+		* with the Host's argument names or `assertExactArguments` throws at mount time
+		* (host descriptors derive parameter names from the method's source text). So
+		* the list is "what the settings panel actually uses":
+		*
+		*  - `getRuntime` / `overviewStatus` — the panel reads live values and overview
+		*    state through `memory-settings-controller.ts`, which uses the settings
+		*    namespace and cached snapshot rather than a direct RPC;
+		*  - `health` — polled by the Host's own composition (`index.ts`), which calls
+		*    the bridge directly and never goes through a browser stub;
+		*  - `unarchive` — no UI affordance exists for it yet. The Host method and its
+		*    Python RPC stay; add a descriptor here when a control is added.
+		*/
 		const ATOM_MEMORY_REMOTE = {
 			package: "dsh-atom-memory",
 			descriptors: [
@@ -1720,11 +1749,7 @@ window.__ModuleLoader__.load({
 				jsonArgsMethod("generateProfile", true),
 				jsonArgsMethod("backup", true),
 				jsonArgsMethod("restore", true),
-				jsonArgsMethod("getRuntime", false),
-				jsonArgsMethod("health", false),
-				jsonArgsMethod("unarchive", true),
 				jsonArgsMethod("changes", true),
-				jsonArgsMethod("overviewStatus", true),
 				jsonArgsMethod("refreshOverview", true)
 			]
 		};

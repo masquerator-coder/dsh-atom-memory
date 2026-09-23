@@ -1,5 +1,5 @@
-import { describe, it, expect, vi } from 'vitest'
-import { createRuntime, Runtime } from '../src/runtime.ts'
+import { describe, it, expect } from 'vitest'
+import { createRuntime } from '../src/runtime.ts'
 import {
   DEFAULT_INJECTED_SUMMARY_TOKENS,
   INJECTED_SUMMARY_TOKEN_PRESETS,
@@ -83,52 +83,5 @@ describe('nearestInjectedSummaryPresetIndex', () => {
     expect(nearestInjectedSummaryPresetIndex(Number.NaN)).toBe(defaultIndex)
     expect(nearestInjectedSummaryPresetIndex(undefined)).toBe(defaultIndex)
     expect(nearestInjectedSummaryPresetIndex('abc')).toBe(defaultIndex)
-  })
-})
-
-describe('Runtime', () => {
-  it('reads back an internally stable snapshot', () => {
-    const runtime = new Runtime(createRuntime({ captureEnabled: true }))
-    expect(runtime.get().captureEnabled).toBe(true)
-  })
-
-  it('notifies listeners only when the live flags actually change', () => {
-    const runtime = new Runtime(createRuntime({ captureEnabled: true }))
-    const listener = vi.fn()
-    const off = runtime.subscribe(listener)
-
-    runtime.set({ ...runtime.get(), captureEnabled: false })
-    expect(listener).toHaveBeenCalledTimes(1)
-
-    // Same flag value again -> no notification.
-    runtime.set({ ...runtime.get(), extractionModel: { provider: 'p', model: 'm' } })
-    expect(listener).toHaveBeenCalledTimes(1)
-
-    off()
-    runtime.set({ ...runtime.get(), llmExtractionEnabled: false })
-    expect(listener).toHaveBeenCalledTimes(1)
-  })
-
-  it('reports the injection switch after a toggle', () => {
-    const runtime = new Runtime(createRuntime({ contextInjectionEnabled: true }))
-    runtime.set({ ...runtime.get(), contextInjectionEnabled: false })
-    expect(runtime.get().contextInjectionEnabled).toBe(false)
-  })
-
-  it('keeps the injection budget out of the change notification', () => {
-    // Nothing re-wires on a budget change: it is read when a snapshot freezes,
-    // so notifying listeners would only cause pointless work.
-    const runtime = new Runtime(createRuntime({}))
-    const listener = vi.fn()
-    runtime.subscribe(listener)
-    runtime.set({ ...runtime.get(), injectedSummaryTokens: 300 })
-    expect(runtime.get().injectedSummaryTokens).toBe(300)
-    expect(listener).not.toHaveBeenCalled()
-  })
-
-  it('clamps a budget written straight through set()', () => {
-    const runtime = new Runtime(createRuntime({}))
-    runtime.set({ ...runtime.get(), injectedSummaryTokens: Number.NaN })
-    expect(runtime.get().injectedSummaryTokens).toBe(DEFAULT_INJECTED_SUMMARY_TOKENS)
   })
 })

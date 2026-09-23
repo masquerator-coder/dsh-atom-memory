@@ -73,6 +73,34 @@ def test_unrelated_unicode_categories_are_untouched():
     assert unicodedata.category("①") != "Cf"
 
 
+def test_variation_selectors_are_kept_on_purpose():
+    """Pins a decision that looks like an omission.
+
+    Variation selectors are `Mn`, not `Cf`, so the category catch-all does not
+    remove them — only VS-1/VS-2 are listed explicitly. A future reviewer will
+    read that as a gap. It is not:
+
+      * a variation selector is a *suffix* on the preceding visible character, so
+        it carries no alphabet and cannot encode a hidden instruction (contrast
+        the tag block U+E0020-U+E007F, an invisible ASCII encoding that IS
+        stripped in full);
+      * stripping U+FE0F would corrupt real content — it is how `❤` is asked to
+        render as `❤️`.
+
+    The cost of keeping them is a narrow string-equality edge case; the cost of
+    removing them is editing what the user wrote. If this test is ever changed,
+    that trade-off is what is being decided.
+    """
+    assert unicodedata.category("\ufe0f") == "Mn"
+    assert unicodedata.category("\U000e0100") == "Mn"
+    assert strip_invisible("A\ufe0fB") == "A\ufe0fB"
+    assert strip_invisible("A\U000e0100B") == "A\U000e0100B"
+    # The tag block, which *can* hide an encoding, is a different story.
+    assert strip_invisible("A\U000e0041B") == "AB"
+    # The two explicitly listed ones are still removed.
+    assert strip_invisible("A\ufe00B") == "AB"
+
+
 # ---- field vs body shaping ---------------------------------------------------
 
 def test_field_is_single_line_and_collapsed():
