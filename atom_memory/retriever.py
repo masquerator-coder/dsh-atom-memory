@@ -30,7 +30,8 @@ candidate ages: ages are shifted so the newest candidate is the reference
 (:func:`~atom_memory.db.age_offset`) and then decayed
 (:func:`~atom_memory.db.recency_credit`). It is measured from ``last_used_at``
 where the fact has been used, so a long-lived fact that is still in active use is
-not aged out for being old. See :data:`RECENCY_HALF_LIFE_DAYS` for the tuning.
+not aged out for being old. See ``MemConfig.recency_half_life_days`` for the
+tuning (the module-level ``RECENCY_HALF_LIFE_DAYS`` is only the default).
 
 Two filters decide whether a candidate is *relevant enough to answer with*,
 because a memory that always returns its least-bad row cannot say "I don't know":
@@ -97,6 +98,11 @@ MIN_RELEVANCE = 0.0
 # Age at which a fact's recency credit halves, and how far back the relative
 # shift may reach. See db.age_offset / db.recency_credit for why recency is a
 # shifted exponential decay rather than a per-query min-max rescale of ages.
+#
+# These are the *defaults*; the effective values come from
+# `MemConfig.recency_half_life_days` / `recency_reference_window_days` so a
+# deployment can retune them without patching the module. They stay exported
+# because they document the shipped ratio and are asserted on by tests.
 #
 # 30 days is deliberately much longer than the summary view's 14: that view
 # answers "what is going on right now" for a session-start snapshot, while this
@@ -248,15 +254,29 @@ class Retriever:
         )
         blob = await asyncio.to_thread(self.embed_one, query)
 
+        # The two legs retrieve a *deeper* pool than the caller asked to see.
+        # Fusing only `k` ids per leg conflates "how many results to return"
+        # with "how far down each ranking to look", and RRF's arithmetic then
+        # settles the question by itself: a fact present in both lists scores
+        # 2/(k+1) while one present in a single list scores at most 1/(k+1),
+        # so any fact outside *both* top-k lists is structurally unreachable no
+        # matter how good it is. Measured on a real store: the fact that
+        # actually answered the query ranked 15th lexically and 11th
+        # semantically, and was therefore invisible by construction. Retrieving
+        # deep and trimming after the re-rank is what lets the four base terms
+        # (importance / recency / trust) promote a deep-but-relevant candidate
+        # over a shallow-but-generic one.
+        pool = max(k * self.config.candidate_pool_multiplier, k)
+
         vec_ids = self._vector_knn(
             user_id,
             blob,
-            k,
+            pool,
             max_distance=self.config.max_vector_distance,
             scope_sql=scope_sql,
             scope_args=scope_args,
         )
-        fts_ids = self._fts_search(user_id, query, k, scope_sql, scope_args)
+        fts_ids = self._fts_search(user_id, query, pool, scope_sql, scope_args)
 
         fused = rrf_merge(fts_ids, vec_ids, k=self.config.rrf_k)
         if not fused:
@@ -415,7 +435,18 @@ class Retriever:
                     f"AND fact_id IN ({inner}) ORDER BY distance LIMIT ?",
                     (blob, user_id, *scope_args, k),
                 ).fetchall()
-                rows = [r for r in rows if float(r["distance"]) <= max_distance]
+                # `distance` comes back NULL when the index cannot compute one for
+                # this row/query pair (seen with a non-normalised query vector).
+                # That is "unknown", not "near": treating it as a pass would let
+                # an unmeasurable row through the very gate that exists to keep
+                # unknown-distance rows out, and `float(None)` would otherwise
+                # raise a TypeError that escapes the sqlite3.Error handler below
+                # and takes down the whole search.
+                rows = [
+                    r for r in rows
+                    if r["distance"] is not None
+                    and float(r["distance"]) <= max_distance
+                ]
             return [r["fact_id"] for r in rows]
         except sqlite3.Error as exc:  # pragma: no cover - defensive
             logger.warning("vector KNN failed: %s", exc)
@@ -530,11 +561,12 @@ class Retriever:
         # Recency is relative to the newest candidate, with the shift capped so
         # an entirely-old result set still spreads its credits. See
         # db.age_offset for why neither a raw wall-clock age nor an uncapped
-        # shift to zero works, and RECENCY_REFERENCE_WINDOW_DAYS for why the cap
-        # must stay well above the half-life.
+        # shift to zero works, and the window cap for why it must stay well above
+        # the half-life. Both come from the config so they can be retuned per
+        # deployment; the module constants are the shipped defaults.
         newest_age = min(age_ms)
-        window_ms = RECENCY_REFERENCE_WINDOW_DAYS * MS_PER_DAY
-        half_life_ms = RECENCY_HALF_LIFE_DAYS * MS_PER_DAY
+        window_ms = self.config.resolved_recency_window_days() * MS_PER_DAY
+        half_life_ms = float(self.config.recency_half_life_days) * MS_PER_DAY
 
         # Absolute, *not* min-max normalised — the same rule as the relevance
         # term above. Min-max rescales the candidate set so the best fact always

@@ -8,28 +8,88 @@
 import z from '@deepseek-ai/schemastery'
 import { DEFAULT_INJECTED_SUMMARY_TOKENS } from './injection-budget.ts'
 
-export interface Config {
+/**
+ * A settings-owned reference whose `get()` returns the current snapshot.
+ *
+ * Declared structurally rather than imported: the canonical definition lives in
+ * `@deepseek-ai/cosmokit` (`lib/types/volatile.d.ts`), which is not a dependency
+ * of this plugin, and the harness's own plugins reach it through cordis's
+ * re-export — which this cordis version (4.0.2) does not provide. The shape is
+ * a single method, so restating it here costs nothing and keeps the plugin free
+ * of a dependency it would otherwise need only for a one-line interface.
+ */
+export interface Volatile<T> {
+  /** @returns the current immutable snapshot. */
+  get(): T
+}
+
+/**
+ * The live half of the plugin configuration, as the runtime sees it.
+ *
+ * Every field here is `.volatile()` in {@link Config}, which changes its TYPE:
+ * schemastery's output for a volatile node is `Volatile<T>` — a stable
+ * reference whose `get()` returns the current snapshot — not a plain value. The
+ * harness's own plugins declare the same shape (see
+ * `packages/client/ui-theme/src/index.ts`), and reading through `get()` is what
+ * makes a settings-panel edit visible to the plugin without a reload.
+ *
+ * This matters for the panel to exist at all: DSH's settings layer builds a
+ * plugin's page from `volatileForm(schema)`, which only descends into nodes
+ * marked volatile. A Config with no volatile field yields no form, and
+ * `describe()` then omits the namespace from the served list entirely — the
+ * browser panel finds nothing, reports itself unavailable, and every control it
+ * guards renders disabled.
+ */
+export interface LiveConfig {
+  /** Manual LLM extraction model override; empty provider+model = follow dsh default. */
+  extractionModel: Volatile<ExtractionModelConfig>
+  /** Whether the session/durable capture hooks (turn/end, user/message) run. */
+  captureEnabled: Volatile<boolean | undefined>
+  /** Whether the LLM-first extractor is wired to the dsh default model. */
+  llmExtractionEnabled: Volatile<boolean | undefined>
+  /** Token cap for the summary snapshot frozen into the system prompt. */
+  injectedSummaryTokens: Volatile<number | undefined>
+  /** Inject a session-start-frozen summary snapshot into the system prompt. */
+  contextInjectionEnabled: Volatile<boolean | undefined>
+  /** Whether the out-of-band work-overview synthesis runs. */
+  overviewEnabled: Volatile<boolean | undefined>
+}
+
+/** Shape of the extraction-model override as stored in the settings document. */
+export interface ExtractionModelConfig {
+  provider?: string
+  model?: string
+  baseURL?: string
+  protocol?: string
+  apiKey?: string
+}
+
+/**
+ * The plugin configuration as `apply` receives it: the schema's inferred output.
+ *
+ * Derived from the schema rather than hand-written, so the two cannot drift. A
+ * hand-written `Config` would have to restate every `.volatile()` field as
+ * `Volatile<T>` by hand — and the one time that restatement is wrong, the
+ * compiler blames the schema instead of the interface, which is the wrong file
+ * to be editing.
+ */
+export type Config = ConfigShape
+
+/**
+ * The plugin configuration, minus the live references.
+ *
+ * `Config`'s live fields are `Volatile<T>` references, so this is what the
+ * deploy-time view looks like once those are read: the shape every consumer
+ * outside the settings wiring actually wants. Keeping it explicit documents
+ * which fields survive a restart.
+ */
+export interface DeployTimeConfig {
   /** Python-side SQLite database path (expanded by the library). */
   dbPath?: string
   /** Override the interpreter used to spawn `python -m atom_memory.rpc`. */
   pythonBin?: string
   /** Auto-start the bridge on plugin load (deployment-time switch). */
   autostart?: boolean
-  /** Manual LLM extraction model override; omit or leave provider empty to follow dsh default. */
-  extractionModel?: {
-    provider?: string
-    model?: string
-    /** Custom OpenAI-compatible endpoint base URL. When set, the extractor calls it directly. */
-    baseURL?: string
-    /** Wire protocol the endpoint speaks (only `openai` supported). */
-    protocol?: string
-    /** API key for a custom endpoint (plaintext). */
-    apiKey?: string
-  }
-  /** Whether the session/durable capture hooks (turn/end, user/message) run. */
-  captureEnabled?: boolean
-  /** Whether the LLM-first extractor is wired to the dsh default model. */
-  llmExtractionEnabled?: boolean
   /**
    * Output-token cap for one LLM extraction call.
    *
@@ -47,31 +107,6 @@ export interface Config {
   maxRecalledFacts?: number
   /** Estimated token cap for returned summary. */
   summaryTokens?: number
-  /**
-   * Token cap for the summary snapshot frozen into the system prompt.
-   *
-   * Deliberately separate from (and smaller than) `summaryTokens`: the
-   * injected text is paid for on every request of a session and is rendered at
-   * the compact depth, while the tool/settings view returns the full detail
-   * list.
-   *
-   * This is only the *seed* for the live value: the settings panel owns it at
-   * runtime (`atom-memory` → `injectedSummaryTokens`), and a change there
-   * applies to every session that has not frozen its snapshot yet.
-   */
-  injectedSummaryTokens?: number
-  /** Inject a session-start-frozen summary snapshot into the system prompt. */
-  contextInjectionEnabled?: boolean
-  /**
-   * Whether the out-of-band work-overview synthesis runs.
-   *
-   * The injected snapshot leads with a model-written narrative of what has been
-   * worked on. Writing it costs a completion, so it is done ahead of time in a
-   * quiet moment rather than while a prompt is frozen; this switch turns that
-   * background job off. The snapshot itself is unaffected — with this off it
-   * leads with the deterministic overview instead.
-   */
-  overviewEnabled?: boolean
   /**
    * Seconds of quiet after a memory write before a refresh is attempted.
    *
@@ -120,8 +155,39 @@ export interface Config {
    * Only meaningful together with `maxVectorDistance`: on its own, every
    * candidate that reached either top-k clears it, which is the trap a
    * rank-based floor sets. `0` disables it.
+   *
+   * The default is deliberately non-zero. At `0` the floor never fires and
+   * recall always answers with a full `maxRecalledFacts` of rows, which makes a
+   * large store indistinguishable from a tiny one and pushes the weakest
+   * lexical-only matches into the context budget. `0.15` sits below the
+   * single-list band (a fact in one ranking scores 0.5, see
+   * `relevance_from_rrf`), so it trims the tail without touching a fact that
+   * ranked well on either leg.
    */
   minRelevance?: number
+  /**
+   * How much deeper than `top_k` each retrieval leg looks before fusion.
+   *
+   * RRF scores a fact by how well the two rankings agree, so a fact outside
+   * both top-k lists is unreachable no matter how strong its importance or
+   * recency — it was never fused in the first place. Retrieving deep and
+   * trimming after the re-rank is what lets the absolute terms promote a
+   * deep-but-relevant fact over a shallow-but-generic one. `1` restores the
+   * old "fuse exactly top_k" behaviour.
+   */
+  candidatePoolMultiplier?: number
+  /**
+   * Age at which a fact's recency credit halves in the re-rank, in days.
+   *
+   * Distinct from the reinforcement half-life: this one is how much "recent" is
+   * worth, that one is how much reuse is worth.
+   */
+  recencyHalfLifeDays?: number
+  /**
+   * Cap on the recency shift, in days. `0` or omitted derives
+   * `3 × recencyHalfLifeDays`, which is the shipped ratio.
+   */
+  recencyReferenceWindowDays?: number
   /**
    * Soft cap on one user's active facts. `0` (the default) is unlimited.
    *
@@ -205,33 +271,78 @@ export interface Config {
   scopePhase?: string
 }
 
-export const Config: z<Config> = z.object({
+/**
+ * Fields the settings panel may edit at runtime, marked `.volatile()`.
+ *
+ * This is not decoration: DSH's settings layer projects a plugin's Config into
+ * a panel form through `volatileForm(schema)`, which only descends into nodes
+ * carrying `meta.volatile`. A Config with no volatile field produces NO form,
+ * and `describe()` then drops the plugin from the served namespace list
+ * entirely — the browser panel finds no namespace, marks itself unavailable,
+ * and every control it guards renders disabled. So a field that belongs in the
+ * panel must be volatile, and a field that does not must NOT be (marking
+ * `dbPath` volatile would offer a live editor for a value the bridge only reads
+ * at spawn time).
+ *
+ * The split below is exactly "may change mid-session" vs "describes the
+ * deployment": the Python interpreter and database path are fixed when the
+ * bridge is spawned, while the switches, the injection budget and the
+ * extraction-model override are read through getters on every use.
+ *
+ * No `z<Config>` annotation here, and that is deliberate: the annotation would
+ * demand that the schema's OUTPUT equal `Config`, but a volatile node's output
+ * is `Volatile<T>` — the very reference `Config` describes. The harness's own
+ * plugins (`ui-theme`, `ui-chat`) leave their Config unannotated for this
+ * reason, and the runtime shape is taken from the schema's inferred output
+ * (see `ConfigShape` / `Config` below) rather than restated by hand.
+ */
+export const Config = z.object({
+  // ---- composition fields: not editable at runtime, so not volatile ----
   dbPath: z.string().default('~/.dsh/atom-memory/memory.db'),
   pythonBin: z.string().default(''),
   autostart: z.boolean().default(true),
-  extractionModel: z.object({
-    provider: z.string().default(''),
-    model: z.string().default(''),
-    baseURL: z.string().default(''),
-    protocol: z.string().default('openai'),
-    apiKey: z.string().default(''),
-  }).default({ provider: '', model: '', baseURL: '', protocol: 'openai', apiKey: '' }),
-  captureEnabled: z.boolean().default(true),
-  llmExtractionEnabled: z.boolean().default(true),
   extractionMaxTokens: z.number().default(2048),
   nudgeEnabled: z.boolean().default(true),
   nudgeIntervalMinutes: z.number().default(30),
   maxRecalledFacts: z.number().default(10),
   summaryTokens: z.number().default(1500),
-  injectedSummaryTokens: z.number().default(DEFAULT_INJECTED_SUMMARY_TOKENS),
-  contextInjectionEnabled: z.boolean().default(true),
-  overviewEnabled: z.boolean().default(true),
   overviewIdleSeconds: z.number().default(90),
   overviewRefreshMinutes: z.number().default(15),
   rpcTimeoutMs: z.number().default(30_000),
   writeAckTimeoutMs: z.number().default(2500),
   maxVectorDistance: z.number().default(0.70),
-  minRelevance: z.number().default(0),
+  minRelevance: z.number().default(0.15),
+  /**
+   * How much deeper than `maxRecalledFacts` each retrieval leg looks before
+   * fusion. Reciprocal Rank Fusion scores a fact by how well the two rankings
+   * agree, so a fact outside both top-k lists cannot be recovered by any
+   * ranking term — it was never fused. Fusing only `top_k` per leg therefore
+   * makes the result set a function of two rank positions alone: measured on
+   * this store, a query's true answer ranked 15th lexically and 11th
+   * semantically and was invisible at 1x, while `4` retrieves it. `1` restores
+   * the old behaviour at the cost of that recall.
+   */
+  candidatePoolMultiplier: z.number().step(1).min(1).default(4),
+  /**
+   * Age at which a fact's recency credit halves *in the re-rank*.
+   *
+   * How much "recent" is worth — distinct from `reinforce`-side decay, which is
+   * how much *reuse* is worth. A fact's age is measured from `last_used_at`
+   * where it has been used, so a long-lived fact still in active use is not
+   * aged out merely for being old. Lower it for a store whose facts turn over
+   * fast; raise it for durable knowledge where age should barely matter.
+   */
+  recencyHalfLifeDays: z.number().min(0.1).default(30),
+  /**
+   * Cap on the recency shift, in days. Derived as `3 × recencyHalfLifeDays`
+   * when omitted (`0`), which is the shipped ratio.
+   *
+   * The cap exists so an entirely-old result set still spreads its credits
+   * instead of reading as uniformly stale. Keeping it well above the half-life
+   * is what stops it flattening genuinely different ages onto one value, so
+   * changing it without changing the half-life is rarely what you want.
+   */
+  recencyReferenceWindowDays: z.number().min(0).default(0),
   maxActiveFacts: z.number().default(0),
   maxProfileRows: z.number().default(50),
   maxFactTokens: z.number().default(600),
@@ -246,5 +357,27 @@ export const Config: z<Config> = z.object({
   scopeProject: z.string().default(''),
   scopeSeries: z.string().default(''),
   scopePhase: z.string().default(''),
+
+  // ---- live fields: these are what the settings panel edits ----
+  extractionModel: z.object({
+    provider: z.string().default(''),
+    model: z.string().default(''),
+    baseURL: z.string().default(''),
+    protocol: z.string().default('openai'),
+    apiKey: z.string().default(''),
+  }).default({ provider: '', model: '', baseURL: '', protocol: 'openai', apiKey: '' }).volatile(),
+  captureEnabled: z.boolean().default(true).volatile(),
+  llmExtractionEnabled: z.boolean().default(true).volatile(),
+  injectedSummaryTokens: z.number().default(DEFAULT_INJECTED_SUMMARY_TOKENS).volatile(),
+  contextInjectionEnabled: z.boolean().default(true).volatile(),
+  overviewEnabled: z.boolean().default(true).volatile(),
 })
+
+/**
+ * The schema's inferred output — what `apply` actually receives.
+ *
+ * Named separately from the exported `Config` because `src/index.ts` re-exports
+ * `Config` as the plugin's schema, which is what the Loader reads.
+ */
+export type ConfigShape = ReturnType<typeof Config>
 

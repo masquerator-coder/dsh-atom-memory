@@ -780,6 +780,84 @@ def test_recency_window_does_not_flatten_real_age_differences():
     assert len(set(recency.values())) == 3, "age differences were flattened away"
 
 
+def test_recency_half_life_is_configurable():
+    """The re-rank's recency curve is a deployer knob, not a module constant.
+
+    A store whose facts turn over in days wants a short half-life; one holding
+    durable knowledge wants a long one. Before this was configurable the only
+    way to retune it was to patch `retriever.py`.
+    """
+    from atom_memory.db import connect_for_tests, now_ms
+    from atom_memory.embedder import serialize_float32
+    from atom_memory.config import MemConfig
+    from atom_memory.retriever import Retriever
+
+    def recency_of(half_life_days, ages):
+        conn = connect_for_tests()
+        try:
+            now = now_ms()
+            ids = []
+            for i, age_days in enumerate(ages):
+                fid = f"f{i}"
+                ids.append(fid)
+                created = now - int(age_days * DAY_MS)
+                conn.execute(
+                    "INSERT INTO facts(fact_id, user_id, session_id, subject, "
+                    "predicate, object, confidence, importance, source_type, "
+                    "status, observed_at, created_at, version) "
+                    "VALUES (?, 'u1', 's1', '用户', '偏好', ?, 0.8, 0.5, "
+                    "'user_explicit', 'active', ?, ?, 1)",
+                    (fid, fid, created, created),
+                )
+            conn.commit()
+            r = Retriever(
+                conn, lambda text: serialize_float32([1.0] * DIM),
+                config=MemConfig(recency_half_life_days=half_life_days),
+            )
+            rows = r._fetch_facts("u1", ids)
+            ranked = r._rerank(rows, {fid: 1.0 for fid in ids})
+            return {f["fact_id"]: f["recency"] for f in ranked}
+        finally:
+            conn.close()
+
+    # A 30-day age sits past the *derived* window once the half-life is short
+    # (7d half-life -> 21d window), so the credit lands on the window floor
+    # rather than continuing to decay. assert the ordering, which is what the
+    # knob is for, and state the floor explicitly so the number is not a
+    # mystery when this test is read later.
+    fast = recency_of(7.0, [0.0, 30.0])
+    slow = recency_of(75.0, [0.0, 30.0])
+    assert fast["f1"] == pytest.approx(0.125), "capped at the derived window floor"
+    assert slow["f1"] > 0.7, "a long half-life must keep a month-old fact current"
+    assert fast["f1"] < slow["f1"], "the knob must actually change the curve"
+    # The newest candidate is the reference under either setting.
+    assert fast["f0"] == pytest.approx(1.0)
+    assert slow["f0"] == pytest.approx(1.0)
+
+    # Within the window the half-life is what shapes the curve: two ages both
+    # inside it must separate more when the half-life is shorter.
+    fast_in = recency_of(7.0, [0.0, 3.0])
+    slow_in = recency_of(75.0, [0.0, 3.0])
+    assert fast_in["f1"] < slow_in["f1"]
+    assert fast_in["f1"] == pytest.approx(0.5 ** (3.0 / 7.0), rel=1e-6)
+
+
+def test_recency_window_defaults_to_three_half_lives_and_can_be_pinned():
+    """An unset window tracks the half-life; a pinned one overrides it."""
+    from atom_memory.config import MemConfig
+
+    # Unset -> derived, so retuning only the half-life keeps the ship ratio and
+    # the cap cannot silently fall below the spread it is meant to preserve.
+    for hl in (7.0, 30.0, 75.0):
+        c = MemConfig(recency_half_life_days=hl)
+        assert c.resolved_recency_window_days() == pytest.approx(3.0 * hl)
+
+    pinned = MemConfig(
+        recency_half_life_days=30.0, recency_reference_window_days=10.0
+    )
+    assert pinned.resolved_recency_window_days() == pytest.approx(10.0)
+
+
 def test_recency_does_not_collapse_when_everything_is_old():
     """An all-old set must still spread, not read as "all maximally stale".
 

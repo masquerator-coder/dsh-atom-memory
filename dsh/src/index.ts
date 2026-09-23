@@ -38,7 +38,7 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { Config, type Config as ConfigShape } from './config.ts'
+import { Config, type ConfigShape } from './config.ts'
 import {
   DEFAULT_INJECTED_SUMMARY_TOKENS,
   clampInjectedSummaryTokens,
@@ -121,6 +121,18 @@ export function buildStartParams(config: ConfigShape): Record<string, unknown> {
   if (config.minRelevance !== undefined) {
     params.min_relevance = config.minRelevance
   }
+  if (config.candidatePoolMultiplier !== undefined) {
+    params.candidate_pool_multiplier = config.candidatePoolMultiplier
+  }
+  // Recency: the half-life always travels; the window does not, because 0 means
+  // "derive 3x the half-life" and the snake_case name collides with the
+  // reinforcement-side `recency` field on the wire.
+  if (config.recencyHalfLifeDays !== undefined) {
+    params.recency_half_life_days = config.recencyHalfLifeDays
+  }
+  if (config.recencyReferenceWindowDays) {
+    params.recency_reference_window_days = config.recencyReferenceWindowDays
+  }
   if (config.maxActiveFacts !== undefined) {
     params.max_active_facts = config.maxActiveFacts
   }
@@ -146,16 +158,49 @@ export function buildStartParams(config: ConfigShape): Record<string, unknown> {
 
 /**
  * Seed the live runtime from the composition config, applying defaults.
+ *
+ * The live fields arrive as `Volatile<T>` references, so their current value is
+ * read through `get()`. Reading them once here is correct because this only
+ * seeds the initial snapshot; every consumer downstream reads the live config
+ * again on each use (see the getters passed to the tools/context/capture
+ * registrations), which is what makes a panel edit take effect without a
+ * restart.
+ *
  * @param config - the validated composition entry.
  */
 function seedRuntime(config: ConfigShape): LiveRuntime {
   return createRuntime({
-    captureEnabled: config.captureEnabled !== false,
-    llmExtractionEnabled: config.llmExtractionEnabled !== false,
-    contextInjectionEnabled: config.contextInjectionEnabled !== false,
-    overviewEnabled: config.overviewEnabled !== false,
-    injectedSummaryTokens: config.injectedSummaryTokens,
-    extractionModel: config.extractionModel,
+    captureEnabled: config.captureEnabled.get() !== false,
+    llmExtractionEnabled: config.llmExtractionEnabled.get() !== false,
+    contextInjectionEnabled: config.contextInjectionEnabled.get() !== false,
+    overviewEnabled: config.overviewEnabled.get() !== false,
+    injectedSummaryTokens: config.injectedSummaryTokens.get(),
+    extractionModel: config.extractionModel.get(),
+  })
+}
+
+/**
+ * The live values as they stand *now*, read fresh from the volatile references.
+ *
+ * This is the function the plugin's consumers call, instead of holding a
+ * snapshot: a volatile reference is updated in place by the settings runtime
+ * when the document changes, so re-reading it is what carries a panel edit into
+ * behaviour. Before the volatile refactor the plugin kept its own `Runtime`
+ * holder and had to be notified of writes through an `onChange` hook; with the
+ * references owned by the settings layer that notification is redundant, and a
+ * missed one would silently pin a switch to its startup value.
+ *
+ * @param config - the validated composition entry.
+ * @returns A complete {@link LiveRuntime} reflecting the current document.
+ */
+function liveNow(config: ConfigShape): LiveRuntime {
+  return createRuntime({
+    captureEnabled: config.captureEnabled.get() !== false,
+    llmExtractionEnabled: config.llmExtractionEnabled.get() !== false,
+    contextInjectionEnabled: config.contextInjectionEnabled.get() !== false,
+    overviewEnabled: config.overviewEnabled.get() !== false,
+    injectedSummaryTokens: config.injectedSummaryTokens.get(),
+    extractionModel: config.extractionModel.get(),
   })
 }
 
@@ -229,7 +274,12 @@ export function createCapture(
 }
 
 export function apply(ctx: Context, config: ConfigShape): void {
-  const runtime = new Runtime(seedRuntime(config))
+  // Live values are read through `liveNow(config)` at each use rather than held
+  // in a snapshot, because the settings layer updates the volatile references
+  // in place when the panel writes.
+  const runtime = {
+    get: (): LiveRuntime => liveNow(config),
+  }
 
   let startTimer: ReturnType<typeof setTimeout> | undefined
 
@@ -485,76 +535,44 @@ export function apply(ctx: Context, config: ConfigShape): void {
     },
   ).forEach((d) => ctx.effect(() => d))
 
-  // Settings namespace: the composition entry seeds the runtime; a settings
-  // write replaces it live. This powers the injected-summary budget, the LLM
-  // extraction model override and the per-feature switches without a restart.
-  // There is deliberately no "memory master switch" here: enabling or disabling
-  // the plugin itself is dsh's own plugin switch, and a second one in this
-  // namespace would be two answers to the same question.
+  // Settings are deliberately NOT registered from here.
   //
-  // Registration runs on `inject(['settings'], …)` rather than a synchronous
-  // `ctx.get('settings')`: `get` returns `undefined` while the settings provider's
-  // fiber is not yet active, which silently skipped registration and left the
-  // browser panel's switch/model grayed out. `inject` waits for the service,
-  // mirroring the harness's own `settings.installSection` call sites.
-  ctx.inject(['settings'], (settingsCtx: Context) => {
-    const settings = settingsCtx.get('settings') as {
-      installSection(
-        owner: Context,
-        ns: string,
-        schema: unknown,
-        entry: LiveRuntime,
-        hooks: {
-          setSource(current: () => LiveRuntime): void
-          onChange(): void
-          validate?(value: LiveRuntime): void
-        },
-      ): void
-    } | undefined
-    if (settings?.installSection === undefined) return
-    let source: () => LiveRuntime = () => seedRuntime(config)
-    settings.installSection(ctx, SETTINGS_NAMESPACE, LiveSettingsSchema, source(), {
-      setSource: (current) => { source = current },
-      onChange: () => { runtime.set(source()) },
-    })
-    ctx.logger(`[dsh-atom-memory] settings section "${SETTINGS_NAMESPACE}" registered`)
-  })
+  // DSH's settings layer discovers a plugin's page on its own: `describe()`
+  // walks every active Loader entry and builds a form from the entry's Config
+  // through `volatileForm(schema)`. A namespace appears exactly when the entry
+  // is active AND its Config declares at least one `.volatile()` field — which
+  // is why `Config` above marks the six live fields and nothing else. There is
+  // no registration call to make, and an earlier revision of this file called
+  // one (`settings.installSection`) that this DSH version does not have: the
+  // guard around it turned the miss into a silent `return`, so the namespace
+  // never appeared, the browser panel could not resolve it, and every control
+  // the panel guards rendered disabled with no error anywhere.
+  //
+  // There is also deliberately no "memory master switch" in this namespace:
+  // enabling or disabling the plugin itself is dsh's own plugin switch, and a
+  // second one here would be two answers to the same question.
 
   // One audit line per live change: when a session behaves differently from the
   // last one, "which switch moved" is the first question, and this answers it
   // without a debugger.
-  runtime.subscribe(() => {
-    const live = runtime.get()
-    ctx.logger(
-      `[atom-memory] live switches: capture=${live.captureEnabled} `
-      + `llm=${live.llmExtractionEnabled} inject=${live.contextInjectionEnabled} `
-      + `budget=${live.injectedSummaryTokens}`,
-    )
+  let lastAudit = seedRuntime(config)
+  ctx.effect(() => {
+    const timer = setInterval(() => {
+      const live = liveNow(config)
+      if (live.captureEnabled === lastAudit.captureEnabled
+        && live.llmExtractionEnabled === lastAudit.llmExtractionEnabled
+        && live.contextInjectionEnabled === lastAudit.contextInjectionEnabled
+        && live.overviewEnabled === lastAudit.overviewEnabled
+        && live.injectedSummaryTokens === lastAudit.injectedSummaryTokens) return
+      lastAudit = live
+      ctx.logger(
+        `[atom-memory] live switches: capture=${live.captureEnabled} `
+        + `llm=${live.llmExtractionEnabled} inject=${live.contextInjectionEnabled} `
+        + `budget=${live.injectedSummaryTokens}`,
+      )
+    }, 2_000)
+    return () => { clearInterval(timer) }
   })
 
   ctx.logger('[dsh-atom-memory] loaded')
 }
-
-/**
- * Schemastery schema for the live settings namespace. This mirrors only the
- * runtime-toggleable fields so a settings write maps 1:1 onto the Runtime.
- *
- * A settings document written by an older version may still carry a `memory
- * master switch` key; it is simply not declared here any more and is ignored on
- * read, so such a deployment keeps memory enabled rather than being silently
- * half-disabled.
- */
-const LiveSettingsSchema: z<LiveRuntime> = z.object({
-  captureEnabled: z.boolean().default(true),
-  llmExtractionEnabled: z.boolean().default(true),
-  contextInjectionEnabled: z.boolean().default(true),
-  overviewEnabled: z.boolean().default(true),
-  injectedSummaryTokens: z.number().default(DEFAULT_INJECTED_SUMMARY_TOKENS),
-  extractionModel: z.object({
-    provider: z.string().default(''),
-    model: z.string().default(''),
-    baseURL: z.string().default(''),
-    protocol: z.string().default('openai'),
-    apiKey: z.string().default(''),
-  }).default({ provider: '', model: '', baseURL: '', protocol: 'openai', apiKey: '' }),
-})

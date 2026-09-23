@@ -76,8 +76,22 @@ export function createRuntime(seed: LiveRuntimeSeed): LiveRuntime {
   }
 }
 
+/**
+ * The live value reader every consumer depends on.
+ *
+ * Declared as an interface rather than a class because the settings layer owns
+ * the references now: the plugin passes a `{ get() }` closure that re-reads the
+ * volatile config, and nothing in the plugin mutates runtime state itself.
+ * Keeping the narrow shape means the controller, tools and capture hooks are
+ * unchanged by where the values come from.
+ */
+export interface RuntimeReader {
+  /** Snapshot of the current live values. */
+  get(): LiveRuntime
+}
+
 /** Mutable holder with a subscribe API for the settings `onChange` wiring. */
-export class Runtime {
+export class Runtime implements RuntimeReader {
   private value: LiveRuntime
   private readonly listeners = new Set<() => void>()
 

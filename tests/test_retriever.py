@@ -29,6 +29,32 @@ def _vec(fill: float) -> bytes:
     return serialize_float32([fill] * DIM)
 
 
+def _vec_at(index: int, magnitude: float = 1.0) -> bytes:
+    """A unit vector along one axis, so distances between facts are real.
+
+    ``_vec(fill)`` is unusable for ranking *within* the vector leg: every
+    uniform vector is parallel to every other, so their cosine distances are all
+    zero and the KNN order falls back to rowid. This builds genuinely different
+    directions instead, which is what a test about vector rank needs.
+    """
+    values = [0.0] * DIM
+    values[index % DIM] = magnitude
+    return serialize_float32(values)
+
+
+def _vec_near(off_axis: float, on_axis: float = 1.0) -> bytes:
+    """A vector mostly along axis 0 with an off-axis component.
+
+    ``off_axis`` controls the cosine distance from ``_vec_at(0)`` — 1.5 gives
+    ~0.445, which is inside the shipped 0.70 gate but farther than a vector
+    lying exactly on the axis.
+    """
+    values = [0.0] * DIM
+    values[0] = on_axis
+    values[1] = off_axis
+    return serialize_float32(values)
+
+
 def _insert_fact(
     conn,
     fact_id: str,
@@ -70,6 +96,22 @@ class _FakeEmbed:
     def embed_one(self, text: str) -> bytes:
         self.calls += 1
         return _vec(1.0)
+
+
+class _FakeEmbedVec:
+    """A fake embedder that returns a caller-chosen vector.
+
+    Needed whenever a test must control the *semantic ranking* (as opposed to
+    just using the vector leg as a tie-break): :class:`_FakeEmbed` returns one
+    constant vector, so every row it matches sits at the same distance and the
+    vector order is decided by rowid rather than by the fixture.
+    """
+
+    def __init__(self, vector: bytes) -> None:
+        self.vector = vector
+
+    def embed_one(self, text: str) -> bytes:
+        return self.vector
 
 
 # ---- RRF --------------------------------------------------------------------
@@ -451,6 +493,99 @@ def test_min_relevance_makes_nothing_relevant_a_valid_answer():
         conn.close()
 
 
+def test_a_deeply_ranked_fact_is_still_reachable():
+    """A fact outside both top-k lists must still be retrievable.
+
+    RRF scores a fact by how well the two rankings agree: a fact in both lists
+    earns ``2/(k+1)`` while one in a single list earns at most ``1/(k+1)``. So
+    when each leg is asked for exactly ``top_k`` ids, any fact that ranks below
+    ``top_k`` on *both* legs is unreachable by construction — no weight on
+    importance, recency or trust can rescue it, because it was never fused.
+
+    This is the shape of a real failure: the fact that answered a query ranked
+    15th lexically and 11th semantically against a 613-fact store, and the
+    caller asking for 8 results got the eight generic hits above it instead.
+    Regression guard for `candidate_pool_multiplier`.
+    """
+    conn = connect_for_tests()
+    try:
+        # The query vector points along axis 0. Twelve generic facts sit exactly
+        # on it (distance 0); the needle is a genuine near-miss one axis over, so
+        # it is semantically plausible but ranks *below* all twelve.
+        query_vec = _vec_at(0)
+
+        class _AxisEmbed:
+            def embed_one(self, text: str) -> bytes:
+                return query_vec
+
+        for index in range(12):
+            _insert_fact(conn, f"generic{index}", "u1", "用户", "偏好", "咖啡")
+            conn.execute(
+                "UPDATE facts_vec SET embedding = ? WHERE fact_id = ?",
+                (query_vec, f"generic{index}"),
+            )
+        # The specific, high-importance answer. It matches the query on both
+        # legs but ranks last on each: a weaker lexical match (one shared token)
+        # and a farther vector. That is the real shape of the failure — the fact
+        # was findable, just never reached, because each leg was truncated to the
+        # number of results the caller wanted to *see*.
+        conn.execute(
+            "INSERT INTO facts(fact_id, user_id, session_id, subject, predicate, "
+            "object, confidence, importance, source_type, status, observed_at, "
+            "created_at, version, type) VALUES ('needle','u1','s','用户','咖啡',"
+            "'咖啡豆采购渠道',0.95,1.0,'user_explicit','active',1,2,1,'semantic')"
+        )
+        conn.execute(
+            "INSERT INTO facts_fts(fact_id, text) VALUES ('needle', ?)",
+            (" ".join(segment_text("用户 咖啡 咖啡豆采购渠道")),),
+        )
+        # Off-axis by 1.5: ~0.445 cosine distance, well inside the default 0.70
+        # gate but farther than every generic row (which sits on the axis).
+        conn.execute(
+            "INSERT INTO facts_vec(fact_id, embedding) VALUES ('needle', ?)",
+            (_vec_near(1.5),),
+        )
+        conn.commit()
+        embed = _AxisEmbed()
+
+        # Precondition: at 1x depth the needle is outside *both* top-8 lists, so
+        # RRF never sees it and no ranking term can recover it.
+        shallow_retriever = Retriever(
+            conn, embed.embed_one,
+            config=MemConfig(candidate_pool_multiplier=1, min_relevance=0.0),
+        )
+        assert "needle" not in shallow_retriever._fts_search("u1", "咖啡", 8)
+        assert "needle" not in shallow_retriever._vector_knn("u1", query_vec, 8)
+        shallow_ids = [
+            f["fact_id"]
+            for f in asyncio.run(shallow_retriever.search("u1", "咖啡", top_k=8))
+        ]
+        assert "needle" not in shallow_ids
+
+        # Deep fusion: it enters both pools, and because it is then the only
+        # candidate both lists agree on at depth, the importance term promotes it.
+        deep = Retriever(
+            conn, embed.embed_one,
+            config=MemConfig(candidate_pool_multiplier=4, min_relevance=0.0),
+        )
+        assert "needle" in deep._fts_search("u1", "咖啡", 32)
+        # Still inside the shipped distance gate: the fix must not depend on
+        # disabling it.
+        assert "needle" in deep._vector_knn(
+            "u1", query_vec, 32, max_distance=MemConfig().max_vector_distance
+        )
+        deep_ids = [
+            f["fact_id"] for f in asyncio.run(deep.search("u1", "咖啡", top_k=8))
+        ]
+        assert "needle" in deep_ids, (
+            "a deeply ranked but highly relevant fact must reach the result set"
+        )
+        # The caller still gets exactly what it asked for.
+        assert len(deep_ids) == 8
+    finally:
+        conn.close()
+
+
 def test_vector_distance_gate_filters_far_rows():
     conn = connect_for_tests()
     try:
@@ -472,7 +607,12 @@ def test_vector_distance_gate_filters_far_rows():
         )
         conn.commit()
 
-        open_gate = Retriever(conn, _FakeEmbed().embed_one)
+        # The gate is a config knob, so "off" is stated explicitly rather than
+        # inherited: the shipped default now has the gate on.
+        open_gate = Retriever(
+            conn, _FakeEmbed().embed_one,
+            config=MemConfig(max_vector_distance=None),
+        )
         assert {f["fact_id"] for f in asyncio.run(
             open_gate.search("u1", "咖啡", top_k=10)
         )} == {"near", "far"}

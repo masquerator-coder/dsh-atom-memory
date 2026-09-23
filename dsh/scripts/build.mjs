@@ -23,7 +23,7 @@
  * compiles TS), so a missing or stale artifact is exactly what ships.
  */
 import { spawnSync } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -72,9 +72,26 @@ let bundled
 if (useTsdown) {
   // Invoke tsdown through its own CLI entry rather than `npx`, so no shell is
   // involved (see `run`).
+  //
+  // The entry is read from tsdown's `bin` field instead of being hard-coded:
+  // it is `dist/cli.mjs` in some releases and `dist/run.mjs` in others, and a
+  // hard-coded name fails with MODULE_NOT_FOUND on the other half — after the
+  // package manager has already replaced `node_modules`, which reads like a
+  // build bug rather than a layout change.
   const require = createRequire(import.meta.url)
   const tsdownPkg = require.resolve('tsdown/package.json', { paths: [root] })
-  const tsdownBin = join(dirname(tsdownPkg), 'dist', 'cli.mjs')
+  const manifest = JSON.parse(readFileSync(tsdownPkg, 'utf8'))
+  const binField = manifest.bin
+  const relativeBin = typeof binField === 'string'
+    ? binField
+    : binField?.tsdown
+  const tsdownBin = relativeBin === undefined
+    ? join(dirname(tsdownPkg), 'dist', 'cli.mjs')
+    : join(dirname(tsdownPkg), relativeBin)
+  if (!existsSync(tsdownBin)) {
+    console.error(`build: tsdown CLI entry not found at ${tsdownBin}`)
+    process.exit(1)
+  }
   bundled = run(process.execPath, [tsdownBin])
 } else {
   bundled = run(process.execPath, [join(here, 'build-rolldown.mjs')])

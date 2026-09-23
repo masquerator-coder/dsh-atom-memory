@@ -78,7 +78,19 @@ def embed(text: str) -> bytes:
 
 @pytest.fixture()
 def config():
-    return MemConfig(scope_aware=True)
+    """Scope-aware config for the retrieval tests in this module.
+
+    The relevance gates are switched off on purpose. ``embed`` below is a
+    sha256 stub, so the cosine distance between two stub vectors is ~1.0
+    regardless of what the texts mean — close to the maximum. These tests are
+    about *which* facts are candidates and how scope weights them, never about
+    semantic closeness, so leaving the distance gate at its shipped default
+    would reject every fact for a reason the fixture cannot express. The gate's
+    real behaviour is covered in ``test_retriever.py``.
+    """
+    return MemConfig(
+        scope_aware=True, max_vector_distance=None, min_relevance=0.0
+    )
 
 
 @pytest.fixture()

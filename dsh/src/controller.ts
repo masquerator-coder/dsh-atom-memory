@@ -15,7 +15,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import type { PythonBridge } from './bridge.ts'
 import { clampInjectedSummaryTokens } from './injection-budget.ts'
-import type { LiveRuntime, Runtime } from './runtime.ts'
+import type { LiveRuntime, RuntimeReader } from './runtime.ts'
 import type { LlmCompleter } from './llm-extractor.ts'
 import type { ChangeRow } from './tools.ts'
 import {
@@ -78,7 +78,7 @@ export class AtomMemoryController extends TypertRemoteService {
   constructor(
     ctx: Context,
     private readonly bridge: PythonBridge,
-    private readonly runtime: Runtime,
+    private readonly runtime: RuntimeReader,
     /**
      * Why the bridge is not running, when the plugin knows (preflight failure,
      * spawn error). Reported verbatim to the panel: "memory bridge is not

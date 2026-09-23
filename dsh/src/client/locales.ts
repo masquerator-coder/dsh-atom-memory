@@ -114,6 +114,10 @@ const zh = {
   importBtn: '导入 JSON',
   restored: '已恢复：{facts} 条事实、{profile} 条画像。',
   error: '操作失败：{message}',
+  // Shown when the settings namespace is not served to this client at all.
+  // Without it the guarded controls simply render disabled and the user has no
+  // way to tell why — the panel is otherwise healthy and shows no error.
+  unavailable: '设置服务未就绪：当前客户端拿不到 `atom-memory` 配置项，因此上方带灰的选项暂时无法修改。常见原因是页面在插件重载前就已打开——请刷新页面（Ctrl+F5）后重试；若仍然如此，请检查 dsh 启动日志中是否有 `[dsh-atom-memory] loaded`。',
 } as const
 
 const en: Record<keyof typeof zh, string> = {
@@ -222,6 +226,7 @@ const en: Record<keyof typeof zh, string> = {
   importBtn: 'Import JSON',
   restored: 'Restored: {facts} facts, {profile} profile rows.',
   error: 'Operation failed: {message}',
+  unavailable: 'Settings service is not ready: this client cannot resolve the `atom-memory` configuration, so the controls shown greyed out above cannot be changed yet. The usual cause is a page that was open before the plugin reloaded — refresh (Ctrl+F5) and try again. If it persists, check the dsh startup log for `[dsh-atom-memory] loaded`.',
 }
 
 export const dicts = { zh, en }

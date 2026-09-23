@@ -84,10 +84,37 @@ class MemConfig:
         min_relevance: Relevance floor. A candidate whose fused relevance is
             below this is not returned at all, so "memory has nothing relevant"
             is expressible instead of always answering with the least bad row.
+            The default is deliberately non-zero: with the floor at ``0`` every
+            query returns a full ``top_k``, which makes a 613-fact store
+            indistinguishable from an empty one. The default sits just below the
+            single-list band (see :func:`relevance_from_rrf`), so it trims the
+            weak tail without touching a fact that ranked well on either leg.
         max_vector_distance: Maximum cosine *distance* accepted from the KNN
             index. ``None`` disables the gate. This is the only filter that can
             tell "semantically close" from "merely in the top-k", because a
-            rank-based score cannot.
+            rank-based score cannot. The default ``0.70`` is calibrated for
+            ``BAAI/bge-small-zh-v1.5``: related pairs measure 0.33–0.54 and
+            unrelated ones 0.67–0.85, so it is a coarse "different topic area"
+            floor. Lower it (≈0.60) for a single-language store that wants
+            looser recall.
+        candidate_pool_multiplier: How much deeper than ``top_k`` each retrieval
+            leg looks before fusion. RRF scores a fact by how well the two
+            rankings *agree*, so a fact outside both top-k lists is unreachable
+            no matter how strong the other ranking terms are. ``4`` means a
+            caller asking for 8 ranks retrieves 32 per leg and trims after the
+            re-rank. Higher values widen recall at the cost of fetching more
+            rows; ``1`` restores the old "fuse exactly top_k" behaviour.
+        recency_half_life_days: Age at which a fact's recency credit halves in
+            the re-rank — how much "recent" is worth, as opposed to
+            ``reinforce_half_life_days``, which is how much reuse is worth. A
+            fact's age is measured from ``last_used_at`` where it has been used,
+            so a long-lived fact still in active use is not aged out for being
+            old.
+        recency_reference_window_days: Cap on the relative age shift. ``None``
+            (the default) derives ``3 × recency_half_life_days``; set it
+            explicitly only to decouple the two. Keeping the window well above
+            the half-life is what stops the cap from flattening genuinely
+            different ages onto one credit.
         conflict_confidence_margin: How much stronger an already-stored claim's
             evidence must be before it is allowed to *outvote* a newly asserted
             value under a single-valued predicate, rather than being superseded
@@ -151,8 +178,59 @@ class MemConfig:
     w_importance: float = 0.2
     w_recency: float = 0.2
     w_trust: float = 0.2
-    min_relevance: float = 0.0
-    max_vector_distance: Optional[float] = None
+    # Deliberately non-zero. At 0 the floor never fires and recall always answers
+    # with a full `top_k`, so a large store looks exactly like a small one.
+    #
+    # Measured on a 617-fact store: with the deeper candidate pool in place, the
+    # *weakest* of the eight returned facts scores 0.78-0.86 for an in-domain
+    # query and 0.39-0.42 for an out-of-domain one ("drawio 图", "视频剪辑").
+    # So the floor is a safety net rather than the active mechanism here — it
+    # trims nothing until ~0.45 and only starts refusing whole queries at 0.60,
+    # where a legitimately rare query returns nothing. The default therefore sits
+    # well below the observed tail: it exists so that "no memory is relevant" is
+    # expressible at all, and a deployment that wants aggressive pruning can
+    # raise it to taste with this measurement as the guide.
+    min_relevance: float = 0.15
+    max_vector_distance: Optional[float] = 0.70
+    # -- recency (ranking) ----------------------------------------------------
+    # Age at which a fact's recency credit halves *in the re-rank*, and how far
+    # back the relative shift may reach. Distinct from
+    # `reinforce_half_life_days`, which decays a fact's *strength*: that one
+    # decides how much reuse is worth, this one decides how much "recent" is
+    # worth. They are independent on purpose — a store can want slow strength
+    # decay and fast recency decay.
+    #
+    # 30 days is deliberately much longer than the summary view's 14: that view
+    # answers "what is going on right now" for a session-start snapshot, while
+    # this one answers "which of the things matching *this query* is most
+    # current", already gated by relevance — so recency here is a tie-breaker
+    # among relevant facts, not a selector.
+    #
+    # Lower it for a store whose facts turn over fast (a 7-day half-life makes a
+    # week-old fact score ~0.37); raise it for a store of durable knowledge where
+    # age should barely matter.
+    recency_half_life_days: float = 30.0
+    # Cap on the relative shift. It must stay well above the half-life, or the
+    # cap stops being a backstop and becomes the dominant shaper: at
+    # window == half-life every candidate more than one half-life older than the
+    # newest is flattened onto the same credit (0.5), and genuinely different
+    # ages stop being distinguished. Three half-lives keeps ~3 bits of
+    # resolution across the plausible spread.
+    #
+    # `None` derives `3 × recency_half_life_days`, which is the shipped ratio;
+    # set it explicitly only to decouple the two.
+    recency_reference_window_days: Optional[float] = None
+    # How much deeper than `top_k` each retrieval leg looks before fusion. RRF
+    # rewards *agreement between two rankings*, so a fact that falls outside
+    # both top-k lists cannot be recovered by the re-rank however strong its
+    # importance or recency. Fusing only `top_k` per leg therefore makes the
+    # result set a function of the two rank positions alone. On a real store a
+    # query's true answer ranked 15th lexically and 11th semantically and was
+    # silently unreachable; at 4x it enters the pool on both legs and the
+    # absolute importance/recency/trust terms can rank it where it belongs.
+    # Cost is bounded: the pool is two index lookups plus one row fetch, all
+    # keyed by id, and the caller still receives exactly `top_k` facts.
+    candidate_pool_multiplier: int = 4
     # Per-fact ceiling for one recall result, in estimated tokens. The recall
     # budget is otherwise a soft bound: the first fact is always kept (so a tiny
     # budget cannot return nothing), which let a single long SOP overshoot
@@ -290,6 +368,21 @@ class MemConfig:
             and friends.
         """
         return str(Path(self.db_path).expanduser())
+
+    def resolved_recency_window_days(self) -> float:
+        """Return the recency shift cap, deriving it when unset.
+
+        The cap exists to keep the relative shift from swallowing every age, so
+        it is a *ratio* to the half-life rather than an independent number; the
+        default therefore tracks whatever half-life the deployment chose instead
+        of silently going stale when that half-life is retuned.
+
+        Returns:
+            ``recency_reference_window_days`` when set, else three half-lives.
+        """
+        if self.recency_reference_window_days is not None:
+            return float(self.recency_reference_window_days)
+        return 3.0 * float(self.recency_half_life_days)
 
     def weights_sum(self) -> float:
         """Return the sum of the four base re-rank weights.

@@ -305,6 +305,17 @@ export function MemorySettingsSection(props: MemorySettingsSectionProps) {
       {state.lastError ? <div className={css.error}>{t('error', { message: state.lastError })}</div> : null}
       {status ? <div className={css.status}>{status}</div> : null}
 
+      {/*
+        The namespace is not served to this client, so every control bound to
+        `available` renders disabled. Say so explicitly: without this the panel
+        looks healthy, shows no error, and the user is left guessing why some
+        fields are grey. `loading` is excluded because a pending read is a
+        normal transient state, not a fault worth reporting.
+      */}
+      {!state.available && !state.loading
+        ? <div className={css.error}>{t('unavailable')}</div>
+        : null}
+
       {/* 1) system-prompt injection size — a slider over fixed gears */}
       <fieldset className={css.block} disabled={!state.available}>
         <legend>{t('injectHeader')}</legend>

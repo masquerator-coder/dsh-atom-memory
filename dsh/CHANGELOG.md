@@ -2,6 +2,77 @@
 
 ## [Unreleased]
 
+### Changed (第二十六轮：recency 排序参数可配置)
+
+**问题**：重排里的时间新近项由 `retriever.py` 顶部的两个模块常量写死
+（`RECENCY_HALF_LIFE_DAYS = 30.0`、`RECENCY_REFERENCE_WINDOW_DAYS = 3 × 半衰期`），
+部署方想调「新近值多少分」只能去改库源码。同时它和 `MemConfig.recency_half_life_days`
+（**强化/强度衰减**用的 75 天）名字几乎一样但用途完全不同、数值也不一样，极易混淆。
+
+**改法**：提升为 `MemConfig` 字段，模块常量保留为「出厂默认值」并继续导出（测试与
+文档仍引用它们）。
+
+- `config.py`：新增 `recency_half_life_days: float = 30.0` 与
+  `recency_reference_window_days: Optional[float] = None`；后者为 `None` 时由新的
+  `resolved_recency_window_days()` 派生 `3 × 半衰期`。**派生而非写死**是关键：只调
+  半衰期时封顶会自动跟随，不会悄悄掉到它本该保护的跨度之下。
+- `retriever.py`：`_rerank` 改读 `self.config`，不再直接引用常量。
+- `config.ts` / `index.ts`：接入线上契约（`recency_half_life_days` /
+  `recency_reference_window_days`）。窗口为 `0` 时**不发送该参数**——发一个显式 `0`
+  会把窗口钉死在零，从而把所有年龄压成同一个 credit。
+
+**实测**（617 条事实的真实库，同一查询）：半衰期 1 天时结果集内 recency 跨度
+0.385、最新使用的那条升到第 1；30 天时 0.131（relevance 主导）；365 天时 0.011
+（时间项几乎关闭）。即该旋钮确实改变排序，而非仅改数字。
+
+**注意**：本库 630 条事实全部创建于 6.1 天内，因此在默认 30 天下时间项本就只在
+0.17–0.20 的窄带内浮动——这是数据分布使然，不是缺陷。
+
+**测试**：`test_recency_half_life_is_configurable` 断言短/长半衰期给出不同的 credit
+且新近候选恒为参照点（含派生窗口封顶的显式取值断言）；
+`test_recency_window_defaults_to_three_half_lives_and_can_be_pinned` 覆盖派生与显式
+两种路径。已做反向验证：把 `_rerank` 改回读常量后，前者确实失败。
+
+### Fixed (第二十五轮：召回候选池深度与相关性闸门默认值)
+
+**问题**：召回在**融合之前**就把每条腿截断到 `top_k`，而 RRF 的算术让这一步成为
+不可逆的损失。同一条事实出现在两个榜单里得 `2/(k+1)`，只出现在一个榜单里最多得
+`1/(k+1)`——于是**任何同时排在两条腿 `top_k` 之外的事实，无论重要度多高，都不可能
+被融合、也就不可能被后续四项重排救回来**。
+
+实测（617 条活跃事实的真实库）：查询「dsh-atom-memory 修复 dsh 更新后无法加载」
+真正回答问题的根因事实（`dsh/package.json` 被 npm files 白名单裁剪）词法排名第 15、
+语义排名第 11，因此结构性地不可达；调用方拿到的是 8 条主题泛化的相近事实。
+
+**改法**：
+
+- `retriever.py`：新增 `candidate_pool_multiplier`，两条腿各取
+  `top_k × multiplier` 再融合，**重排之后再裁剪**到 `top_k`。截断点由此从
+  "返回几条"（调用方的偏好）改为"往下看多深"（召回质量），四项绝对量纲的重排项
+  （重要度/新近度/可信度）才有机会把"深但相关"的事实顶上来。
+- `config.py` / `config.ts`：`min_relevance` 默认 `0 → 0.15`。此前地板恒不触发，
+  召回永远返回满 `top_k` 条，大库与小库在结果上无从区分。
+- `config.ts` / `index.ts`：把 `candidatePoolMultiplier` 接入 `buildStartParams`
+  的线上契约（`candidate_pool_multiplier`）。
+- `retriever.py`：`_vector_knn` 过滤 `distance IS NULL` 的行。sqlite-vec 在查询向量
+  非归一化时返回 NULL 距离；`float(None)` 抛的是 `TypeError`，**不被 `except
+  sqlite3.Error` 捕获**，会让整次检索崩掉。NULL 是"未知"而非"够近"，不能放行。
+
+**实测效果**（同一真实库、同一组 10 条查询）：期望事实召回 10/12 → **11/12**，
+原本失效的目标查询恢复命中 2/2；跨项目噪声不再出现在结果集中。
+
+**关于闸门的诚实说明**：在加深候选池之后，`min_relevance` 在本库上**基本不触发**——
+返回的 8 条里最弱的一条，域内查询得 0.78–0.86、域外查询（"drawio 图"、"视频剪辑"）
+得 0.39–0.42。它要到约 0.45 才开始裁剪，到 0.60 就会让合法的罕见查询直接返回空。
+因此默认值取 0.15，定位是"让『没有相关记忆』可被表达"的**安全网**，而非本轮的主力
+机制；真正的修复是候选池深度。调高它属于部署方的取舍，上述实测值即为标定依据。
+
+**测试**：`test_a_deeply_ranked_fact_is_still_reachable` 构造"两条腿都排在 top_k
+之外、但重要度极高"的事实，断言 1x 深度下不可达、4x 深度下可达（已做反向验证：
+还原缺陷后该测试确实失败）。`tests/test_scope.py` 的 `config` fixture 显式关闭两道
+闸门并注明理由——其 `embed` 是 sha256 stub，任意两个 stub 向量的余弦距离恒为 ~1.0，
+会把该模块所有检索用例误杀；闸门本身的真实行为由 `test_retriever.py` 覆盖。
+
 ### Removed (第二十四轮：取消「记忆总开关」，启停交给 dsh 的插件开关)
 
 **问题**：插件自带一个贯穿全局的 `enabled` 总开关——配置项、运行时字段、设置面板

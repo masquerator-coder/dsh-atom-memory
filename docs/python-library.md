@@ -281,8 +281,11 @@ class MemConfig:
     w_importance: float = 0.2
     w_recency: float = 0.2
     w_trust: float = 0.2
-    min_relevance: float = 0.0
-    max_vector_distance: Optional[float] = None
+    min_relevance: float = 0.15
+    max_vector_distance: Optional[float] = 0.70
+    candidate_pool_multiplier: int = 4
+    recency_half_life_days: float = 30.0
+    recency_reference_window_days: Optional[float] = None
     scope_aware: bool = True
     w_scope: float = 0.20
     w_condition: float = 0.15
@@ -300,6 +303,29 @@ class MemConfig:
 existed; it now bounds `fact_candidates` pruning alongside the other two
 retention windows. `max_active_facts = 0` means unlimited, so the archive tier
 stays dormant until it is configured.
+
+`candidate_pool_multiplier` decouples *how far down each ranking leg looks* from
+*how many results are returned*. The two legs retrieve `top_k × multiplier` ids
+each and the fused pool is trimmed back to `top_k` only after re-ranking. This
+matters because RRF scores agreement between the two rankings: a fact outside
+both top-k lists can never be fused, so no weight on importance, recency or
+trust could ever recover it. `1` restores the previous behaviour.
+
+`recency_half_life_days` governs how much *recent* is worth in the re-rank, as
+opposed to `reinforce_half_life_days`, which governs how much *reuse* is worth.
+It is deliberately separate: a store can want slow strength decay and fast
+recency decay. Ages are measured from `last_used_at` where the fact has been
+used, so a long-lived fact still in active use is not aged out for being old.
+`recency_reference_window_days` caps the relative shift and defaults to three
+half-lives; raising the half-life alone keeps that ratio, so the cap cannot
+silently fall below the spread it exists to preserve. Measured effect on a
+617-fact store — the recency spread inside one top-8 result set:
+
+| half-life | window | recency spread | top-1 |
+| --- | --- | --- | --- |
+| 1 day | 3 days | 0.385 | most recently used fact |
+| 30 days (default) | 90 days | 0.131 | relevance-weighted |
+| 365 days | 1095 days | 0.011 | effectively recency-off |
 
 The `scope_*` knobs are described in [Scope-aware memory](scopes.md#9-configuration).
 The three `w_scope` / `w_condition` / `w_phase` weights are added to the four base

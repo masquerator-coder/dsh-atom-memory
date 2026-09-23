@@ -294,11 +294,28 @@ Two filters can then mean something, and both are configurable:
 
 - `max_vector_distance` (default 0.70) drops candidates whose *cosine distance*
   is too large — the one signal that can say "this is a different topic area";
-- `min_relevance` (default 0, off) drops candidates below a fused-relevance
-  floor.
+- `min_relevance` (default 0.15) drops candidates below a fused-relevance floor.
+
+Before either filter runs, both legs retrieve `top_k × candidate_pool_multiplier`
+(4 by default) ids and the fused pool is trimmed back to `top_k` only after
+re-ranking. Fusing just `top_k` per leg conflates "how many results to return"
+with "how far down each ranking to look", and RRF makes that lossy: a fact in
+both lists scores `2/(k+1)` while one in a single list scores at most `1/(k+1)`,
+so a fact outside both top-k lists is unreachable by construction. Measured on a
+617-fact store, the fact that actually answered a query ranked 15th lexically and
+11th semantically — invisible at `1x`, retrieved at `4x`.
 
 The remaining terms stay absolute: `importance` and `recency` are never
 min-max normalised (their magnitude is the point), and the reuse term is bounded.
+
+Recency decays exponentially with a `recency_half_life_days` half-life (30 by
+default), measured from `last_used_at` where the fact has been used and from
+creation otherwise, and shifted so the newest candidate in the set is the
+reference. The shift is capped at `recency_reference_window_days` — derived as
+three half-lives unless pinned — so an entirely-old result set still spreads its
+credits instead of reading as uniformly stale. The half-life is deliberately
+independent of `reinforce_half_life_days`: one is how much *recent* is worth, the
+other how much *reuse* is worth.
 
 **Why.** `_minmax` over the current candidates made the top result of *every*
 query score exactly 1.0 — including the best of twenty irrelevant rows — so the
