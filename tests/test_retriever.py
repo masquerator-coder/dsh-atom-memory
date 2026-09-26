@@ -13,6 +13,7 @@ from atom_memory.embedder import serialize_float32
 from atom_memory.retriever import (
     Retriever,
     SOURCE_CREDIBILITY,
+    VEC_MAX_K,
     estimate_tokens,
     relevance_from_rrf,
     rrf_ceiling,
@@ -582,6 +583,78 @@ def test_a_deeply_ranked_fact_is_still_reachable():
         )
         # The caller still gets exactly what it asked for.
         assert len(deep_ids) == 8
+    finally:
+        conn.close()
+
+
+# -- sqlite-vec k ceiling -----------------------------------------------------
+#
+# vec0 *raises* above `VEC_MAX_K` rather than clamping, and the raise is caught
+# by `_vector_knn`'s error handler -- which returns `[]` and records only
+# "vector" in `last_degraded`. The result is that an over-large pool silently
+# deletes the semantic half of retrieval and leaves lexical matching alone: a
+# recall that still answers, worse, with no symptom a caller can see unless it
+# inspects `degraded`. The pool is `top_k * candidate_pool_multiplier`, so this
+# is reachable through configuration alone.
+
+
+def test_vector_knn_clamps_a_pool_above_the_engine_ceiling():
+    """An over-large pool must return the deepest ranking, not nothing.
+
+    Asserted on the ids rather than on `last_degraded`, because the failure this
+    guards against is precisely "returned empty but nothing raised".
+    """
+    conn = connect_for_tests()
+    try:
+        for index in range(5):
+            _insert_fact(conn, f"f{index}", "u1", "用户", "偏好", f"值{index}")
+        conn.commit()
+        retriever = Retriever(conn, _vec(0.25))
+
+        # Well past the ceiling: must still return the facts it can rank.
+        ids = retriever._vector_knn("u1", _vec(1.0), VEC_MAX_K + 1)
+        assert len(ids) == 5, (
+            "a pool above the ceiling must clamp, not silently empty the leg"
+        )
+        assert retriever.last_degraded == [], (
+            "clamping is not a degradation -- nothing failed"
+        )
+    finally:
+        conn.close()
+
+
+def test_vector_knn_ceiling_is_actually_the_engine_limit():
+    """The clamp must sit *at* the ceiling, so it never fires needlessly.
+
+    Paired with the test above: that one proves over-limit pools still work,
+    this one proves an at-limit pool is left alone (no spurious clamp, no
+    spurious `degraded` entry).
+    """
+    conn = connect_for_tests()
+    try:
+        for index in range(3):
+            _insert_fact(conn, f"f{index}", "u1", "用户", "偏好", f"值{index}")
+        conn.commit()
+        retriever = Retriever(conn, _vec(0.25))
+        assert len(retriever._vector_knn("u1", _vec(1.0), VEC_MAX_K)) == 3
+        assert retriever.last_degraded == []
+    finally:
+        conn.close()
+
+
+def test_vector_knn_rejects_a_non_positive_pool():
+    """`LIMIT 0` is a wasted round trip and a negative one is a driver error.
+
+    Neither is a query, so neither may reach the engine.
+    """
+    conn = connect_for_tests()
+    try:
+        _insert_fact(conn, "f0", "u1", "用户", "偏好", "值")
+        conn.commit()
+        retriever = Retriever(conn, _vec(0.25))
+        for pool in (0, -1, -100):
+            assert retriever._vector_knn("u1", _vec(1.0), pool) == []
+        assert retriever.last_degraded == [], "a caller mistake is not a degradation"
     finally:
         conn.close()
 

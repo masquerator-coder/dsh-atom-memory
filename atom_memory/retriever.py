@@ -93,6 +93,21 @@ RRF_K = 60
 # is worse than one that does.
 MIN_RELEVANCE = 0.0
 
+# sqlite-vec refuses a KNN `k` above this and raises instead of clamping. The
+# failure is nasty out of proportion to its cause: `_vector_knn` catches the
+# error, records "vector" in `last_degraded` and returns `[]`, so an over-large
+# pool silently deletes the *semantic* half of retrieval and leaves only FTS --
+# a recall that still answers, with worse results and no visible symptom for a
+# caller that does not inspect `degraded`. Measured threshold: k=4096 succeeds,
+# k=4097 raises "k value in knn query too large".
+#
+# The pool is `top_k * candidate_pool_multiplier`, so this is reachable purely
+# through configuration (top_k=2000 at the shipped multiplier of 4). Clamping is
+# the right response rather than failing: asking for more neighbours than the
+# engine can rank is a deployment mistake, and returning the deepest ranking the
+# engine supports is strictly closer to the intent than returning nothing.
+VEC_MAX_K = 4096
+
 # -- recency ------------------------------------------------------------------
 #
 # Age at which a fact's recency credit halves, and how far back the relative
@@ -418,6 +433,22 @@ class Retriever:
             Fact ids, nearest first.
         """
         scope_args = list(scope_args or [])
+        # A non-positive pool is a caller mistake, not a query: `LIMIT 0` is a
+        # wasted round trip and a negative LIMIT is a SQLite error. Neither
+        # should reach the engine.
+        if k <= 0:
+            return []
+        # Clamp before the query: sqlite-vec raises rather than clamping, and the
+        # raise path returns an empty semantic leg (see VEC_MAX_K). Asking for
+        # more neighbours than the engine can rank is a configuration mistake;
+        # the deepest ranking it supports is the honest answer to it.
+        if k > VEC_MAX_K:
+            logger.warning(
+                "vector KNN pool %d exceeds sqlite-vec's limit of %d; clamping",
+                k,
+                VEC_MAX_K,
+            )
+            k = VEC_MAX_K
         inner = (
             "SELECT f.fact_id FROM facts f WHERE f.user_id = ? "
             "AND f.status = 'active' " + scope_sql

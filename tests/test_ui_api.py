@@ -13,6 +13,7 @@ import asyncio
 import pytest
 
 from atom_memory import AtomMem, MemConfig
+from atom_memory.api import _has_conflict_candidate
 from atom_memory.backup import BACKUP_VERSION, validate_backup
 from atom_memory.embedder import serialize_float32
 
@@ -421,6 +422,105 @@ def test_recall_conflicts_ignore_retracted_and_multi_valued(tmp_path, monkeypatc
         assert not any("f_old" in p for p in pairs)
         assert not any("发布流程" in c["predicate"] for c in r["conflicts"])
         assert not any("事件" in c["predicate"] for c in r["conflicts"])
+        await mem.stop()
+
+    _run(scenario())
+
+
+# -- lazy conflict gate -------------------------------------------------------
+#
+# `_load_conflicts` runs on every recall, and its full scan (every active row
+# plus a batched scope lookup) dominated the read path's non-retrieval cost. It
+# is now gated by `_has_conflict_candidate`, a cheap necessary condition: no
+# (subject, predicate) key holds two distinct objects => no scope-respecting
+# grouping can find a conflict. These tests pin both directions of that gate,
+# because a gate that is merely *fast* is worthless if it is also *wrong*.
+
+
+def test_conflict_gate_short_circuits_on_a_clean_store(tmp_path, monkeypatch):
+    """The gate must say "impossible" — not merely "none found" — when clean.
+
+    This is the performance half of the contract: on a store where no
+    single-valued key holds two objects, the expensive scope-aware scan must not
+    run at all. Asserted directly on the gate so the test fails if the guard is
+    ever bypassed, rather than only observing that the answer is still `[]`.
+    """
+    mem = _make(tmp_path, monkeypatch)
+
+    async def scenario():
+        await mem.start()
+        _insert_fact(mem, "f1", "用户", "职业", "工程师", created_at=1)
+        # Two *distinct* single-valued keys, each with one object: no pair
+        # anywhere, so no scope partition can produce one.
+        _insert_fact(mem, "f2", "用户", "城市", "天津", created_at=2)
+        # Multi-valued keys with several objects are independent by definition
+        # and must not arm the gate either.
+        _insert_fact(mem, "f3", "用户", "偏好", "黑咖啡", created_at=3)
+        _insert_fact(mem, "f4", "用户", "偏好", "绿茶", created_at=4)
+        mem.db.commit()
+
+        rows = mem._single_valued_rows("u1")
+        assert _has_conflict_candidate(rows, mem.config) is False, (
+            "clean store must short-circuit before the scope-aware scan"
+        )
+        assert mem._load_conflicts("u1") == []
+        assert (await mem.recall("u1", "职业"))["conflicts"] == []
+        await mem.stop()
+
+    _run(scenario())
+
+
+def test_conflict_gate_defers_when_objects_are_split_across_scopes(
+    tmp_path, monkeypatch,
+):
+    """A true gate answer is *inconclusive* and must fall through to the scan.
+
+    Two objects under one single-valued key are exactly what arms the gate, but
+    if they live in different scopes they are not a conflict. The gate must not
+    report anything itself — it only decides whether the real check may be
+    skipped. This pins the asymmetry: `False` is a proof, `True` is a deferral.
+    """
+    mem = _make(tmp_path, monkeypatch)
+
+    async def scenario():
+        await mem.start()
+        _insert_fact(mem, "g1", "用户", "职业", "工程师", created_at=1)
+        _insert_fact(mem, "g2", "用户", "职业", "设计师", created_at=2)
+        mem.db.commit()
+
+        rows = mem._single_valued_rows("u1")
+        assert _has_conflict_candidate(rows, mem.config) is True, (
+            "two objects under one key must arm the gate"
+        )
+        # Unbound facts are global facts, so they share a scope set and really
+        # do conflict — the gate's deferral must reach that conclusion.
+        pairs = {(c["left"], c["right"]) for c in mem._load_conflicts("u1")}
+        assert pairs == {("g1", "g2")}
+        await mem.stop()
+
+    _run(scenario())
+
+
+def test_conflict_gate_ignores_multi_valued_objects(tmp_path, monkeypatch):
+    """Multi-valued predicates never arm the gate, however many objects they hold.
+
+    The filter has to happen before grouping: a preference list with three
+    values is a three-way "conflict" to a naive grouper, which would arm the
+    gate on essentially every real store and silently undo the optimisation.
+    """
+    mem = _make(tmp_path, monkeypatch)
+
+    async def scenario():
+        await mem.start()
+        for i, value in enumerate(("黑咖啡", "绿茶", "乌龙"), start=1):
+            _insert_fact(mem, f"m{i}", "用户", "偏好", value, created_at=i)
+        for i, value in enumerate(("A", "B"), start=1):
+            _insert_fact(mem, f"k{i}", "用户", "发布流程", value, type="sop", created_at=i)
+        mem.db.commit()
+
+        assert mem._single_valued_rows("u1") == []
+        assert _has_conflict_candidate(mem._single_valued_rows("u1"), mem.config) is False
+        assert mem._load_conflicts("u1") == []
         await mem.stop()
 
     _run(scenario())

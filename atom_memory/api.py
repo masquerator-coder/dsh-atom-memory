@@ -114,6 +114,46 @@ def _merge_truncation_records(
     return merged
 
 
+def _has_conflict_candidate(rows, config: MemConfig) -> bool:
+    """Whether any single-valued key could possibly hold a conflict.
+
+    This is the cheap gate in front of the conflict scan. It groups rows by
+    ``(subject, predicate)`` **without** consulting scope bindings, and answers
+    ``True`` as soon as one key holds two or more distinct objects.
+
+    The asymmetry is the point:
+
+    * ``False`` is a **proof** of absence. A scope-aware grouping only ever
+      subdivides a ``(subject, predicate)`` group — two facts that share a scope
+      set also share the key, but not conversely — so if no key has two distinct
+      objects ignoring scope, no scope-respecting partition can produce one
+      either. Returning early here cannot hide a conflict.
+    * ``True`` is **inconclusive**. The two objects may well live in different
+      scopes, which is not a conflict at all (the design's "跨作用域 + 矛盾 → 不判
+      矛盾"). A true answer therefore defers to the full scan rather than
+      reporting anything itself.
+
+    Args:
+        rows: Active rows with single-valued predicates (see
+            :meth:`AtomMem._single_valued_rows`).
+        config: Configuration carrying ``multi_valued_predicates``. Accepted for
+            signature symmetry with the scan; the multi-valued filter has
+            already been applied to ``rows``.
+
+    Returns:
+        ``True`` when a conflict cannot be ruled out, ``False`` when none exists.
+    """
+    del config  # rows arrive pre-filtered; kept so callers read symmetrically
+    objects: dict = {}
+    for r in rows:
+        key = (str(r["subject"]), str(r["predicate"]))
+        seen = objects.setdefault(key, set())
+        seen.add(r["object"])
+        if len(seen) >= 2:
+            return True
+    return False
+
+
 class AtomMem:
     """In-process long-term memory for DeepSeek Harness."""
 
@@ -560,6 +600,8 @@ class AtomMem:
 
         return {
             "facts": facts,
+            # Lazy: the scan is skipped entirely unless a cheap necessary
+            # condition says a conflict *could* exist (see `_load_conflicts`).
             "conflicts": self._load_conflicts(user_id),
             "degraded": list(getattr(self.retriever, "last_degraded", []) or []),
             "scope": getattr(self.retriever, "last_scope", None),
@@ -585,6 +627,14 @@ class AtomMem:
         矛盾，标 scope_priority"). Reporting them as a conflict would ask a user to
         resolve a disagreement that does not exist.
 
+        **Lazy by construction.** The write path blocks conflicting pairs, so on
+        a healthy store this returns ``[]`` every time — but the full scan costs
+        ~6 ms (every active row plus a batched scope-binding lookup) and ran on
+        *every* recall, where it dominated the read path's non-retrieval cost.
+        The scan is therefore gated by :meth:`_has_conflict_candidate`, a cheap
+        necessary condition evaluated first; when it says "no", the expensive
+        scope-aware grouping never runs.
+
         Returns:
             A list of ``{"left": fact_id, "right": fact_id, "subject",
             "predicate", "object_left", "object_right", "scopes"}`` — one entry
@@ -593,11 +643,17 @@ class AtomMem:
         """
         if self.db is None:
             return []
-        rows = self.db.execute(
-            "SELECT fact_id, subject, predicate, object, type FROM facts "
-            "WHERE user_id = ? AND status = 'active' ORDER BY created_at ASC",
-            (user_id,),
-        ).fetchall()
+        rows = self._single_valued_rows(user_id)
+        # The gate. Grouping by (subject, predicate) alone — without the scope
+        # lookup — finds every key that holds 2+ distinct objects *anywhere*.
+        # Splitting by scope can only ever shrink a group, never merge two, so
+        # "no key has 2+ distinct objects ignoring scope" guarantees that no
+        # scope-respecting grouping can find one either. A true answer is
+        # inconclusive (the objects may live in different scopes) and falls
+        # through to the full check below.
+        if not _has_conflict_candidate(rows, self.config):
+            return []
+
         store = self._scope_store()
         scope_map = store.fact_scopes([r["fact_id"] for r in rows])
         # Group active facts by their single-valued (subject, predicate) key
@@ -642,6 +698,36 @@ class AtomMem:
                         }
                     )
         return conflicts
+
+    def _single_valued_rows(self, user_id: str) -> list:
+        """Return the active rows a conflict scan must consider.
+
+        The row fetch is shared by the gate and the full scan so neither pays
+        for it twice, and so both see exactly the same candidate universe.
+        Multi-valued keys are filtered out here rather than in each consumer:
+        they can never contradict by definition, and dropping them first keeps
+        the gate's grouping honest.
+
+        Args:
+            user_id: The owner whose active facts to load.
+
+        Returns:
+            The active rows with a single-valued predicate, oldest first.
+        """
+        rows = self.db.execute(
+            "SELECT fact_id, subject, predicate, object, type FROM facts "
+            "WHERE user_id = ? AND status = 'active' ORDER BY created_at ASC",
+            (user_id,),
+        ).fetchall()
+        return [
+            r
+            for r in rows
+            if not is_multi_valued(
+                str(r["predicate"]),
+                r["type"] or "semantic",
+                self.config.multi_valued_predicates,
+            )
+        ]
 
     def get_fact(self, user_id: str, fact_id: str) -> dict:
         """Return one fact in full, including any knowledge body.
