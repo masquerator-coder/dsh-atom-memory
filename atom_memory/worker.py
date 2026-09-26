@@ -1997,7 +1997,21 @@ class Worker:
             (user_id, old_fact_id),
         ).fetchone()
         if old is None:
-            self._finish_candidate(candidate_id, CAND_STATUS_SKIPPED)
+            # Both refusals below used to finish the candidate with no reason at
+            # all, so the caller's receipt said only "nothing was written". The
+            # target being missing and the text not surviving extraction are
+            # different facts about the world and need different fixes, so each
+            # one now names itself.
+            reason = (
+                f"no active fact {old_fact_id} for user {user_id} to replace"
+            )
+            logger.warning("replace %s refused: %s", candidate_id, reason)
+            self._finish_candidate(
+                candidate_id,
+                CAND_STATUS_SKIPPED,
+                reject_kind="target_not_active",
+                reject_reason=reason,
+            )
             return
 
         # A replacement belongs where the fact it replaces belongs. Resolving
@@ -2009,7 +2023,22 @@ class Worker:
 
         candidates = self.extractor.extract(text, user_id, session_id, turn_id)
         if not candidates:
-            self._finish_candidate(candidate_id, CAND_STATUS_SKIPPED)
+            # The text did not survive extraction (the LLM path is unavailable
+            # or returned nothing usable, and the rule engine matched no
+            # pattern). Unlike ``add``, ``replace`` has no verbatim fallback, so
+            # this is a hard refusal — say so instead of leaving the caller to
+            # guess why nothing happened.
+            reason = (
+                "extraction produced no candidate from the replacement text "
+                f"({len(text)} chars); use memory_add for free-form content"
+            )
+            logger.warning("replace %s refused: %s", candidate_id, reason)
+            self._finish_candidate(
+                candidate_id,
+                CAND_STATUS_SKIPPED,
+                reject_kind="extraction_empty",
+                reject_reason=reason,
+            )
             return
         outcome = await self._apply_candidates(
             candidates,

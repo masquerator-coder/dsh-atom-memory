@@ -61,6 +61,26 @@ const EXPLICIT_IMPORTANCE = 0.9
 /** Confidence stamped on a fact the user explicitly asked to remember. */
 const EXPLICIT_CONFIDENCE = 0.9
 
+/**
+ * How a named store refusal leads off the receipt.
+ *
+ * `reject_kind` is set by the store when a write is refused before it produced
+ * an outcome (e.g. `replace` on a fact that is gone, or on text that extracted
+ * to nothing). Naming the failure is the difference between the caller fixing
+ * it and the caller guessing: these two refusals need different repairs.
+ */
+const REFUSAL_LEADS: Record<string, string> = {
+  target_not_active: '未替换：目标事实不存在或已不是活跃状态',
+  extraction_empty: '未替换：新内容没能抽取成任何事实',
+}
+
+/** Fallback wording when the store named a kind but sent no reason. */
+const REFUSAL_HINTS: Record<string, string> = {
+  target_not_active: '它可能已被替换、遗忘，或 fact_id 属于其他用户',
+  extraction_empty:
+    'replace 没有原样兜底，请改用 memory_add 记录自由文本，再决定是否遗忘原条目',
+}
+
 /** One label the store attached to a written fact. */
 interface DomainLabel {
   name?: string
@@ -204,6 +224,15 @@ export function renderWriteReceipt(receipt: WriteReceipt): string {
   if (receipt.status === 'error') {
     return `写入失败：${receipt.reject_reason ?? '存储侧报错'}（未写入任何记忆）`
   }
+  // A refusal the store named must be reported even when `outcome` carries
+  // nothing: the kind and the reason are the only facts that tell a correction
+  // apart from a target that no longer exists, and without them every refusal
+  // collapsed into the same "nothing to write" line below.
+  if (receipt.reject_kind) {
+    const reason = receipt.reject_reason ?? REFUSAL_HINTS[receipt.reject_kind]
+    return `${REFUSAL_LEADS[receipt.reject_kind] ?? '写入被拒绝'}`
+      + `${reason ? `：${reason}` : ''}（未写入任何记忆）。`
+  }
   if (purged.length > 0) return `已彻底删除 ${purged.length} 条记忆（不可恢复）。`
   if (retracted.length > 0) return `已遗忘 ${retracted.length} 条记忆（软删除）。`
 
@@ -237,7 +266,10 @@ export function renderWriteReceipt(receipt: WriteReceipt): string {
     parts.push(`拒绝 ${rejected.length} 条：${reason}`)
   }
   if (shortened) parts.push(`注意：内容过长已截断——${shortened}`)
-  if (parts.length === 0) return '没有可写入的事实（抽取为空）。'
+  // Reached only when the store produced no outcome and named no refusal — an
+  // unnamed refusal is a gap in the receipt, not evidence that extraction was
+  // empty, so this no longer asserts a cause it cannot see.
+  if (parts.length === 0) return '存储未写入任何事实，也没有给出原因（请用 memory_stats 查看最近写入结果）。'
   const placement = renderPlacement(outcome.scope, outcome.domains)
   return placement ? `${parts.join('，')}。${placement}` : `${parts.join('，')}。`
 }
