@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+### Changed (设置页「编辑记忆」摘要：按钮与徽章拉开间距，徽章补充领域数)
+
+- 按钮与右侧计数徽章之间加了间距（`.atom-memory-toggle` 内 `margin-left:12px`），
+  并让两者在同一基线上对齐——原先徽章紧贴按钮，读起来像按钮文字的一部分。
+- 徽章由「共 N 条」改为「**M 个领域 · 共 N 条**」，鼠标悬停展开领域名列表。
+- 新增 Host `@Remote listDomains`（包 `domain_list`，把 Python 侧返回的**裸列表**
+  包成 `{domains: [...]}` 信封，与面板其它方法一致）＋客户端描述符，面板启动时随
+  `refreshData` 一起取。
+
+**领域数只算用户自建的主题，排除 `system_seeded`。** 这一条是拿真实库核出来的：
+开发机上的现网库（`~/.dsh/atom-memory/memory.db`，与徽章显示的 1101 条活跃事实一致）
+有 11 行 `domain`，其中 **8 行是系统自登记**的——`github.com/<owner>/<repo>`、
+`atomgit.com/...` 这类仓库路径，以及 `general` / `user` 脚手架
+（`atom_memory/domain.py:664`）。若全算，徽章会对一个只有 3 个主题的词表报
+「11 个领域」，悬停列表里还会把 git 仓库 URL 当作领域名列出。现在计 3 个，
+并在悬停卡片末尾注明「另有 8 个由系统自动登记…未计入」，既不虚高也不隐藏。
+
+**领域是「已注册的主题词表」，不是「有记忆的领域」。** `list_facts` 不携带逐条
+domain 标签（`atom_memory/api.py:1508` 只回 scope_labels），所以按领域统计事实数
+在这里无法得到，面板不宣称这个数字。
+
+领域查询是**补充信息**：它失败时只把领域列表置空并降级为裸总数，不会连带让
+事实表格或整块面板失败（`refreshData` 里单独 try/catch，且不写 `lastError`）。
+
+`dsh/src/{controller.ts,client/remote.ts,client/memory-settings-controller.ts,client/MemorySettingsSection.tsx,client/locales.ts,client/styles.ts}`
+
 ### Changed (设置页「编辑记忆」：原子事实改为分页显示 + 记忆总数)
 
 记忆条数变大后，「编辑记忆（原子事实）」弹窗原先一次渲染全部行，且客户端固定

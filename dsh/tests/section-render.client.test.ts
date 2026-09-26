@@ -190,8 +190,17 @@ function spyBudgetWrites(props: { setInjectedSummaryTokens: unknown }): number[]
  * end — a page turn must change the *rows*, not just the page number.
  *
  * @param total - How many facts the fake store holds.
+ * @param domains - Topic names to report; each becomes a domain row.
+ * @param domainsFail - Make `listDomains` reject, to exercise the optional path.
+ * @param seeded - How many of `domains` are system-seeded (`system_seeded`
+ *   rows, i.e. auto-registered names rather than topics the user created).
  */
-function buildPagedFactsController(total: number) {
+function buildPagedFactsController(
+  total: number,
+  domains: string[] = [],
+  domainsFail = false,
+  seeded = 0,
+) {
   const all = Array.from({ length: total }, (_v, i) => ({
     fact_id: `f${i + 1}`,
     subject: `主语${i + 1}`,
@@ -228,6 +237,24 @@ function buildPagedFactsController(total: number) {
     },
     editFact: async () => ({ ok: true, value: {} }),
     deleteFact: async () => ({ ok: true, value: {} }),
+    listDomains: async () => {
+      if (domainsFail) throw new Error('domain surface unavailable')
+      return {
+        ok: true,
+        value: {
+          domains: domains.map((name, i) => ({
+            domain_id: i + 1,
+            name,
+            display_name: name,
+            path: `/${name}`,
+            status: 'active',
+            // The first `seeded` entries stand in for the store's self-registered
+            // names (git remotes, general/user).
+            system_seeded: i < seeded,
+          })),
+        },
+      }
+    },
     summary: async () => ({ ok: true, value: '' }),
     listProfile: async () => ({ ok: true, value: { profile: [], count: 0, limit: 50 } }),
     upsertProfile: async () => ({ ok: true, value: {} }),
@@ -248,6 +275,19 @@ function factRows(): string[][] {
   return Array.from(table.querySelectorAll('tbody tr')).map(tr =>
     Array.from(tr.querySelectorAll('input, textarea')).map(el => (el as HTMLInputElement).value),
   )
+}
+
+/**
+ * The hover card anchored to the 编辑记忆 badge.
+ *
+ * Scoped by the badge's sibling relationship, not by `.atom-memory-tooltip`
+ * alone: every action in the region has a tooltip, so a document-order query
+ * would return the summary button's card first.
+ */
+function domainCard(): HTMLElement {
+  const card = document.querySelector('.atom-memory-count-badge + .atom-memory-tooltip')
+  expect(card).toBeTruthy()
+  return card as HTMLElement
 }
 
 describe('MemorySettingsSection client render', () => {
@@ -360,6 +400,96 @@ describe('MemorySettingsSection client render', () => {
     // The panel's list is one page (50 rows); the badge must report the store's
     // 137, never the page size.
     expect(screen.getByText('共 137 条')).toBeTruthy()
+  })
+
+  it('enriches the badge with the registered domain count', async () => {
+    const { controller } = buildPagedFactsController(1101, ['programming', 'teaching', 'life'])
+    const { props } = bind(controller)
+    await act(async () => {
+      render(createElement(MemorySettingsSection, props))
+    })
+    await act(async () => {})
+    expect(screen.getByText('3 个领域 · 共 1101 条')).toBeTruthy()
+  })
+
+  it('lists the domain names in the badge hover card', async () => {
+    const { controller } = buildPagedFactsController(42, ['programming', 'teaching'])
+    const { props } = bind(controller)
+    await act(async () => {
+      render(createElement(MemorySettingsSection, props))
+    })
+    await act(async () => {})
+    const card = domainCard()
+    expect(within(card).getByText('你建立的领域（2 个）')).toBeTruthy()
+    const items = Array.from(card.querySelectorAll('.atom-memory-domains-item')).map(li => li.textContent)
+    expect(items).toEqual(['programming', 'teaching'])
+  })
+
+  /**
+   * Regression against the real store: it held 11 domain rows of which 8 were
+   * system-seeded (git-remote paths plus `general`/`user`), so counting all rows
+   * advertised "11 个领域" for a vocabulary of 3 and listed git URLs as topics.
+   */
+  it('counts only user-created domains, not the system-seeded ones', async () => {
+    const seeded = ['github.com', 'github.com/owner', 'github.com/owner/repo', 'atomgit.com', 'general', 'user']
+    const own = ['programming', 'workflow']
+    const { controller } = buildPagedFactsController(1101, [...seeded, ...own], false, seeded.length)
+    const { props } = bind(controller)
+    await act(async () => {
+      render(createElement(MemorySettingsSection, props))
+    })
+    await act(async () => {})
+    // 8 rows, but the user only ever created 2 topics.
+    expect(screen.getByText('2 个领域 · 共 1101 条')).toBeTruthy()
+    const card = domainCard()
+    expect(within(card).getByText('你建立的领域（2 个）')).toBeTruthy()
+    const items = Array.from(card.querySelectorAll('.atom-memory-domains-item')).map(li => li.textContent)
+    expect(items).toEqual(own)
+    expect(items).not.toContain('github.com/owner/repo')
+    // The self-registered names are acknowledged rather than hidden.
+    expect(within(card).getByText(/另有 6 个由系统自动登记/)).toBeTruthy()
+  })
+
+  it('falls back to the bare total when every domain is system-seeded', async () => {
+    const { controller } = buildPagedFactsController(55, ['general', 'user'], false, 2)
+    const { props } = bind(controller)
+    await act(async () => {
+      render(createElement(MemorySettingsSection, props))
+    })
+    await act(async () => {})
+    // No user-created topic: the badge must not claim "0 个领域".
+    expect(screen.getByText('共 55 条')).toBeTruthy()
+    expect(screen.queryByText(/个领域 ·/)).toBeNull()
+  })
+
+  it('caps the hover card and reports how many domains were left out', async () => {
+    const many = Array.from({ length: 30 }, (_v, i) => `domain${i + 1}`)
+    const { controller } = buildPagedFactsController(10, many)
+    const { props } = bind(controller)
+    await act(async () => {
+      render(createElement(MemorySettingsSection, props))
+    })
+    await act(async () => {})
+    const card = domainCard()
+    // 24 listed, 6 collapsed into the remainder line — the card must never grow
+    // with the vocabulary.
+    expect(card.querySelectorAll('.atom-memory-domains-item')).toHaveLength(24)
+    expect(within(card).getByText('另有 6 个未列出…')).toBeTruthy()
+  })
+
+  it('degrades to the bare total when the domain surface is unavailable', async () => {
+    const { controller } = buildPagedFactsController(77, [], true)
+    const { props } = bind(controller)
+    await act(async () => {
+      render(createElement(MemorySettingsSection, props))
+    })
+    await act(async () => {})
+    // A failed `domain_list` must not blank the panel or claim "0 个领域"; the
+    // facts count is still shown and the table still works.
+    expect(screen.getByText('共 77 条')).toBeTruthy()
+    expect(screen.queryByText(/个领域/)).toBeNull()
+    const card = domainCard()
+    expect(within(card).getByText('暂无你建立的领域。')).toBeTruthy()
   })
 
   it('pages through the facts table and reports the visible range', async () => {

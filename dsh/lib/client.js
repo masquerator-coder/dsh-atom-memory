@@ -141,7 +141,8 @@ window.__ModuleLoader__.load({
 				data: {
 					facts: [],
 					factsTotal: 0,
-					profile: []
+					profile: [],
+					domains: []
 				}
 			});
 			unsubscribe;
@@ -175,6 +176,7 @@ window.__ModuleLoader__.load({
 					setExtractionModelOverride: (override) => this.scope.set("extractionModel", override),
 					refreshData: () => this.refreshData(),
 					fetchFactsPage: (offset, limit) => this.fetchFactsPage(offset, limit),
+					fetchDomains: () => this.fetchDomains(),
 					saveFact: (fact) => this.saveFact(fact),
 					deleteFact: (factId) => this.deleteFact(factId),
 					fetchSummary: () => this.fetchSummary(),
@@ -216,6 +218,7 @@ window.__ModuleLoader__.load({
 					this.store.set({
 						...this.store.getSnapshot(),
 						data: {
+							...this.store.getSnapshot().data,
 							facts: Array.isArray(facts.facts) ? facts.facts : [],
 							factsTotal: normalizeTotal(facts.total, facts.facts),
 							profile: Array.isArray(profile.profile) ? profile.profile : [],
@@ -229,6 +232,43 @@ window.__ModuleLoader__.load({
 						...this.store.getSnapshot(),
 						lastError: err?.message ?? String(err)
 					});
+					return;
+				}
+				try {
+					const domains = unwrap(await this.r().listDomains({ user: USER }));
+					this.store.set({
+						...this.store.getSnapshot(),
+						data: {
+							...this.store.getSnapshot().data,
+							domains: Array.isArray(domains?.domains) ? domains.domains : []
+						}
+					});
+				} catch {
+					this.store.set({
+						...this.store.getSnapshot(),
+						data: {
+							...this.store.getSnapshot().data,
+							domains: []
+						}
+					});
+				}
+			}
+			async fetchDomains() {
+				try {
+					const domains = unwrap(await this.r().listDomains({ user: USER }));
+					this.store.set({
+						...this.store.getSnapshot(),
+						data: {
+							...this.store.getSnapshot().data,
+							domains: Array.isArray(domains?.domains) ? domains.domains : []
+						}
+					});
+				} catch (err) {
+					this.store.set({
+						...this.store.getSnapshot(),
+						lastError: err?.message ?? String(err)
+					});
+					throw err;
 				}
 			}
 			/**
@@ -556,6 +596,13 @@ window.__ModuleLoader__.load({
 				factsPageNext: "下一页",
 				factsPageIndicator: "第 {page}/{pages} 页",
 				factsPageLoadError: "第 {page} 页加载失败：{message}",
+				memorySummaryBadge: "{domains} 个领域 · 共 {total} 条",
+				memorySummaryBadgeNoDomains: "共 {total} 条",
+				memoryDomainsTitle: "你建立的领域（{count} 个）",
+				memoryDomainsHint: "点「编辑记忆」可按条查看与编辑。",
+				memoryDomainsMore: "另有 {rest} 个未列出…",
+				memoryDomainsEmpty: "暂无你建立的领域。",
+				memoryDomainsSystemSeeded: "（另有 {count} 个由系统自动登记，如仓库路径与 general/user，未计入）",
 				backupHeader: "记忆备份与恢复",
 				backupDesc: "把记忆导出为 JSON 文件，或从 JSON 文件导入恢复（replace 语义：覆盖当前记忆）。",
 				exportBtn: "导出 JSON",
@@ -670,6 +717,13 @@ window.__ModuleLoader__.load({
 				factsPageNext: "Next",
 				factsPageIndicator: "Page {page}/{pages}",
 				factsPageLoadError: "Failed to load page {page}: {message}",
+				memorySummaryBadge: "{domains} domains · {total} total",
+				memorySummaryBadgeNoDomains: "{total} total",
+				memoryDomainsTitle: "Domains you created ({count})",
+				memoryDomainsHint: "Open 编辑记忆 to browse and edit individual facts.",
+				memoryDomainsMore: "{rest} more not listed…",
+				memoryDomainsEmpty: "No domains created by you yet.",
+				memoryDomainsSystemSeeded: "({count} more were auto-registered by the system — repo paths, general/user — and are not counted)",
 				backupHeader: "Backup & restore",
 				backupDesc: "Export memory to a JSON file, or import from a JSON file to restore (replace semantics: overwrites current memory).",
 				exportBtn: "Export JSON",
@@ -704,8 +758,12 @@ window.__ModuleLoader__.load({
 .atom-memory-group-title{font-size:13px;font-weight:700;padding:0 6px;color:var(--dsw-alias-label-primary,#e6e8eb)}
 /* The 记忆内容 region lays its actions out as one horizontal row of buttons. */
 .atom-memory-content-actions{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-start}
-/* Each action is a relative anchor for its hover tooltip. */
-.atom-memory-toggle{position:relative;display:inline-flex}
+/* Each action is a relative anchor for its hover tooltip. Centering the row
+   keeps a button and its adjacent count badge on one baseline; the badge itself
+   carries the horizontal gap so the two read as one unit rather than as two
+   unrelated row items. */
+.atom-memory-toggle{position:relative;display:inline-flex;align-items:center}
+.atom-memory-toggle .atom-memory-count-badge{margin-left:12px}
 .atom-memory-toggle .atom-memory-tooltip{position:absolute;top:calc(100% + 8px);left:0;z-index:50;width:max-content;max-width:min(320px,80vw);padding:8px 11px;border:1px solid var(--dsw-alias-border-l3,rgba(255,255,255,0.16));border-radius:8px;background:var(--dsw-alias-bg-layer-3,#24262b);color:var(--dsw-alias-label-primary,#e6e8eb);font-size:12px;line-height:1.55;box-shadow:0 10px 28px rgba(0,0,0,0.4);white-space:normal;opacity:0;visibility:hidden;pointer-events:none;transition:opacity 120ms ease,visibility 120ms ease}
 .atom-memory-toggle:hover .atom-memory-tooltip,.atom-memory-toggle:focus-within .atom-memory-tooltip{opacity:1;visibility:visible}
 .atom-memory-switch-row,.atom-memory-radio-row{display:flex;align-items:flex-start;gap:8px;font-size:14px;cursor:pointer;color:var(--dsw-alias-label-primary,#e6e8eb)}
@@ -773,8 +831,19 @@ window.__ModuleLoader__.load({
    buttons sideways as the page number grows a digit. */
 .atom-memory-pager-indicator{font-variant-numeric:tabular-nums;white-space:nowrap}
 .atom-memory-pager-error{color:var(--dsw-alias-state-error-primary,#e5484d);margin:0 0 8px}
-/* The count badge shown next to the 编辑记忆 button in the panel. */
-.atom-memory-count-badge{font-size:12px;color:var(--dsw-alias-label-secondary,#8a8f98);font-variant-numeric:tabular-nums;white-space:nowrap}
+/* The count badge shown next to the 编辑记忆 button in the panel. It is itself
+   the hover target for the domain card, so it must not be pointer-transparent
+   and needs its own focus ring (the card is reachable by keyboard through the
+   button's focus-within, and a mouse user must be able to hover it). */
+.atom-memory-count-badge{font-size:12px;color:var(--dsw-alias-label-secondary,#8a8f98);font-variant-numeric:tabular-nums;white-space:nowrap;cursor:default;border-bottom:1px dotted var(--dsw-alias-border-l3,rgba(255,255,255,0.16));padding-bottom:1px}
+/* The domain card reuses the tooltip skin but is wider (it lists names) and is
+   anchored to the badge, so it hangs below the badge rather than below the
+   button. */
+.atom-memory-toggle .atom-memory-count-badge+.atom-memory-tooltip{left:auto;right:0;max-width:min(360px,80vw)}
+.atom-memory-domains-title{font-weight:600;margin:0 0 5px}
+.atom-memory-domains-list{margin:0;padding:0;list-style:none;display:flex;flex-wrap:wrap;gap:4px 6px}
+.atom-memory-domains-item{padding:1px 7px;border:1px solid var(--dsw-alias-border-l3,rgba(255,255,255,0.16));border-radius:999px;background:var(--dsw-alias-bg-layer-2,#24262b);font-family:var(--dsw-font-mono,ui-monospace,SFMono-Regular,Menlo,Consolas,monospace);font-size:11px}
+.atom-memory-domains-hint{margin:6px 0 0;color:var(--dsw-alias-label-secondary,#8a8f98);font-size:11px}
 
 /* Injection-budget gear slider: a discrete handle plus its gear labels. The
    field skin (border/background/padding) is for text inputs — a native range
@@ -855,7 +924,11 @@ window.__ModuleLoader__.load({
 			pagerGroup: "atom-memory-pager-group",
 			pagerIndicator: "atom-memory-pager-indicator",
 			pagerError: "atom-memory-pager-error",
-			countBadge: "atom-memory-count-badge"
+			countBadge: "atom-memory-count-badge",
+			domainsTitle: "atom-memory-domains-title",
+			domainsList: "atom-memory-domains-list",
+			domainsItem: "atom-memory-domains-item",
+			domainsHint: "atom-memory-domains-hint"
 		};
 		/** Locale key of each gear shown in the panel, smallest gear first. */
 		const PRESET_LABEL_KEYS = {
@@ -868,6 +941,15 @@ window.__ModuleLoader__.load({
 		};
 		/** DOM id of the injection-budget slider (its `<label>` points at it). */
 		const BUDGET_SLIDER_ID = "atom-memory-inject-budget";
+		/**
+		* How many topic names the badge's hover card lists before collapsing the rest
+		* into a "+N more" line.
+		*
+		* The card is a hover affordance, not a management surface (editing a topic
+		* vocabulary is `memory_domains`' job), so it must stay small enough to read at
+		* a glance and never grow tall enough to run off the panel.
+		*/
+		const DOMAIN_CARD_LIMIT = 24;
 		/**
 		* Render a refresh outcome token as words.
 		*
@@ -983,6 +1065,21 @@ window.__ModuleLoader__.load({
 			const facts = state.data?.facts ?? [];
 			/** Rows the whole store holds; `facts` is only the page currently loaded. */
 			const factsTotal = state.data?.factsTotal ?? facts.length;
+			/** The user's registered topic vocabulary (see `MemoryData.domains`). */
+			const domains = state.data?.domains ?? [];
+			/**
+			* The topics the *user* owns, which is what the badge counts.
+			*
+			* `system_seeded` rows are names the store registered for itself — git remotes
+			* harvested as `github.com/<owner>/<repo>`, plus the `general` / `user`
+			* scaffolding (`atom_memory/domain.py:664`). They are real domain rows and the
+			* store does use them, but they are not 领域 the user would recognise: on a
+			* real store of 11 rows, 8 were exactly this kind. Counting them made the
+			* badge read "11 个领域" for a vocabulary of 3, and the hover card listed git
+			* URLs as topics. Excluded here rather than at the fetch so the raw list stays
+			* intact for any future surface that wants it.
+			*/
+			const ownDomains = domains.filter((d) => d.system_seeded !== true);
 			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 				className: css.section,
 				children: [
@@ -1259,7 +1356,40 @@ window.__ModuleLoader__.load({
 										}),
 										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 											className: css.countBadge,
-											children: t("factsTotal", { total: String(factsTotal) })
+											children: ownDomains.length > 0 ? t("memorySummaryBadge", {
+												domains: String(ownDomains.length),
+												total: String(factsTotal)
+											}) : t("memorySummaryBadgeNoDomains", { total: String(factsTotal) })
+										}),
+										/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+											className: css.tooltip,
+											children: [
+												/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+													className: css.domainsTitle,
+													children: t("memoryDomainsTitle", { count: String(ownDomains.length) })
+												}),
+												ownDomains.length > 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("ul", {
+													className: css.domainsList,
+													children: ownDomains.slice(0, DOMAIN_CARD_LIMIT).map((d) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)("li", {
+														className: css.domainsItem,
+														children: d.display_name || d.path || d.name
+													}, d.domain_id))
+												}), ownDomains.length > DOMAIN_CARD_LIMIT ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+													className: css.domainsHint,
+													children: t("memoryDomainsMore", { rest: String(ownDomains.length - DOMAIN_CARD_LIMIT) })
+												}) : null] }) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+													className: css.domainsHint,
+													children: t("memoryDomainsEmpty")
+												}),
+												domains.length > ownDomains.length ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+													className: css.domainsHint,
+													children: t("memoryDomainsSystemSeeded", { count: String(domains.length - ownDomains.length) })
+												}) : null,
+												/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+													className: css.domainsHint,
+													children: t("memoryDomainsHint")
+												})
+											]
 										}),
 										factsTotal === 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 											className: css.tooltip,
@@ -1983,6 +2113,7 @@ window.__ModuleLoader__.load({
 			package: "dsh-atom-memory",
 			descriptors: [
 				jsonArgsMethod("listFacts", true),
+				jsonArgsMethod("listDomains", true),
 				jsonArgsMethod("editFact", true),
 				jsonArgsMethod("deleteFact", true),
 				jsonArgsMethod("summary", true),

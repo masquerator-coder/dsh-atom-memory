@@ -62,6 +62,8 @@ function fakeRemote() {
   const listFacts = vi.fn(async (): Promise<{ ok: boolean; value: { facts: Array<{ fact_id: string; subject: string; predicate: string; object: string }>; total: number } }> => ({ ok: true, value: { facts: [], total: 0 } }))
   const listProfile = vi.fn(async () => ({ ok: true, value: { profile: [], count: 0, limit: 50 } }))
   const deleteFact = vi.fn(async () => ({ ok: true, value: {} }))
+  // Typed `unknown` so a test can make it fail or answer a malformed payload.
+  const listDomains = vi.fn(async (): Promise<unknown> => ({ ok: true, value: { domains: [] } }))
   // Typed as `unknown` result so a test can make one call fail (or return a
   // malformed payload) without fighting the inferred success shape.
   const writeProfile = vi.fn(async (): Promise<unknown> => ({ ok: true, value: { written: 0, deleted: 0 } }))
@@ -71,8 +73,8 @@ function fakeRemote() {
   }))
   const summary = vi.fn(async () => ({ ok: true, value: '# 记忆摘要 (Summary) — global\n决策规则\n- 一条规则' }))
   const refreshOverview = vi.fn(async (): Promise<unknown> => ({ ok: true, value: 'refreshed' }))
-  const remote: Record<string, unknown> = { listFacts, editFact: vi.fn(async () => ({ ok: true, value: {} })), deleteFact, summary, listProfile, upsertProfile: vi.fn(async () => ({ ok: true, value: {} })), deleteProfile: vi.fn(async () => ({ ok: true, value: {} })), writeProfile, generateProfile, backup, restore, refreshOverview }
-  return { remote, backup, restore, listFacts, listProfile, deleteFact, summary, writeProfile, generateProfile, refreshOverview }
+  const remote: Record<string, unknown> = { listFacts, editFact: vi.fn(async () => ({ ok: true, value: {} })), deleteFact, listDomains, summary, listProfile, upsertProfile: vi.fn(async () => ({ ok: true, value: {} })), deleteProfile: vi.fn(async () => ({ ok: true, value: {} })), writeProfile, generateProfile, backup, restore, refreshOverview }
+  return { remote, backup, restore, listFacts, listProfile, listDomains, deleteFact, summary, writeProfile, generateProfile, refreshOverview }
 }
 
 describe('MemorySettingsController', () => {
@@ -245,6 +247,63 @@ describe('MemorySettingsController', () => {
     // control that silently does not do what it says.
     expect(FACTS_PAGE_SIZES.every(size => size >= 1 && size <= 200)).toBe(true)
     expect(FACTS_PAGE_SIZES).toContain(FACTS_PAGE_SIZE_DEFAULT)
+  })
+
+  it('reads the registered domain vocabulary alongside the facts', async () => {
+    const { scope } = fakeScope(snapshot({}))
+    const { remote, listDomains } = fakeRemote()
+    listDomains.mockResolvedValue({
+      ok: true,
+      value: {
+        domains: [
+          { domain_id: 1, name: 'programming', display_name: '编程', path: '/programming' },
+          { domain_id: 2, name: 'teaching', display_name: '教学', path: '/teaching' },
+        ],
+      },
+    } as never)
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, remote)
+    await controller.inject().refreshData()
+    expect(listDomains).toHaveBeenCalledWith({ user: 'global' })
+    const snap = controller.inject().hooks.memorySettings.getSnapshot()
+    expect(snap.data.domains?.map(d => d.name)).toEqual(['programming', 'teaching'])
+  })
+
+  it('keeps the facts list when the domain vocabulary cannot be read', async () => {
+    const { scope } = fakeScope(snapshot({}))
+    const { remote, listFacts, listDomains } = fakeRemote()
+    listFacts.mockResolvedValue({
+      ok: true,
+      value: { facts: [{ fact_id: 'f1', subject: 's', predicate: 'p', object: 'o' }], total: 9 },
+    } as never)
+    listDomains.mockRejectedValue(new Error('domain surface unavailable'))
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, remote)
+    // The vocabulary is optional context for a badge: losing it must not take
+    // the working panel down with it.
+    await expect(controller.inject().refreshData()).resolves.toBeUndefined()
+    const snap = controller.inject().hooks.memorySettings.getSnapshot()
+    expect(snap.data.facts.map(f => f.fact_id)).toEqual(['f1'])
+    expect(snap.data.factsTotal).toBe(9)
+    expect(snap.data.domains).toEqual([])
+    // A supplementary failure is not surfaced as a panel-wide error either.
+    expect(snap.lastError).toBeUndefined()
+  })
+
+  it('normalizes a malformed domain payload to an empty list', async () => {
+    const { scope } = fakeScope(snapshot({}))
+    const { remote, listDomains } = fakeRemote()
+    listDomains.mockResolvedValue({ ok: true, value: { domains: undefined } } as never)
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, remote)
+    await controller.inject().fetchDomains()
+    expect(controller.inject().hooks.memorySettings.getSnapshot().data.domains).toEqual([])
+  })
+
+  it('reports a failed standalone domain fetch as a rejection', async () => {
+    const { scope } = fakeScope(snapshot({}))
+    const { remote, listDomains } = fakeRemote()
+    listDomains.mockResolvedValue({ ok: false, error: { message: '领域查询失败' } } as never)
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, remote)
+    await expect(controller.inject().fetchDomains()).rejects.toThrow('领域查询失败')
+    expect(controller.inject().hooks.memorySettings.getSnapshot().lastError).toBe('领域查询失败')
   })
 
   it('keeps the current page on screen and reports why when a page fetch fails', async () => {

@@ -63,6 +63,24 @@ export interface MemoryData {
   }>
   profile: Array<{ section: string; key: string; value: string; source?: string }>
   /**
+   * The user's registered topic vocabulary (the `memory_domains` word list).
+   *
+   * Read-only context for the panel's memory summary. Note what this is and is
+   * not: it is every topic the store has *registered* for this user, not the set
+   * of topics that currently hold memories. `list_facts` does not carry per-fact
+   * domain labels, so a genuine per-topic fact count is not available here and
+   * the panel must not imply one.
+   */
+  domains?: Array<{
+    domain_id: number
+    name: string
+    display_name?: string
+    parent_id?: number | null
+    path?: string
+    status?: string
+    system_seeded?: boolean
+  }>
+  /**
    * Total active facts the store holds, from the `list_facts` envelope.
    *
    * Deliberately NOT `facts.length`: `facts` is one page of a paged list, so its
@@ -136,6 +154,13 @@ export interface MemorySettingsFace {
    * snapshot when the call fails, so a failed page turn does not blank the table.
    */
   fetchFactsPage: (offset: number, limit: number) => Promise<void>
+  /**
+   * Re-read the user's registered topic vocabulary.
+   *
+   * Rejects on a failed call; callers treat the vocabulary as optional context,
+   * so a rejection is reported rather than allowed to fail a panel load.
+   */
+  fetchDomains: () => Promise<void>
   saveFact: (fact: MemoryData['facts'][number]) => Promise<void>
   deleteFact: (factId: string) => Promise<void>
   /** Lazy-load the user's compact summary (the view injected into the prompt). */
@@ -222,6 +247,7 @@ interface RemoteAtomMemory {
     type?: string
   }): Promise<WireResult<unknown>>
   deleteFact(args: { user: string; fact_id: string }): Promise<WireResult<unknown>>
+  listDomains(args: { user: string }): Promise<WireResult<{ domains?: MemoryData['domains'] }>>
   summary(args: { user: string; maxTokens?: number }): Promise<WireResult<string>>
   listProfile(args: { user: string }): Promise<WireResult<{ profile: MemoryData['profile']; count?: number; limit?: number }>>
   upsertProfile(args: { user: string; section: string; key: string; value: string }): Promise<WireResult<unknown>>
@@ -289,7 +315,7 @@ export class MemorySettingsController {
       overviewEnabled: true,
       extractionModel: undefined,
     },
-    data: { facts: [], factsTotal: 0, profile: [] },
+    data: { facts: [], factsTotal: 0, profile: [], domains: [] },
   })
   private readonly unsubscribe: () => void
 
@@ -325,6 +351,7 @@ export class MemorySettingsController {
         this.scope.set('extractionModel', override),
       refreshData: () => this.refreshData(),
       fetchFactsPage: (offset, limit) => this.fetchFactsPage(offset, limit),
+      fetchDomains: () => this.fetchDomains(),
       saveFact: (fact) => this.saveFact(fact),
       deleteFact: (factId) => this.deleteFact(factId),
       fetchSummary: () => this.fetchSummary(),
@@ -369,6 +396,7 @@ export class MemorySettingsController {
       this.store.set({
         ...this.store.getSnapshot(),
         data: {
+          ...this.store.getSnapshot().data,
           facts: Array.isArray(facts.facts) ? facts.facts : [],
           factsTotal: normalizeTotal(facts.total, facts.facts),
           profile: Array.isArray(profile.profile) ? profile.profile : [],
@@ -381,6 +409,45 @@ export class MemorySettingsController {
       this.store.set({
         ...this.store.getSnapshot(), lastError: (err as Error)?.message ?? String(err),
       })
+      return
+    }
+    // The vocabulary is supplementary context for the count badge, so it is
+    // fetched after the essential data has landed and its failure is swallowed:
+    // a store that cannot answer `domain_list` (an older library, a disabled
+    // topic surface) must still show the facts table and its count. Failing the
+    // whole refresh over a badge would trade a working panel for a cosmetic one.
+    try {
+      const domains = unwrap(await this.r().listDomains({ user: USER }))
+      this.store.set({
+        ...this.store.getSnapshot(),
+        data: {
+          ...this.store.getSnapshot().data,
+          domains: Array.isArray(domains?.domains) ? domains.domains : [],
+        },
+      })
+    } catch {
+      this.store.set({
+        ...this.store.getSnapshot(),
+        data: { ...this.store.getSnapshot().data, domains: [] },
+      })
+    }
+  }
+
+  private async fetchDomains(): Promise<void> {
+    try {
+      const domains = unwrap(await this.r().listDomains({ user: USER }))
+      this.store.set({
+        ...this.store.getSnapshot(),
+        data: {
+          ...this.store.getSnapshot().data,
+          domains: Array.isArray(domains?.domains) ? domains.domains : [],
+        },
+      })
+    } catch (err) {
+      this.store.set({
+        ...this.store.getSnapshot(), lastError: (err as Error)?.message ?? String(err),
+      })
+      throw err
     }
   }
 

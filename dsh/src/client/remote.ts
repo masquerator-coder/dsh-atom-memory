@@ -104,6 +104,7 @@ export const ATOM_MEMORY_REMOTE: TypertRemoteContribution = {
   package: 'dsh-atom-memory',
   descriptors: [
     jsonArgsMethod('listFacts', true),
+    jsonArgsMethod('listDomains', true),
     jsonArgsMethod('editFact', true),
     jsonArgsMethod('deleteFact', true),
     jsonArgsMethod('summary', true),

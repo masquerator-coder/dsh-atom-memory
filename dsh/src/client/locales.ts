@@ -115,6 +115,20 @@ const zh = {
   factsPageNext: '下一页',
   factsPageIndicator: '第 {page}/{pages} 页',
   factsPageLoadError: '第 {page} 页加载失败：{message}',
+  // 5c) the memory summary badge beside 编辑记忆: "N 个领域 · 共 X 条".
+  // `domains` is the registered topic vocabulary, NOT the number of topics that
+  // currently hold facts — `list_facts` carries no per-fact domain labels, so a
+  // per-topic count is not knowable here and none is claimed.
+  memorySummaryBadge: '{domains} 个领域 · 共 {total} 条',
+  memorySummaryBadgeNoDomains: '共 {total} 条',
+  // Hover card listing the actual topic names behind that count.
+  memoryDomainsTitle: '你建立的领域（{count} 个）',
+  memoryDomainsHint: '点「编辑记忆」可按条查看与编辑。',
+  memoryDomainsMore: '另有 {rest} 个未列出…',
+  memoryDomainsEmpty: '暂无你建立的领域。',
+  // The store registers some names for itself (git remotes, `general`/`user`);
+  // they drive scope-aware recall but are not topics the user chose.
+  memoryDomainsSystemSeeded: '（另有 {count} 个由系统自动登记，如仓库路径与 general/user，未计入）',
   // (removed the old memoryMd block — the compact injected view now lives under summary above)
   // 5) backup / restore
   backupHeader: '记忆备份与恢复',
@@ -236,6 +250,13 @@ const en: Record<keyof typeof zh, string> = {
   factsPageNext: 'Next',
   factsPageIndicator: 'Page {page}/{pages}',
   factsPageLoadError: 'Failed to load page {page}: {message}',
+  memorySummaryBadge: '{domains} domains · {total} total',
+  memorySummaryBadgeNoDomains: '{total} total',
+  memoryDomainsTitle: 'Domains you created ({count})',
+  memoryDomainsHint: 'Open 编辑记忆 to browse and edit individual facts.',
+  memoryDomainsMore: '{rest} more not listed…',
+  memoryDomainsEmpty: 'No domains created by you yet.',
+  memoryDomainsSystemSeeded: '({count} more were auto-registered by the system — repo paths, general/user — and are not counted)',
   // (removed the old memoryMd block — the compact injected view now lives under summary above)
   backupHeader: 'Backup & restore',
   backupDesc: 'Export memory to a JSON file, or import from a JSON file to restore (replace semantics: overwrites current memory).',

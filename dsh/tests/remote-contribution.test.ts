@@ -36,6 +36,7 @@ describe('ATOM_MEMORY_REMOTE', () => {
     const methods = ATOM_MEMORY_REMOTE.descriptors.map(d => d.method)
     expect(methods).toEqual([
       'listFacts',
+      'listDomains',
       'editFact',
       'deleteFact',
       'summary',

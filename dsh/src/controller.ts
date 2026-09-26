@@ -61,6 +61,24 @@ export interface ProfileSuggestion {
   value: string
 }
 
+/**
+ * One row of the user's topic vocabulary (`domain` table).
+ *
+ * Mirror of the Python `DomainRow.to_dict()` surface. `name` is the canonical
+ * (lowercase, path-like) form and `display_name` the human one; `path` is the
+ * materialised hierarchy label, which is what the panel shows because it is the
+ * only field that makes a nested topic readable at a glance.
+ */
+export interface DomainRow {
+  domain_id: number
+  name: string
+  display_name: string
+  parent_id?: number | null
+  path?: string
+  status?: string
+  system_seeded?: boolean
+}
+
 declare module '@deepseek-ai/cordis' {
   interface Context {
     /** Host owner of the `atom-memory` Remote namespace for the memory panel. */
@@ -274,6 +292,26 @@ export class AtomMemoryController extends TypertRemoteService {
   async listProfile(args: { user: string }): Promise<Record<string, unknown>> {
     this.assertReady()
     return this.bridge.call('list_profile', { user_id: args.user }) as Promise<Record<string, unknown>>
+  }
+
+  /**
+   * The user's registered topic vocabulary (the `memory_domains`词表), for the
+   * settings panel's memory summary.
+   *
+   * `domain_list` answers with a bare list, so it is wrapped in an object here:
+   * every other panel-facing method returns a named-key envelope, and a bare
+   * array at the wire boundary is the shape that tends to get silently coerced
+   * (or dropped) by an intermediate layer. The panel reads `domains`.
+   *
+   * Read-only: it never registers a topic. Registering happens on the write path
+   * (`memory_domains` create / an extractor's proposal), never as a side effect
+   * of drawing a count.
+   */
+  @Remote
+  async listDomains(args: { user: string }): Promise<{ domains: DomainRow[] }> {
+    this.assertReady()
+    const domains = await this.bridge.call('domain_list', { user_id: args.user })
+    return { domains: Array.isArray(domains) ? domains as DomainRow[] : [] }
   }
 
   /** Add or update one profile row (a user edit from the panel). */

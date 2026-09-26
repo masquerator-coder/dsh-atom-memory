@@ -1022,7 +1022,7 @@ Rules:
 * Python bridge and returns a JSON-serializable business value (backup payloads
 * are plain JSON). Arguments are validated minimally here and fully by the
 * Python side.
-*/var AtomMemoryController=class AtomMemoryController extends TypertRemoteService{static{[_initProto]=_applyDecs(this,[],[[Remote,2,"health"],[Remote,2,"listFacts"],[Remote,2,"editFact"],[Remote,2,"deleteFact"],[Remote,2,"summary"],[Remote,2,"changes"],[Remote,2,"overviewStatus"],[Remote,2,"refreshOverview"],[Remote,2,"unarchive"],[Remote,2,"listProfile"],[Remote,2,"upsertProfile"],[Remote,2,"deleteProfile"],[Remote,2,"writeProfile"],[Remote,2,"generateProfile"],[Remote,2,"backup"],[Remote,2,"restore"],[Remote,2,"getRuntime"]],0,void 0,TypertRemoteService).e;}bridge=void _initProto(this);runtime;startupError;complete;refreshOverviewFn;constructor(ctx,bridge,runtime,startupError=()=>void 0,complete=void 0,refreshOverviewFn=void 0){super(ctx,"atomMemoryController",{namespace:"atomMemory"});this.bridge=bridge;this.runtime=runtime;this.startupError=startupError;this.complete=complete;this.refreshOverviewFn=refreshOverviewFn;}/** Whether the bridge is alive and therefore able to serve a call. */assertReady(){if(!this.bridge.alive){const reason=this.startupError();throw new Error(reason!==void 0?`memory bridge is not running: ${reason}`:"memory bridge is not running");}}/**
+*/var AtomMemoryController=class AtomMemoryController extends TypertRemoteService{static{[_initProto]=_applyDecs(this,[],[[Remote,2,"health"],[Remote,2,"listFacts"],[Remote,2,"editFact"],[Remote,2,"deleteFact"],[Remote,2,"summary"],[Remote,2,"changes"],[Remote,2,"overviewStatus"],[Remote,2,"refreshOverview"],[Remote,2,"unarchive"],[Remote,2,"listProfile"],[Remote,2,"listDomains"],[Remote,2,"upsertProfile"],[Remote,2,"deleteProfile"],[Remote,2,"writeProfile"],[Remote,2,"generateProfile"],[Remote,2,"backup"],[Remote,2,"restore"],[Remote,2,"getRuntime"]],0,void 0,TypertRemoteService).e;}bridge=void _initProto(this);runtime;startupError;complete;refreshOverviewFn;constructor(ctx,bridge,runtime,startupError=()=>void 0,complete=void 0,refreshOverviewFn=void 0){super(ctx,"atomMemoryController",{namespace:"atomMemory"});this.bridge=bridge;this.runtime=runtime;this.startupError=startupError;this.complete=complete;this.refreshOverviewFn=refreshOverviewFn;}/** Whether the bridge is alive and therefore able to serve a call. */assertReady(){if(!this.bridge.alive){const reason=this.startupError();throw new Error(reason!==void 0?`memory bridge is not running: ${reason}`:"memory bridge is not running");}}/**
 	* Diagnostics for the panel: is the store actually usable?
 	*
 	* Deliberately does not call {@link assertReady}: this is the call the panel
@@ -1061,7 +1061,19 @@ Rules:
 	*
 	* The archive tier is how capacity control stays non-destructive: nothing is
 	* deleted when the store is over its cap, so there has to be a way back.
-	*/async unarchive(args){this.assertReady();if(!args.fact_id)throw new Error("unarchive requires fact_id");return this.bridge.call("unarchive",{user_id:args.user,fact_id:args.fact_id});}/** List the user's profile rows. */async listProfile(args){this.assertReady();return this.bridge.call("list_profile",{user_id:args.user});}/** Add or update one profile row (a user edit from the panel). */async upsertProfile(args){this.assertReady();if(!args.section||!args.key)throw new Error("upsertProfile requires section and key");return this.bridge.call("upsert_profile",{user_id:args.user,section:args.section,key:args.key,value:args.value});}/** Delete one profile row. */async deleteProfile(args){this.assertReady();return this.bridge.call("delete_profile",{user_id:args.user,section:args.section,key:args.key});}/** Apply the panel's batch profile edits (upserts + deletions) in one pass. */async writeProfile(args){this.assertReady();return this.bridge.call("write_profile",{user_id:args.user,rows:args.rows??[]});}/**
+	*/async unarchive(args){this.assertReady();if(!args.fact_id)throw new Error("unarchive requires fact_id");return this.bridge.call("unarchive",{user_id:args.user,fact_id:args.fact_id});}/** List the user's profile rows. */async listProfile(args){this.assertReady();return this.bridge.call("list_profile",{user_id:args.user});}/**
+	* The user's registered topic vocabulary (the `memory_domains`词表), for the
+	* settings panel's memory summary.
+	*
+	* `domain_list` answers with a bare list, so it is wrapped in an object here:
+	* every other panel-facing method returns a named-key envelope, and a bare
+	* array at the wire boundary is the shape that tends to get silently coerced
+	* (or dropped) by an intermediate layer. The panel reads `domains`.
+	*
+	* Read-only: it never registers a topic. Registering happens on the write path
+	* (`memory_domains` create / an extractor's proposal), never as a side effect
+	* of drawing a count.
+	*/async listDomains(args){this.assertReady();const domains=await this.bridge.call("domain_list",{user_id:args.user});return{domains:Array.isArray(domains)?domains:[]};}/** Add or update one profile row (a user edit from the panel). */async upsertProfile(args){this.assertReady();if(!args.section||!args.key)throw new Error("upsertProfile requires section and key");return this.bridge.call("upsert_profile",{user_id:args.user,section:args.section,key:args.key,value:args.value});}/** Delete one profile row. */async deleteProfile(args){this.assertReady();return this.bridge.call("delete_profile",{user_id:args.user,section:args.section,key:args.key});}/** Apply the panel's batch profile edits (upserts + deletions) in one pass. */async writeProfile(args){this.assertReady();return this.bridge.call("write_profile",{user_id:args.user,rows:args.rows??[]});}/**
 	* Propose profile entries for the user to approve.
 	*
 	* The flow spans both halves on purpose: Python owns which slots are *filable*

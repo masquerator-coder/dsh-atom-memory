@@ -63,6 +63,10 @@ const css = {
   pagerIndicator: 'atom-memory-pager-indicator',
   pagerError: 'atom-memory-pager-error',
   countBadge: 'atom-memory-count-badge',
+  domainsTitle: 'atom-memory-domains-title',
+  domainsList: 'atom-memory-domains-list',
+  domainsItem: 'atom-memory-domains-item',
+  domainsHint: 'atom-memory-domains-hint',
 }
 import { LOCALE_NS, type MemorySettingsLocaleKey } from './locales.ts'
 import { ensureMemorySettingsStyle } from './styles.ts'
@@ -88,6 +92,16 @@ const PRESET_LABEL_KEYS: Record<(typeof INJECTED_SUMMARY_TOKEN_PRESETS)[number],
 
 /** DOM id of the injection-budget slider (its `<label>` points at it). */
 const BUDGET_SLIDER_ID = 'atom-memory-inject-budget'
+
+/**
+ * How many topic names the badge's hover card lists before collapsing the rest
+ * into a "+N more" line.
+ *
+ * The card is a hover affordance, not a management surface (editing a topic
+ * vocabulary is `memory_domains`' job), so it must stay small enough to read at
+ * a glance and never grow tall enough to run off the panel.
+ */
+const DOMAIN_CARD_LIMIT = 24
 
 /**
  * Render a refresh outcome token as words.
@@ -312,6 +326,21 @@ export function MemorySettingsSection(props: MemorySettingsSectionProps) {
   const facts = state.data?.facts ?? []
   /** Rows the whole store holds; `facts` is only the page currently loaded. */
   const factsTotal = state.data?.factsTotal ?? facts.length
+  /** The user's registered topic vocabulary (see `MemoryData.domains`). */
+  const domains = state.data?.domains ?? []
+  /**
+   * The topics the *user* owns, which is what the badge counts.
+   *
+   * `system_seeded` rows are names the store registered for itself — git remotes
+   * harvested as `github.com/<owner>/<repo>`, plus the `general` / `user`
+   * scaffolding (`atom_memory/domain.py:664`). They are real domain rows and the
+   * store does use them, but they are not 领域 the user would recognise: on a
+   * real store of 11 rows, 8 were exactly this kind. Counting them made the
+   * badge read "11 个领域" for a vocabulary of 3, and the hover card listed git
+   * URLs as topics. Excluded here rather than at the fetch so the raw list stays
+   * intact for any future surface that wants it.
+   */
+  const ownDomains = domains.filter(d => d.system_seeded !== true)
 
   return (
     <div className={css.section}>
@@ -538,10 +567,55 @@ export function MemorySettingsSection(props: MemorySettingsSectionProps) {
             </button>
             {/* The count is read from the store's own `total`, not from
                 `facts.length` — the panel's list is one page, so its length
-                would report the page size as the memory count. */}
+                would report the page size as the memory count. The domain count
+                covers user-owned topics only; when there are none (or the call
+                failed) the badge degrades to the bare total rather than
+                claiming "0 个领域". */}
             <span className={css.countBadge}>
-              {t('factsTotal', { total: String(factsTotal) })}
+              {ownDomains.length > 0
+                ? t('memorySummaryBadge', { domains: String(ownDomains.length), total: String(factsTotal) })
+                : t('memorySummaryBadgeNoDomains', { total: String(factsTotal) })}
             </span>
+            <div className={css.tooltip}>
+              <p className={css.domainsTitle}>
+                {t('memoryDomainsTitle', { count: String(ownDomains.length) })}
+              </p>
+              {ownDomains.length > 0
+                ? (
+                    <>
+                      <ul className={css.domainsList}>
+                        {/* `path` is the materialised hierarchy label and the only
+                            field that makes a nested topic readable; `name` is the
+                            canonical fallback. Capped so a large vocabulary cannot
+                            grow the card past the viewport. */}
+                        {ownDomains.slice(0, DOMAIN_CARD_LIMIT).map(d => (
+                          <li key={d.domain_id} className={css.domainsItem}>
+                            {d.display_name || d.path || d.name}
+                          </li>
+                        ))}
+                      </ul>
+                      {ownDomains.length > DOMAIN_CARD_LIMIT
+                        ? (
+                            <p className={css.domainsHint}>
+                              {t('memoryDomainsMore', { rest: String(ownDomains.length - DOMAIN_CARD_LIMIT) })}
+                            </p>
+                          )
+                        : null}
+                    </>
+                  )
+                : <p className={css.domainsHint}>{t('memoryDomainsEmpty')}</p>}
+              {/* The auto-registered names are still worth a word: they are what
+                  makes recall scope-aware, and hiding them entirely would leave
+                  the store's own vocabulary invisible. */}
+              {domains.length > ownDomains.length
+                ? (
+                    <p className={css.domainsHint}>
+                      {t('memoryDomainsSystemSeeded', { count: String(domains.length - ownDomains.length) })}
+                    </p>
+                  )
+                : null}
+              <p className={css.domainsHint}>{t('memoryDomainsHint')}</p>
+            </div>
             {factsTotal === 0 ? <div className={css.tooltip}>{t('factsEmpty')}</div> : null}
           </div>
         </div>

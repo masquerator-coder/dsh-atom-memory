@@ -92,3 +92,31 @@ describe('AtomMemoryController fact paging', () => {
     expect(call).not.toHaveBeenCalled()
   })
 })
+
+describe('AtomMemoryController domain listing', () => {
+  it('wraps the bare domain list in a named envelope', async () => {
+    const rows = [
+      { domain_id: 1, name: 'programming', display_name: '编程', path: '/programming' },
+      { domain_id: 2, name: 'teaching', display_name: '教学', path: '/teaching' },
+    ]
+    const { controller, call } = makeController({ result: rows })
+    const out = await controller.listDomains({ user: 'global' })
+    expect(call.mock.calls[0]![0]).toBe('domain_list')
+    expect(call.mock.calls[0]![1]).toEqual({ user_id: 'global' })
+    // `domain_list` answers with a bare array; the panel reads `domains`, so the
+    // wrapper is part of the contract, not a nicety.
+    expect(out.domains).toEqual(rows)
+  })
+
+  it('normalizes a non-array domain payload to an empty list', async () => {
+    const { controller } = makeController({ result: undefined })
+    // A missing vocabulary must read as "no domains", never crash the panel.
+    await expect(controller.listDomains({ user: 'global' })).resolves.toEqual({ domains: [] })
+  })
+
+  it('refuses to list domains while the bridge is down', async () => {
+    const { controller, call } = makeController({ alive: false })
+    await expect(controller.listDomains({ user: 'global' })).rejects.toThrow('bridge is not running')
+    expect(call).not.toHaveBeenCalled()
+  })
+})

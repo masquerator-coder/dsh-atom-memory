@@ -20,8 +20,12 @@ export const memorySettingsStyleText = `
 .atom-memory-group-title{font-size:13px;font-weight:700;padding:0 6px;color:var(--dsw-alias-label-primary,#e6e8eb)}
 /* The 记忆内容 region lays its actions out as one horizontal row of buttons. */
 .atom-memory-content-actions{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-start}
-/* Each action is a relative anchor for its hover tooltip. */
-.atom-memory-toggle{position:relative;display:inline-flex}
+/* Each action is a relative anchor for its hover tooltip. Centering the row
+   keeps a button and its adjacent count badge on one baseline; the badge itself
+   carries the horizontal gap so the two read as one unit rather than as two
+   unrelated row items. */
+.atom-memory-toggle{position:relative;display:inline-flex;align-items:center}
+.atom-memory-toggle .atom-memory-count-badge{margin-left:12px}
 .atom-memory-toggle .atom-memory-tooltip{position:absolute;top:calc(100% + 8px);left:0;z-index:50;width:max-content;max-width:min(320px,80vw);padding:8px 11px;border:1px solid var(--dsw-alias-border-l3,rgba(255,255,255,0.16));border-radius:8px;background:var(--dsw-alias-bg-layer-3,#24262b);color:var(--dsw-alias-label-primary,#e6e8eb);font-size:12px;line-height:1.55;box-shadow:0 10px 28px rgba(0,0,0,0.4);white-space:normal;opacity:0;visibility:hidden;pointer-events:none;transition:opacity 120ms ease,visibility 120ms ease}
 .atom-memory-toggle:hover .atom-memory-tooltip,.atom-memory-toggle:focus-within .atom-memory-tooltip{opacity:1;visibility:visible}
 .atom-memory-switch-row,.atom-memory-radio-row{display:flex;align-items:flex-start;gap:8px;font-size:14px;cursor:pointer;color:var(--dsw-alias-label-primary,#e6e8eb)}
@@ -89,8 +93,19 @@ export const memorySettingsStyleText = `
    buttons sideways as the page number grows a digit. */
 .atom-memory-pager-indicator{font-variant-numeric:tabular-nums;white-space:nowrap}
 .atom-memory-pager-error{color:var(--dsw-alias-state-error-primary,#e5484d);margin:0 0 8px}
-/* The count badge shown next to the 编辑记忆 button in the panel. */
-.atom-memory-count-badge{font-size:12px;color:var(--dsw-alias-label-secondary,#8a8f98);font-variant-numeric:tabular-nums;white-space:nowrap}
+/* The count badge shown next to the 编辑记忆 button in the panel. It is itself
+   the hover target for the domain card, so it must not be pointer-transparent
+   and needs its own focus ring (the card is reachable by keyboard through the
+   button's focus-within, and a mouse user must be able to hover it). */
+.atom-memory-count-badge{font-size:12px;color:var(--dsw-alias-label-secondary,#8a8f98);font-variant-numeric:tabular-nums;white-space:nowrap;cursor:default;border-bottom:1px dotted var(--dsw-alias-border-l3,rgba(255,255,255,0.16));padding-bottom:1px}
+/* The domain card reuses the tooltip skin but is wider (it lists names) and is
+   anchored to the badge, so it hangs below the badge rather than below the
+   button. */
+.atom-memory-toggle .atom-memory-count-badge+.atom-memory-tooltip{left:auto;right:0;max-width:min(360px,80vw)}
+.atom-memory-domains-title{font-weight:600;margin:0 0 5px}
+.atom-memory-domains-list{margin:0;padding:0;list-style:none;display:flex;flex-wrap:wrap;gap:4px 6px}
+.atom-memory-domains-item{padding:1px 7px;border:1px solid var(--dsw-alias-border-l3,rgba(255,255,255,0.16));border-radius:999px;background:var(--dsw-alias-bg-layer-2,#24262b);font-family:var(--dsw-font-mono,ui-monospace,SFMono-Regular,Menlo,Consolas,monospace);font-size:11px}
+.atom-memory-domains-hint{margin:6px 0 0;color:var(--dsw-alias-label-secondary,#8a8f98);font-size:11px}
 
 /* Injection-budget gear slider: a discrete handle plus its gear labels. The
    field skin (border/background/padding) is for text inputs — a native range
