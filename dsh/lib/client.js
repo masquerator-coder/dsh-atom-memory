@@ -94,6 +94,36 @@ window.__ModuleLoader__.load({
 			return result.value;
 		}
 		const USER = "global";
+		/**
+		* Rows per page offered by the facts editor, smallest first.
+		*
+		* 200 is the store's own ceiling (`list_facts` clamps `limit` to `[1, 200]`), so
+		* offering anything larger would render a page-size control that quietly does
+		* not do what it says.
+		*/
+		const FACTS_PAGE_SIZES = [
+			20,
+			50,
+			100,
+			200
+		];
+		/**
+		* Read a row count off a `list_facts` envelope.
+		*
+		* Falls back to the page length when `total` is missing or unparsable, so a
+		* store that predates the count (or a malformed payload) still renders a sane
+		* number instead of `NaN` — the panel is the only place this is read, and a
+		* `NaN` count would read as "0 memories" to the user.
+		*
+		* @param total - The envelope's `total` field, if any.
+		* @param facts - The page actually returned.
+		* @returns A non-negative integer row count.
+		*/
+		function normalizeTotal(total, facts) {
+			const parsed = Number(total);
+			if (Number.isFinite(parsed) && parsed >= 0) return Math.trunc(parsed);
+			return Array.isArray(facts) ? facts.length : 0;
+		}
 		var MemorySettingsController = class {
 			scope;
 			remote;
@@ -110,6 +140,7 @@ window.__ModuleLoader__.load({
 				},
 				data: {
 					facts: [],
+					factsTotal: 0,
 					profile: []
 				}
 			});
@@ -143,6 +174,7 @@ window.__ModuleLoader__.load({
 					}),
 					setExtractionModelOverride: (override) => this.scope.set("extractionModel", override),
 					refreshData: () => this.refreshData(),
+					fetchFactsPage: (offset, limit) => this.fetchFactsPage(offset, limit),
 					saveFact: (fact) => this.saveFact(fact),
 					deleteFact: (factId) => this.deleteFact(factId),
 					fetchSummary: () => this.fetchSummary(),
@@ -176,7 +208,8 @@ window.__ModuleLoader__.load({
 				try {
 					const [factsR, profileR] = await Promise.all([this.r().listFacts({
 						user: USER,
-						limit: 200
+						offset: 0,
+						limit: 50
 					}), this.r().listProfile({ user: USER })]);
 					const facts = unwrap(factsR);
 					const profile = unwrap(profileR);
@@ -184,6 +217,7 @@ window.__ModuleLoader__.load({
 						...this.store.getSnapshot(),
 						data: {
 							facts: Array.isArray(facts.facts) ? facts.facts : [],
+							factsTotal: normalizeTotal(facts.total, facts.facts),
 							profile: Array.isArray(profile.profile) ? profile.profile : [],
 							profileCount: Number(profile.count ?? (Array.isArray(profile.profile) ? profile.profile.length : 0)),
 							profileLimit: Number(profile.limit ?? 0)
@@ -195,6 +229,46 @@ window.__ModuleLoader__.load({
 						...this.store.getSnapshot(),
 						lastError: err?.message ?? String(err)
 					});
+				}
+			}
+			/**
+			* Fetch one page of active facts into `data.facts`.
+			*
+			* Paging is served by the store, not sliced in the browser: `list_facts`
+			* already paginates (`LIMIT`/`OFFSET`) and counts the whole table in the same
+			* round trip, so a page fetch is one call and the panel can reach facts past
+			* any single-page cap. A client-side slice could not: it would have to receive
+			* every row first, which is exactly what does not scale.
+			*
+			* `data.facts` is *replaced* by the page — the table renders one page at a time
+			* — and `factsTotal` is refreshed from the same envelope so the count stays in
+			* step with the rows on screen (a save that deletes a row changes both).
+			*
+			* @param offset - Zero-based index of the first row to fetch.
+			* @param limit - Rows per page (the store clamps this to 200).
+			*/
+			async fetchFactsPage(offset, limit) {
+				try {
+					const page = unwrap(await this.r().listFacts({
+						user: USER,
+						offset,
+						limit
+					}));
+					this.store.set({
+						...this.store.getSnapshot(),
+						data: {
+							...this.store.getSnapshot().data,
+							facts: Array.isArray(page.facts) ? page.facts : [],
+							factsTotal: normalizeTotal(page.total, page.facts)
+						},
+						lastError: void 0
+					});
+				} catch (err) {
+					this.store.set({
+						...this.store.getSnapshot(),
+						lastError: err?.message ?? String(err)
+					});
+					throw err;
 				}
 			}
 			async saveFact(fact) {
@@ -474,6 +548,14 @@ window.__ModuleLoader__.load({
 				addRow: "添加一行",
 				close: "关闭",
 				saving: "保存中…",
+				factsTotal: "共 {total} 条",
+				factsPageRange: "第 {from}-{to} 条 / 共 {total} 条",
+				factsPageSizeLabel: "每页显示",
+				factsPageSizeOption: "{size} 条",
+				factsPagePrev: "上一页",
+				factsPageNext: "下一页",
+				factsPageIndicator: "第 {page}/{pages} 页",
+				factsPageLoadError: "第 {page} 页加载失败：{message}",
 				backupHeader: "记忆备份与恢复",
 				backupDesc: "把记忆导出为 JSON 文件，或从 JSON 文件导入恢复（replace 语义：覆盖当前记忆）。",
 				exportBtn: "导出 JSON",
@@ -580,6 +662,14 @@ window.__ModuleLoader__.load({
 				addRow: "Add row",
 				close: "Close",
 				saving: "Saving…",
+				factsTotal: "{total} total",
+				factsPageRange: "Rows {from}-{to} of {total}",
+				factsPageSizeLabel: "Rows per page",
+				factsPageSizeOption: "{size} rows",
+				factsPagePrev: "Previous",
+				factsPageNext: "Next",
+				factsPageIndicator: "Page {page}/{pages}",
+				factsPageLoadError: "Failed to load page {page}: {message}",
 				backupHeader: "Backup & restore",
 				backupDesc: "Export memory to a JSON file, or import from a JSON file to restore (replace semantics: overwrites current memory).",
 				exportBtn: "Export JSON",
@@ -673,6 +763,18 @@ window.__ModuleLoader__.load({
 .atom-memory-editor-row-actions{display:flex;gap:6px;align-items:center;justify-content:flex-end;white-space:nowrap}
 /* The pin checkbox must not inherit the table's full-width text-input skin. */
 .atom-memory-editor input.atom-memory-pin{width:auto;padding:0;margin:0;border:none;background:transparent;cursor:pointer}
+/* Facts table paging: a count/range read-out on the left, the page controls on
+   the right. Wraps on narrow panels rather than overflowing the modal. */
+.atom-memory-pager{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:0 0 10px}
+.atom-memory-pager-spacer{flex:1 1 auto}
+.atom-memory-pager-group{display:flex;align-items:center;gap:6px}
+.atom-memory-pager select{padding:4px 6px;border:1px solid var(--dsw-alias-border-l3,rgba(255,255,255,0.16));border-radius:6px;background:var(--dsw-alias-bg-layer-3,#24262b);color:var(--dsw-alias-label-primary,#e6e8eb);font-size:12px}
+/* The page indicator is informational, so it is sized so it cannot jitter the
+   buttons sideways as the page number grows a digit. */
+.atom-memory-pager-indicator{font-variant-numeric:tabular-nums;white-space:nowrap}
+.atom-memory-pager-error{color:var(--dsw-alias-state-error-primary,#e5484d);margin:0 0 8px}
+/* The count badge shown next to the 编辑记忆 button in the panel. */
+.atom-memory-count-badge{font-size:12px;color:var(--dsw-alias-label-secondary,#8a8f98);font-variant-numeric:tabular-nums;white-space:nowrap}
 
 /* Injection-budget gear slider: a discrete handle plus its gear labels. The
    field skin (border/background/padding) is for text inputs — a native range
@@ -747,7 +849,13 @@ window.__ModuleLoader__.load({
 			modalBody: "atom-memory-modal-body",
 			modalFooter: "atom-memory-modal-footer",
 			editor: "atom-memory-editor",
-			editorRowActions: "atom-memory-editor-row-actions"
+			editorRowActions: "atom-memory-editor-row-actions",
+			pager: "atom-memory-pager",
+			pagerSpacer: "atom-memory-pager-spacer",
+			pagerGroup: "atom-memory-pager-group",
+			pagerIndicator: "atom-memory-pager-indicator",
+			pagerError: "atom-memory-pager-error",
+			countBadge: "atom-memory-count-badge"
 		};
 		/** Locale key of each gear shown in the panel, smallest gear first. */
 		const PRESET_LABEL_KEYS = {
@@ -873,6 +981,8 @@ window.__ModuleLoader__.load({
 			const busy = state.loading || phase === "busy";
 			const profile = state.data?.profile ?? [];
 			const facts = state.data?.facts ?? [];
+			/** Rows the whole store holds; `facts` is only the page currently loaded. */
+			const factsTotal = state.data?.factsTotal ?? facts.length;
 			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 				className: css.section,
 				children: [
@@ -1139,16 +1249,23 @@ window.__ModuleLoader__.load({
 								}),
 								/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 									className: css.toggle,
-									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-										type: "button",
-										className: css.btn,
-										disabled: busy,
-										onClick: () => setModal("facts"),
-										children: t("memoryEditBtn")
-									}), facts.length === 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
-										className: css.tooltip,
-										children: t("factsEmpty")
-									}) : null]
+									children: [
+										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+											type: "button",
+											className: css.btn,
+											disabled: busy,
+											onClick: () => setModal("facts"),
+											children: t("memoryEditBtn")
+										}),
+										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											className: css.countBadge,
+											children: t("factsTotal", { total: String(factsTotal) })
+										}),
+										factsTotal === 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+											className: css.tooltip,
+											children: t("factsEmpty")
+										}) : null
+									]
 								})
 							]
 						})]
@@ -1230,6 +1347,8 @@ window.__ModuleLoader__.load({
 					modal === "facts" ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)(FactsEditorModal, {
 						t,
 						initial: facts,
+						total: factsTotal,
+						onFetchPage: (offset, limit) => props.fetchFactsPage(offset, limit),
 						onSave: (rows) => props.saveAllFacts(rows),
 						onClose: () => setModal(void 0)
 					}) : null,
@@ -1300,10 +1419,25 @@ window.__ModuleLoader__.load({
 				})
 			});
 		}
-		/** Modal editor for atomic facts: Excel-like editable table + single save all. */
+		/** Modal editor for atomic facts: Excel-like editable table + single save all.
+		*
+		* The table shows **one page** of the store's facts. Paging is served by the
+		* store (`fetchFactsPage` → `list_facts` with `offset`/`limit`), not sliced in
+		* the browser, so facts past the first page are reachable and the panel never
+		* has to hold the whole table.
+		*
+		* Turning a page therefore *replaces* the draft rows: the table renders what the
+		* current page returned, and there is no cross-page draft state. That is the
+		* honest model — a save commits exactly the rows on screen, against a diff taken
+		* from that same page (see `saveAllFacts`) — and it is why `draftsFor` re-seeds
+		* on every fetched page instead of merging. Carrying half-edited rows across a
+		* page turn would let a stale draft be written back over a row the user has
+		* since navigated away from and no longer sees.
+		*/
 		function FactsEditorModal(props) {
-			const { t, initial, onSave, onClose } = props;
-			const [rows, setRows] = (0, react.useState)(() => initial.map((f) => ({
+			const { t, initial, total, onFetchPage, onSave, onClose } = props;
+			/** Build the editable drafts for one fetched page. */
+			const draftsFor = (page) => page.map((f) => ({
 				uid: nextDraftUid(),
 				fact_id: f.fact_id,
 				subject: f.subject,
@@ -1312,9 +1446,53 @@ window.__ModuleLoader__.load({
 				content: f.content ?? "",
 				type: f.type,
 				deleted: false
-			})));
+			}));
+			const [rows, setRows] = (0, react.useState)(() => draftsFor(initial));
 			const [saving, setSaving] = (0, react.useState)(false);
 			const [saveError, setSaveError] = (0, react.useState)(void 0);
+			const [pageSize, setPageSize] = (0, react.useState)(50);
+			/** Zero-based index of the page on screen. */
+			const [page, setPage] = (0, react.useState)(0);
+			const [paging, setPaging] = (0, react.useState)(false);
+			const [pageError, setPageError] = (0, react.useState)();
+			/**
+			* The page the table is actually showing, derived from what the store handed
+			* us rather than assumed from `page`.
+			*
+			* `total` is the store's count and `initial` is one page of it, so the page
+			* count follows the *data*, and a deletion on the last page shrinks it without
+			* the user being stranded on a page that no longer exists (the effect below
+			* pulls `page` back into range).
+			*/
+			const pageCount = Math.max(1, Math.ceil(total / pageSize));
+			const from = total === 0 ? 0 : Math.min(page * pageSize + 1, total);
+			const to = total === 0 ? 0 : Math.min((page + 1) * pageSize, total);
+			/** Fetch `nextPage` and re-seed the drafts from what came back. */
+			const loadPage = (nextPage, size) => {
+				setPaging(true);
+				setPageError(void 0);
+				onFetchPage(nextPage * size, size).then(() => {
+					setPage(nextPage);
+				}).catch((err) => {
+					setPageError(err?.message ?? String(err));
+				}).finally(() => {
+					setPaging(false);
+				});
+			};
+			const goToPage = (nextPage) => {
+				if (nextPage < 0 || nextPage > pageCount - 1 || nextPage === page) return;
+				loadPage(nextPage, pageSize);
+			};
+			const changePageSize = (size) => {
+				setPageSize(size);
+				loadPage(0, size);
+			};
+			(0, react.useEffect)(() => {
+				setRows(draftsFor(initial));
+			}, [initial]);
+			(0, react.useEffect)(() => {
+				if (page > pageCount - 1) loadPage(pageCount - 1, pageSize);
+			}, [pageCount, page]);
 			const setRow = (index, patch) => setRows((prev) => prev.map((r, i) => i === index ? {
 				...r,
 				...patch
@@ -1348,54 +1526,120 @@ window.__ModuleLoader__.load({
 				title: t("memoryModalTitle"),
 				footer,
 				onClose,
-				children: [saveError ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
-					className: css.hint,
-					style: { color: "#c0392b" },
-					children: saveError
-				}) : null, /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("table", {
-					className: css.editor,
-					children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("thead", { children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("tr", { children: [
-						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("th", { children: t("colSubject") }),
-						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("th", { children: t("colPredicate") }),
-						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("th", { children: t("colObject") }),
-						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("th", { children: t("colContent") }),
-						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("th", { children: t("colActions") })
-					] }) }), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("tbody", { children: rows.map((row, i) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("tr", {
-						style: row.deleted ? { opacity: .45 } : void 0,
+				children: [
+					saveError ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+						className: css.hint,
+						style: { color: "#c0392b" },
+						children: saveError
+					}) : null,
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						className: css.pager,
 						children: [
-							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("td", { children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
-								value: row.subject,
-								disabled: row.deleted,
-								placeholder: t("newRowPlaceholder"),
-								onChange: (e) => setRow(i, { subject: e.currentTarget.value })
-							}) }),
-							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("td", { children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
-								value: row.predicate,
-								disabled: row.deleted,
-								onChange: (e) => setRow(i, { predicate: e.currentTarget.value })
-							}) }),
-							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("td", { children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
-								value: row.object,
-								disabled: row.deleted,
-								onChange: (e) => setRow(i, { object: e.currentTarget.value })
-							}) }),
-							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("td", { children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("textarea", {
-								value: row.content ?? "",
-								disabled: row.deleted,
-								onChange: (e) => setRow(i, { content: e.currentTarget.value })
-							}) }),
-							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("td", { children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
-								className: css.editorRowActions,
-								children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-									type: "button",
-									className: css.btnRowDelete,
-									onClick: () => setRow(i, { deleted: !row.deleted }),
-									children: row.deleted ? t("addRow") : t("factDelete")
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: css.hint,
+								children: t("factsPageRange", {
+									from: String(from),
+									to: String(to),
+									total: String(total)
 								})
-							}) })
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { className: css.pagerSpacer }),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
+								className: css.pagerGroup,
+								children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+									className: css.hint,
+									children: t("factsPageSizeLabel")
+								}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("select", {
+									value: pageSize,
+									disabled: paging || saving,
+									"aria-label": t("factsPageSizeLabel"),
+									onChange: (e) => changePageSize(Number(e.currentTarget.value)),
+									children: FACTS_PAGE_SIZES.map((size) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)("option", {
+										value: size,
+										children: t("factsPageSizeOption", { size: String(size) })
+									}, size))
+								})]
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+								className: css.pagerGroup,
+								children: [
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+										type: "button",
+										className: css.btn,
+										disabled: paging || saving || page <= 0,
+										onClick: () => goToPage(page - 1),
+										children: t("factsPagePrev")
+									}),
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+										className: `${css.hint} ${css.pagerIndicator}`,
+										children: t("factsPageIndicator", {
+											page: String(page + 1),
+											pages: String(pageCount)
+										})
+									}),
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+										type: "button",
+										className: css.btn,
+										disabled: paging || saving || page >= pageCount - 1,
+										onClick: () => goToPage(page + 1),
+										children: t("factsPageNext")
+									})
+								]
+							})
 						]
-					}, row.uid)) })]
-				})]
+					}),
+					pageError ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+						className: `${css.hint} ${css.pagerError}`,
+						children: t("factsPageLoadError", {
+							page: String(page + 1),
+							message: pageError
+						})
+					}) : null,
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("table", {
+						className: css.editor,
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("thead", { children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("tr", { children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("th", { children: t("colSubject") }),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("th", { children: t("colPredicate") }),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("th", { children: t("colObject") }),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("th", { children: t("colContent") }),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("th", { children: t("colActions") })
+						] }) }), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("tbody", { children: rows.map((row, i) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("tr", {
+							style: row.deleted ? { opacity: .45 } : void 0,
+							children: [
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("td", { children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+									value: row.subject,
+									disabled: row.deleted,
+									placeholder: t("newRowPlaceholder"),
+									onChange: (e) => setRow(i, { subject: e.currentTarget.value })
+								}) }),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("td", { children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+									value: row.predicate,
+									disabled: row.deleted,
+									onChange: (e) => setRow(i, { predicate: e.currentTarget.value })
+								}) }),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("td", { children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+									value: row.object,
+									disabled: row.deleted,
+									onChange: (e) => setRow(i, { object: e.currentTarget.value })
+								}) }),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("td", { children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("textarea", {
+									value: row.content ?? "",
+									disabled: row.deleted,
+									onChange: (e) => setRow(i, { content: e.currentTarget.value })
+								}) }),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("td", { children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+									className: css.editorRowActions,
+									children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+										type: "button",
+										className: css.btnRowDelete,
+										onClick: () => setRow(i, { deleted: !row.deleted }),
+										children: row.deleted ? t("addRow") : t("factDelete")
+									})
+								}) })
+							]
+						}, row.uid)) })]
+					})
+				]
 			});
 		}
 		/** Modal editor for the user profile: Excel-like editable table + single save all. */

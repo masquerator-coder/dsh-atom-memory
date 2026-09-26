@@ -62,6 +62,15 @@ export interface MemoryData {
     content?: string
   }>
   profile: Array<{ section: string; key: string; value: string; source?: string }>
+  /**
+   * Total active facts the store holds, from the `list_facts` envelope.
+   *
+   * Deliberately NOT `facts.length`: `facts` is one page of a paged list, so its
+   * length is the page size once the library outgrows a single page. The store
+   * counts the whole table in the same statement that serves the page, so this
+   * is the authority on "how many memories do I have".
+   */
+  factsTotal?: number
   /** Row cap and current count for the profile table (`limit` 0 = uncapped). */
   profileCount?: number
   profileLimit?: number
@@ -119,6 +128,14 @@ export interface MemorySettingsFace {
   /** Write the whole extraction-model override (provider/model/baseURL/protocol/apiKey). */
   setExtractionModelOverride: (override: NonNullable<MemorySettingsSection['extractionModel']>) => Promise<boolean>
   refreshData: () => Promise<void>
+  /**
+   * Fetch one page of active facts into `data.facts` (server-side paging).
+   *
+   * Rejects on a failed call so the caller can report it; the store's own
+   * `lastError` is set either way. The page that was on screen stays in the
+   * snapshot when the call fails, so a failed page turn does not blank the table.
+   */
+  fetchFactsPage: (offset: number, limit: number) => Promise<void>
   saveFact: (fact: MemoryData['facts'][number]) => Promise<void>
   deleteFact: (factId: string) => Promise<void>
   /** Lazy-load the user's compact summary (the view injected into the prompt). */
@@ -230,6 +247,36 @@ function unwrap<T>(result: WireResult<T>): T {
 
 const USER = 'global'
 
+/**
+ * Rows per page offered by the facts editor, smallest first.
+ *
+ * 200 is the store's own ceiling (`list_facts` clamps `limit` to `[1, 200]`), so
+ * offering anything larger would render a page-size control that quietly does
+ * not do what it says.
+ */
+export const FACTS_PAGE_SIZES = [20, 50, 100, 200] as const
+
+/** Page size the panel opens with. */
+export const FACTS_PAGE_SIZE_DEFAULT = 50
+
+/**
+ * Read a row count off a `list_facts` envelope.
+ *
+ * Falls back to the page length when `total` is missing or unparsable, so a
+ * store that predates the count (or a malformed payload) still renders a sane
+ * number instead of `NaN` — the panel is the only place this is read, and a
+ * `NaN` count would read as "0 memories" to the user.
+ *
+ * @param total - The envelope's `total` field, if any.
+ * @param facts - The page actually returned.
+ * @returns A non-negative integer row count.
+ */
+function normalizeTotal(total: unknown, facts: unknown): number {
+  const parsed = Number(total)
+  if (Number.isFinite(parsed) && parsed >= 0) return Math.trunc(parsed)
+  return Array.isArray(facts) ? facts.length : 0
+}
+
 export class MemorySettingsController {
   private readonly store = createSnapshotStore<MemorySettingsState>({
     available: false,
@@ -242,7 +289,7 @@ export class MemorySettingsController {
       overviewEnabled: true,
       extractionModel: undefined,
     },
-    data: { facts: [], profile: [] },
+    data: { facts: [], factsTotal: 0, profile: [] },
   })
   private readonly unsubscribe: () => void
 
@@ -277,6 +324,7 @@ export class MemorySettingsController {
       setExtractionModelOverride: (override) =>
         this.scope.set('extractionModel', override),
       refreshData: () => this.refreshData(),
+      fetchFactsPage: (offset, limit) => this.fetchFactsPage(offset, limit),
       saveFact: (fact) => this.saveFact(fact),
       deleteFact: (factId) => this.deleteFact(factId),
       fetchSummary: () => this.fetchSummary(),
@@ -313,7 +361,7 @@ export class MemorySettingsController {
   private async refreshData(): Promise<void> {
     try {
       const [factsR, profileR] = await Promise.all([
-        this.r().listFacts({ user: USER, limit: 200 }),
+        this.r().listFacts({ user: USER, offset: 0, limit: FACTS_PAGE_SIZE_DEFAULT }),
         this.r().listProfile({ user: USER }),
       ])
       const facts = unwrap(factsR)
@@ -322,6 +370,7 @@ export class MemorySettingsController {
         ...this.store.getSnapshot(),
         data: {
           facts: Array.isArray(facts.facts) ? facts.facts : [],
+          factsTotal: normalizeTotal(facts.total, facts.facts),
           profile: Array.isArray(profile.profile) ? profile.profile : [],
           profileCount: Number(profile.count ?? (Array.isArray(profile.profile) ? profile.profile.length : 0)),
           profileLimit: Number(profile.limit ?? 0),
@@ -332,6 +381,42 @@ export class MemorySettingsController {
       this.store.set({
         ...this.store.getSnapshot(), lastError: (err as Error)?.message ?? String(err),
       })
+    }
+  }
+
+  /**
+   * Fetch one page of active facts into `data.facts`.
+   *
+   * Paging is served by the store, not sliced in the browser: `list_facts`
+   * already paginates (`LIMIT`/`OFFSET`) and counts the whole table in the same
+   * round trip, so a page fetch is one call and the panel can reach facts past
+   * any single-page cap. A client-side slice could not: it would have to receive
+   * every row first, which is exactly what does not scale.
+   *
+   * `data.facts` is *replaced* by the page — the table renders one page at a time
+   * — and `factsTotal` is refreshed from the same envelope so the count stays in
+   * step with the rows on screen (a save that deletes a row changes both).
+   *
+   * @param offset - Zero-based index of the first row to fetch.
+   * @param limit - Rows per page (the store clamps this to 200).
+   */
+  private async fetchFactsPage(offset: number, limit: number): Promise<void> {
+    try {
+      const page = unwrap(await this.r().listFacts({ user: USER, offset, limit }))
+      this.store.set({
+        ...this.store.getSnapshot(),
+        data: {
+          ...this.store.getSnapshot().data,
+          facts: Array.isArray(page.facts) ? page.facts : [],
+          factsTotal: normalizeTotal(page.total, page.facts),
+        },
+        lastError: undefined,
+      })
+    } catch (err) {
+      this.store.set({
+        ...this.store.getSnapshot(), lastError: (err as Error)?.message ?? String(err),
+      })
+      throw err
     }
   }
 

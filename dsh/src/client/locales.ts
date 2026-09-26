@@ -106,6 +106,15 @@ const zh = {
   addRow: '添加一行',
   close: '关闭',
   saving: '保存中…',
+  // 5b) facts table paging (the table shows one page at a time)
+  factsTotal: '共 {total} 条',
+  factsPageRange: '第 {from}-{to} 条 / 共 {total} 条',
+  factsPageSizeLabel: '每页显示',
+  factsPageSizeOption: '{size} 条',
+  factsPagePrev: '上一页',
+  factsPageNext: '下一页',
+  factsPageIndicator: '第 {page}/{pages} 页',
+  factsPageLoadError: '第 {page} 页加载失败：{message}',
   // (removed the old memoryMd block — the compact injected view now lives under summary above)
   // 5) backup / restore
   backupHeader: '记忆备份与恢复',
@@ -219,6 +228,14 @@ const en: Record<keyof typeof zh, string> = {
   addRow: 'Add row',
   close: 'Close',
   saving: 'Saving…',
+  factsTotal: '{total} total',
+  factsPageRange: 'Rows {from}-{to} of {total}',
+  factsPageSizeLabel: 'Rows per page',
+  factsPageSizeOption: '{size} rows',
+  factsPagePrev: 'Previous',
+  factsPageNext: 'Next',
+  factsPageIndicator: 'Page {page}/{pages}',
+  factsPageLoadError: 'Failed to load page {page}: {message}',
   // (removed the old memoryMd block — the compact injected view now lives under summary above)
   backupHeader: 'Backup & restore',
   backupDesc: 'Export memory to a JSON file, or import from a JSON file to restore (replace semantics: overwrites current memory).',

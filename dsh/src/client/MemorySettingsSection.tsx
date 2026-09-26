@@ -57,6 +57,12 @@ const css = {
   modalFooter: 'atom-memory-modal-footer',
   editor: 'atom-memory-editor',
   editorRowActions: 'atom-memory-editor-row-actions',
+  pager: 'atom-memory-pager',
+  pagerSpacer: 'atom-memory-pager-spacer',
+  pagerGroup: 'atom-memory-pager-group',
+  pagerIndicator: 'atom-memory-pager-indicator',
+  pagerError: 'atom-memory-pager-error',
+  countBadge: 'atom-memory-count-badge',
 }
 import { LOCALE_NS, type MemorySettingsLocaleKey } from './locales.ts'
 import { ensureMemorySettingsStyle } from './styles.ts'
@@ -68,6 +74,7 @@ import type {
   FactEditRow, MemorySettingsFace, MemorySettingsState, ProfileEditRow,
   ProfileSuggestion, ProfileSuggestionResult,
 } from './memory-settings-controller.ts'
+import { FACTS_PAGE_SIZE_DEFAULT, FACTS_PAGE_SIZES } from './memory-settings-controller.ts'
 
 /** Locale key of each gear shown in the panel, smallest gear first. */
 const PRESET_LABEL_KEYS: Record<(typeof INJECTED_SUMMARY_TOKEN_PRESETS)[number], MemorySettingsLocaleKey> = {
@@ -303,6 +310,8 @@ export function MemorySettingsSection(props: MemorySettingsSectionProps) {
   // facts/profile payload) blank the panel — default to empty lists.
   const profile = state.data?.profile ?? []
   const facts = state.data?.facts ?? []
+  /** Rows the whole store holds; `facts` is only the page currently loaded. */
+  const factsTotal = state.data?.factsTotal ?? facts.length
 
   return (
     <div className={css.section}>
@@ -527,7 +536,13 @@ export function MemorySettingsSection(props: MemorySettingsSectionProps) {
             <button type="button" className={css.btn} disabled={busy} onClick={() => setModal('facts')}>
               {t('memoryEditBtn')}
             </button>
-            {facts.length === 0 ? <div className={css.tooltip}>{t('factsEmpty')}</div> : null}
+            {/* The count is read from the store's own `total`, not from
+                `facts.length` — the panel's list is one page, so its length
+                would report the page size as the memory count. */}
+            <span className={css.countBadge}>
+              {t('factsTotal', { total: String(factsTotal) })}
+            </span>
+            {factsTotal === 0 ? <div className={css.tooltip}>{t('factsEmpty')}</div> : null}
           </div>
         </div>
       </fieldset>
@@ -598,6 +613,8 @@ export function MemorySettingsSection(props: MemorySettingsSectionProps) {
         <FactsEditorModal
           t={t}
           initial={facts}
+          total={factsTotal}
+          onFetchPage={(offset, limit) => props.fetchFactsPage(offset, limit)}
           onSave={(rows) => props.saveAllFacts(rows)}
           onClose={() => setModal(undefined)}
         />
@@ -676,23 +693,112 @@ function SummaryModal(props: {
  * Excel-style table editors
  * ========================================================================== */
 
-/** Modal editor for atomic facts: Excel-like editable table + single save all. */
+/** Modal editor for atomic facts: Excel-like editable table + single save all.
+ *
+ * The table shows **one page** of the store's facts. Paging is served by the
+ * store (`fetchFactsPage` → `list_facts` with `offset`/`limit`), not sliced in
+ * the browser, so facts past the first page are reachable and the panel never
+ * has to hold the whole table.
+ *
+ * Turning a page therefore *replaces* the draft rows: the table renders what the
+ * current page returned, and there is no cross-page draft state. That is the
+ * honest model — a save commits exactly the rows on screen, against a diff taken
+ * from that same page (see `saveAllFacts`) — and it is why `draftsFor` re-seeds
+ * on every fetched page instead of merging. Carrying half-edited rows across a
+ * page turn would let a stale draft be written back over a row the user has
+ * since navigated away from and no longer sees.
+ */
 function FactsEditorModal(props: {
   t: RowTranslate
   initial: MemorySettingsState['data']['facts']
+  /** Total active facts in the store (not `initial.length`, which is one page). */
+  total: number
+  /** Load one page from the store; rejects if the call fails. */
+  onFetchPage: (offset: number, limit: number) => Promise<void>
   onSave: (rows: FactEditRow[]) => void
   onClose: () => void
 }) {
-  const { t, initial, onSave, onClose } = props
-  const [rows, setRows] = useState<FactsDraft[]>(() =>
-    initial.map(f => ({
+  const { t, initial, total, onFetchPage, onSave, onClose } = props
+
+  /** Build the editable drafts for one fetched page. */
+  const draftsFor = (page: MemorySettingsState['data']['facts']): FactsDraft[] =>
+    page.map(f => ({
       uid: nextDraftUid(),
       fact_id: f.fact_id, subject: f.subject, predicate: f.predicate,
       object: f.object, content: f.content ?? '', type: f.type, deleted: false,
-    })),
-  )
+    }))
+
+  const [rows, setRows] = useState<FactsDraft[]>(() => draftsFor(initial))
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | undefined>(undefined)
+
+  // --- paging -------------------------------------------------------------
+  const [pageSize, setPageSize] = useState<number>(FACTS_PAGE_SIZE_DEFAULT)
+  /** Zero-based index of the page on screen. */
+  const [page, setPage] = useState(0)
+  const [paging, setPaging] = useState(false)
+  const [pageError, setPageError] = useState<string>()
+
+  /**
+   * The page the table is actually showing, derived from what the store handed
+   * us rather than assumed from `page`.
+   *
+   * `total` is the store's count and `initial` is one page of it, so the page
+   * count follows the *data*, and a deletion on the last page shrinks it without
+   * the user being stranded on a page that no longer exists (the effect below
+   * pulls `page` back into range).
+   */
+  const pageCount = Math.max(1, Math.ceil(total / pageSize))
+  const from = total === 0 ? 0 : Math.min(page * pageSize + 1, total)
+  const to = total === 0 ? 0 : Math.min((page + 1) * pageSize, total)
+
+  /** Fetch `nextPage` and re-seed the drafts from what came back. */
+  const loadPage = (nextPage: number, size: number) => {
+    setPaging(true)
+    setPageError(undefined)
+    void onFetchPage(nextPage * size, size)
+      .then(() => {
+        // The store has published the new page; committing the page number here
+        // (rather than before the await) keeps `page` and the rows on screen
+        // from disagreeing while the fetch is in flight.
+        setPage(nextPage)
+      })
+      .catch((err: unknown) => {
+        // The failed page never lands, so keep showing the page that is there
+        // and say why instead of blanking the table.
+        setPageError((err as Error)?.message ?? String(err))
+      })
+      .finally(() => { setPaging(false) })
+  }
+
+  const goToPage = (nextPage: number) => {
+    if (nextPage < 0 || nextPage > pageCount - 1 || nextPage === page) return
+    loadPage(nextPage, pageSize)
+  }
+
+  const changePageSize = (size: number) => {
+    // A new page size renumbers every row, so restart at the first page rather
+    // than keeping an offset that now means something else.
+    setPageSize(size)
+    loadPage(0, size)
+  }
+
+  // Adopt rows the store published for the page we are on.
+  //
+  // `initial` is a fresh array on every store publish (including the refresh our
+  // own save triggers), so this is the single place drafts are re-seeded. It is
+  // safe to re-seed wholesale — not just on a page turn — because the rows on
+  // screen are exactly the rows a save commits, so nothing the user typed can be
+  // lost by a publish that re-reads the same page.
+  useEffect(() => {
+    setRows(draftsFor(initial))
+  }, [initial])
+
+  // A save can delete rows on the last page and shrink `total` past the page we
+  // are standing on; walk back until the page exists again.
+  useEffect(() => {
+    if (page > pageCount - 1) loadPage(pageCount - 1, pageSize)
+  }, [pageCount, page])
 
   const setRow = (index: number, patch: Partial<FactsDraft>) =>
     setRows(prev => prev.map((r, i) => i === index ? { ...r, ...patch } : r))
@@ -726,6 +832,56 @@ function FactsEditorModal(props: {
       {/* The save stayed open precisely so this can be read: the reason a
           batch was refused would otherwise be lost with the modal. */}
       {saveError ? <div className={css.hint} style={{ color: '#c0392b' }}>{saveError}</div> : null}
+
+      {/* Which rows are on screen, out of how many there are in total. */}
+      <div className={css.pager}>
+        <span className={css.hint}>
+          {t('factsPageRange', { from: String(from), to: String(to), total: String(total) })}
+        </span>
+        <span className={css.pagerSpacer} />
+        <label className={css.pagerGroup}>
+          <span className={css.hint}>{t('factsPageSizeLabel')}</span>
+          <select
+            value={pageSize}
+            disabled={paging || saving}
+            aria-label={t('factsPageSizeLabel')}
+            onChange={(e) => changePageSize(Number(e.currentTarget.value))}
+          >
+            {FACTS_PAGE_SIZES.map(size => (
+              <option key={size} value={size}>{t('factsPageSizeOption', { size: String(size) })}</option>
+            ))}
+          </select>
+        </label>
+        <div className={css.pagerGroup}>
+          <button
+            type="button"
+            className={css.btn}
+            disabled={paging || saving || page <= 0}
+            onClick={() => goToPage(page - 1)}
+          >
+            {t('factsPagePrev')}
+          </button>
+          <span className={`${css.hint} ${css.pagerIndicator}`}>
+            {t('factsPageIndicator', { page: String(page + 1), pages: String(pageCount) })}
+          </span>
+          <button
+            type="button"
+            className={css.btn}
+            disabled={paging || saving || page >= pageCount - 1}
+            onClick={() => goToPage(page + 1)}
+          >
+            {t('factsPageNext')}
+          </button>
+        </div>
+      </div>
+      {pageError
+        ? (
+            <div className={`${css.hint} ${css.pagerError}`}>
+              {t('factsPageLoadError', { page: String(page + 1), message: pageError })}
+            </div>
+          )
+        : null}
+
       <table className={css.editor}>
         <thead>
           <tr>

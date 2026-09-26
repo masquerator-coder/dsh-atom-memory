@@ -78,7 +78,7 @@ pnpm build       # -> lib/index.mjs
 | LLM 抽取模型 | 跟随 dsh 默认 / 手动 provider+model | `settings<atom-memory>.extractionModel` → `llm-extractor` |
 | 查看摘要 | **只读**弹窗以 `<pre>` 原始 markdown 渲染**与注入系统提示词完全相同**的紧凑摘要（按类型分组、不含 `fact_id`），类 `atom-memory-summary-view`——与 `memory_summary` 工具同源 | `remote.atomMemory.summary` |
 | user 画像编辑 | 画像行增删改 + **「生成画像」**：由记忆库提炼推荐条目（已在画像中的不重复推荐），勾选后加入表格再保存；带条目上限显示 | `remote.atomMemory.listProfile/writeProfile/generateProfile` |
-| 记忆与编辑 · 原子事实 | 原子事实列表查看/编辑（SPO/content/type） | `remote.atomMemory.listFacts/editFact` |
+| 记忆与编辑 · 原子事实 | 原子事实列表查看/编辑（SPO/content/type）。**分页显示**：每页 20/50/100/200 条（默认 50），翻页走服务端 `offset/limit`，因此第 200 条之后的记忆也能编辑；按钮旁与弹窗内都显示**记忆总数**（取 store 信封里的 `total`，不是当页行数） | `remote.atomMemory.listFacts/editFact` |
 | 记忆备份与恢复 | 导出 JSON / 上传导入（replace 语义） | `remote.atomMemory.backup/restore` |
 
 > **画像是用户自己的表（v10 起）**：它曾经是活跃事实的**派生视图**，每次读取都重建，

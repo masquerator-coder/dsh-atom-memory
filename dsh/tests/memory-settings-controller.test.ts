@@ -12,6 +12,8 @@ import { describe, expect, it, vi } from 'vitest'
 import type { ConfigForm, ConfigFormSnapshot } from '@deepseek-ai/dsh-client-ui-settings/client'
 import {
   MemorySettingsController,
+  FACTS_PAGE_SIZE_DEFAULT,
+  FACTS_PAGE_SIZES,
   type MemorySettingsSection,
 } from '../src/client/memory-settings-controller.ts'
 import {
@@ -171,7 +173,9 @@ describe('MemorySettingsController', () => {
     })
     const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, remote)
     await controller.inject().refreshData()
-    expect(listFacts).toHaveBeenCalledWith({ user: 'global', limit: 200 })
+    // The initial load is the first page, not the whole table: the panel pages
+    // through `list_facts` rather than pulling everything and slicing it.
+    expect(listFacts).toHaveBeenCalledWith({ user: 'global', offset: 0, limit: FACTS_PAGE_SIZE_DEFAULT })
     expect(listProfile).toHaveBeenCalledWith({ user: 'global' })
     const snap = controller.inject().hooks.memorySettings.getSnapshot()
     // Regression: the wire shape is `{ok, value}` — data must hold the raw
@@ -180,6 +184,86 @@ describe('MemorySettingsController', () => {
     expect(Array.isArray(snap.data.facts)).toBe(true)
     expect(Array.isArray(snap.data.profile)).toBe(true)
     expect(snap.data.facts[0]?.fact_id).toBe('f1')
+  })
+
+  it('carries the store total separately from the page so the count is not the page size', async () => {
+    const { scope } = fakeScope(snapshot({}))
+    const { remote, listFacts } = fakeRemote()
+    listFacts.mockResolvedValue({
+      ok: true,
+      value: {
+        facts: [{ fact_id: 'f1', subject: 's', predicate: 'p', object: 'o' }],
+        // 137 facts in the store, 1 on this page: `facts.length` must never be
+        // mistaken for the memory count.
+        total: 137,
+      },
+    } as never)
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, remote)
+    await controller.inject().refreshData()
+    const snap = controller.inject().hooks.memorySettings.getSnapshot()
+    expect(snap.data.facts).toHaveLength(1)
+    expect(snap.data.factsTotal).toBe(137)
+  })
+
+  it('falls back to the page length when the store omits total', async () => {
+    const { scope } = fakeScope(snapshot({}))
+    const { remote, listFacts } = fakeRemote()
+    listFacts.mockResolvedValue({
+      ok: true,
+      value: { facts: [{ fact_id: 'f1', subject: 's', predicate: 'p', object: 'o' }] },
+    } as never)
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, remote)
+    await controller.inject().refreshData()
+    // A count rendered as `NaN` would read as "0 memories", so the payload
+    // without a `total` degrades to the page length instead.
+    expect(controller.inject().hooks.memorySettings.getSnapshot().data.factsTotal).toBe(1)
+  })
+
+  it('fetches a requested page with the exact offset and limit', async () => {
+    const { scope } = fakeScope(snapshot({}))
+    const { remote, listFacts } = fakeRemote()
+    listFacts.mockResolvedValue({
+      ok: true,
+      value: {
+        facts: [{ fact_id: 'f101', subject: 's', predicate: 'p', object: 'o' }],
+        total: 240,
+      },
+    } as never)
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, remote)
+    const face = controller.inject()
+    // Page 3 of 100-row pages starts at row 200.
+    await face.fetchFactsPage(200, 100)
+    expect(listFacts).toHaveBeenLastCalledWith({ user: 'global', offset: 200, limit: 100 })
+    const snap = face.hooks.memorySettings.getSnapshot()
+    // The page REPLACES the list — the table renders one page at a time.
+    expect(snap.data.facts.map(f => f.fact_id)).toEqual(['f101'])
+    expect(snap.data.factsTotal).toBe(240)
+  })
+
+  it('offers only page sizes the store can actually serve', () => {
+    // `list_facts` clamps `limit` to 200, so a larger option would render a
+    // control that silently does not do what it says.
+    expect(FACTS_PAGE_SIZES.every(size => size >= 1 && size <= 200)).toBe(true)
+    expect(FACTS_PAGE_SIZES).toContain(FACTS_PAGE_SIZE_DEFAULT)
+  })
+
+  it('keeps the current page on screen and reports why when a page fetch fails', async () => {
+    const { scope } = fakeScope(snapshot({}))
+    const { remote, listFacts } = fakeRemote()
+    listFacts.mockResolvedValueOnce({
+      ok: true,
+      value: { facts: [{ fact_id: 'f1', subject: 's', predicate: 'p', object: 'o' }], total: 240 },
+    } as never)
+    const controller = new MemorySettingsController(scope as unknown as ConfigForm<MemorySettingsSection>, remote)
+    const face = controller.inject()
+    await face.refreshData()
+    listFacts.mockResolvedValueOnce({ ok: false, error: { message: '桥接未就绪' } } as never)
+    await expect(face.fetchFactsPage(50, 50)).rejects.toThrow('桥接未就绪')
+    const snap = face.hooks.memorySettings.getSnapshot()
+    // The failed page never lands: the rows already loaded stay put rather than
+    // blanking the table, and the reason is on the snapshot.
+    expect(snap.data.facts.map(f => f.fact_id)).toEqual(['f1'])
+    expect(snap.lastError).toBe('桥接未就绪')
   })
 
   it('normalizes malformed remote list results to empty arrays (no blank-section crash)', async () => {

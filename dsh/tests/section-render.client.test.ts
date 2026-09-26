@@ -181,6 +181,75 @@ function spyBudgetWrites(props: { setInjectedSummaryTokens: unknown }): number[]
   return writes
 }
 
+/**
+ * Build a controller whose facts list is a real paged store.
+ *
+ * `listFacts` slices a synthetic table of `total` facts by the requested
+ * `offset`/`limit` and reports the full count, which is exactly the contract the
+ * Host's `list_facts` honours. That makes the panel's paging observable end to
+ * end — a page turn must change the *rows*, not just the page number.
+ *
+ * @param total - How many facts the fake store holds.
+ */
+function buildPagedFactsController(total: number) {
+  const all = Array.from({ length: total }, (_v, i) => ({
+    fact_id: `f${i + 1}`,
+    subject: `主语${i + 1}`,
+    predicate: '是',
+    object: `宾语${i + 1}`,
+    content: '',
+  }))
+  const calls: Array<{ offset: number; limit: number }> = []
+  let section: Record<string, unknown> = {
+    enabled: true, captureEnabled: true, llmExtractionEnabled: true,
+    contextInjectionEnabled: true, extractionModel: undefined,
+    injectedSummaryTokens: DEFAULT_INJECTED_SUMMARY_TOKENS,
+  }
+  const listeners = new Set<() => void>()
+  const scope = {
+    getSnapshot: () => ({
+      status: 'ready' as const,
+      value: section,
+      base: undefined, user: undefined, revision: 1, writable: true, mode: 'host' as const,
+    }),
+    subscribe: (fn: () => void) => { listeners.add(fn); return () => { listeners.delete(fn) } },
+    set: async (key: string, value: unknown) => {
+      section = { ...section, [key]: value }
+      for (const fn of [...listeners]) fn()
+    },
+    unset: async () => {}, mutate: async () => {},
+  }
+  const remote = {
+    listFacts: async (args: { offset?: number; limit?: number }) => {
+      const offset = args.offset ?? 0
+      const limit = args.limit ?? 50
+      calls.push({ offset, limit })
+      return { ok: true, value: { facts: all.slice(offset, offset + limit), total } }
+    },
+    editFact: async () => ({ ok: true, value: {} }),
+    deleteFact: async () => ({ ok: true, value: {} }),
+    summary: async () => ({ ok: true, value: '' }),
+    listProfile: async () => ({ ok: true, value: { profile: [], count: 0, limit: 50 } }),
+    upsertProfile: async () => ({ ok: true, value: {} }),
+    deleteProfile: async () => ({ ok: true, value: {} }),
+    writeProfile: async () => ({ ok: true, value: {} }),
+    generateProfile: async () => ({ ok: true, value: { suggestions: [], existing: 0, limit: 50, full: false } }),
+    backup: async () => ({ ok: true, value: {} }),
+    restore: async () => ({ ok: true, value: { facts_written: 0, profile_written: 0 } }),
+  }
+  const controller = new MemorySettingsController(scope as never, remote as never)
+  return { controller, calls }
+}
+
+/** One page rendered in the facts table as `[subject, predicate, object]`. */
+function factRows(): string[][] {
+  // The facts editor is the only table whose rows carry a delete button.
+  const table = document.querySelector('.atom-memory-editor')!
+  return Array.from(table.querySelectorAll('tbody tr')).map(tr =>
+    Array.from(tr.querySelectorAll('input, textarea')).map(el => (el as HTMLInputElement).value),
+  )
+}
+
 describe('MemorySettingsSection client render', () => {
   it('renders and runs effects without throwing', async () => {
     const controller = buildController()
@@ -279,6 +348,157 @@ describe('MemorySettingsSection client render', () => {
     expect(subjectInput).toBeTruthy()
     // One save-all button, one 添加一行 button, one 取消 (close) button.
     expect(screen.getAllByText('保存全部').length).toBeGreaterThan(0)
+  })
+
+  it('shows the memory total next to the edit button, not the current page length', async () => {
+    const { controller } = buildPagedFactsController(137)
+    const { props } = bind(controller)
+    await act(async () => {
+      render(createElement(MemorySettingsSection, props))
+    })
+    await act(async () => {})
+    // The panel's list is one page (50 rows); the badge must report the store's
+    // 137, never the page size.
+    expect(screen.getByText('共 137 条')).toBeTruthy()
+  })
+
+  it('pages through the facts table and reports the visible range', async () => {
+    const { controller, calls } = buildPagedFactsController(120)
+    const { props } = bind(controller)
+    await act(async () => {
+      render(createElement(MemorySettingsSection, props))
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.click(screen.getByText('编辑记忆'))
+    })
+    await act(async () => {})
+
+    // Opens on page 1 with the default page size, showing the store's own rows.
+    expect(factRows()).toHaveLength(50)
+    expect(factRows()[0]![0]).toBe('主语1')
+    expect(screen.getByText('第 1-50 条 / 共 120 条')).toBeTruthy()
+    expect(screen.getByText('第 1/3 页')).toBeTruthy()
+
+    // Next page asks the store for the next window and swaps the rows.
+    await act(async () => {
+      fireEvent.click(screen.getByText('下一页'))
+    })
+    await act(async () => {})
+    expect(calls.at(-1)).toEqual({ offset: 50, limit: 50 })
+    expect(factRows()[0]![0]).toBe('主语51')
+    expect(screen.getByText('第 51-100 条 / 共 120 条')).toBeTruthy()
+    expect(screen.getByText('第 2/3 页')).toBeTruthy()
+
+    // The last page is partial: 20 rows, and 下一页 is dead there.
+    await act(async () => {
+      fireEvent.click(screen.getByText('下一页'))
+    })
+    await act(async () => {})
+    expect(factRows()).toHaveLength(20)
+    expect(screen.getByText('第 101-120 条 / 共 120 条')).toBeTruthy()
+    expect(screen.getByText('第 3/3 页')).toBeTruthy()
+    expect((screen.getByText('下一页') as HTMLButtonElement).disabled).toBe(true)
+
+    // 上一页 walks back through the same offsets.
+    await act(async () => {
+      fireEvent.click(screen.getByText('上一页'))
+    })
+    await act(async () => {})
+    expect(calls.at(-1)).toEqual({ offset: 50, limit: 50 })
+    expect(factRows()[0]![0]).toBe('主语51')
+  })
+
+  it('changes the page size and restarts from the first page', async () => {
+    const { controller, calls } = buildPagedFactsController(120)
+    const { props } = bind(controller)
+    await act(async () => {
+      render(createElement(MemorySettingsSection, props))
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.click(screen.getByText('编辑记忆'))
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.click(screen.getByText('下一页'))
+    })
+    await act(async () => {})
+
+    // 20 rows per page from page 1 — the page number is NOT preserved, because
+    // the same number would now address a different slice of rows.
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText('每页显示'), { target: { value: '20' } })
+    })
+    await act(async () => {})
+    expect(calls.at(-1)).toEqual({ offset: 0, limit: 20 })
+    expect(factRows()).toHaveLength(20)
+    expect(factRows()[0]![0]).toBe('主语1')
+    expect(screen.getByText('第 1-20 条 / 共 120 条')).toBeTruthy()
+    expect(screen.getByText('第 1/6 页')).toBeTruthy()
+  })
+
+  it('disables paging when everything fits on one page', async () => {
+    const { controller, calls } = buildPagedFactsController(3)
+    const { props } = bind(controller)
+    await act(async () => {
+      render(createElement(MemorySettingsSection, props))
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.click(screen.getByText('编辑记忆'))
+    })
+    await act(async () => {})
+    expect(factRows()).toHaveLength(3)
+    expect((screen.getByText('上一页') as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByText('下一页') as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.getByText('第 1/1 页')).toBeTruthy()
+    // 3 rows in one page of 50.
+    expect(screen.getByText('第 1-3 条 / 共 3 条')).toBeTruthy()
+    // No page turn was requested just by opening the modal.
+    expect(calls).toHaveLength(1)
+  })
+
+  it('saves only the rows on the page being edited, never a stale page draft', async () => {
+    const { controller } = buildPagedFactsController(120)
+    const { props } = bind(controller)
+    const saved: Array<Array<{ fact_id: string; subject: string }>> = []
+    props.saveAllFacts = (async (rows: never[]) => { saved.push(rows) }) as never
+    await act(async () => {
+      render(createElement(MemorySettingsSection, props))
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.click(screen.getByText('编辑记忆'))
+    })
+    await act(async () => {})
+
+    // Edit a row on page 1, then turn to page 2 and edit a row there.
+    await act(async () => {
+      fireEvent.change(screen.getAllByRole('textbox')[0]!, { target: { value: '改过的' } })
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.click(screen.getByText('下一页'))
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.change(screen.getAllByRole('textbox')[0]!, { target: { value: '第二页改的' } })
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.click(screen.getAllByText('保存全部')[0]!)
+    })
+    await act(async () => {})
+
+    // The envelope is exactly page 2: the page-1 edit was discarded with the
+    // page it belonged to, so it can neither resurface nor overwrite a row the
+    // user navigated away from.
+    const envelope = saved.at(-1)!
+    expect(envelope).toHaveLength(50)
+    expect(envelope[0]!.fact_id).toBe('f51')
+    expect(envelope[0]!.subject).toBe('第二页改的')
+    expect(envelope.some(r => r.fact_id === 'f1')).toBe(false)
   })
 
   it('opens the profile editor as an Excel-like table with the saved data', async () => {

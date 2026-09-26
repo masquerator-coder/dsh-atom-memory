@@ -79,6 +79,18 @@ export const memorySettingsStyleText = `
 .atom-memory-editor-row-actions{display:flex;gap:6px;align-items:center;justify-content:flex-end;white-space:nowrap}
 /* The pin checkbox must not inherit the table's full-width text-input skin. */
 .atom-memory-editor input.atom-memory-pin{width:auto;padding:0;margin:0;border:none;background:transparent;cursor:pointer}
+/* Facts table paging: a count/range read-out on the left, the page controls on
+   the right. Wraps on narrow panels rather than overflowing the modal. */
+.atom-memory-pager{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:0 0 10px}
+.atom-memory-pager-spacer{flex:1 1 auto}
+.atom-memory-pager-group{display:flex;align-items:center;gap:6px}
+.atom-memory-pager select{padding:4px 6px;border:1px solid var(--dsw-alias-border-l3,rgba(255,255,255,0.16));border-radius:6px;background:var(--dsw-alias-bg-layer-3,#24262b);color:var(--dsw-alias-label-primary,#e6e8eb);font-size:12px}
+/* The page indicator is informational, so it is sized so it cannot jitter the
+   buttons sideways as the page number grows a digit. */
+.atom-memory-pager-indicator{font-variant-numeric:tabular-nums;white-space:nowrap}
+.atom-memory-pager-error{color:var(--dsw-alias-state-error-primary,#e5484d);margin:0 0 8px}
+/* The count badge shown next to the 编辑记忆 button in the panel. */
+.atom-memory-count-badge{font-size:12px;color:var(--dsw-alias-label-secondary,#8a8f98);font-variant-numeric:tabular-nums;white-space:nowrap}
 
 /* Injection-budget gear slider: a discrete handle plus its gear labels. The
    field skin (border/background/padding) is for text inputs — a native range
