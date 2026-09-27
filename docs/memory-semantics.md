@@ -266,6 +266,19 @@ whenever the exempt rows were what pushed it over — archiving nothing and
 reporting success. Measured effect of the prefilter on a 1204-fact store: 1.30 ms
 → 0.10 ms per sweep, with 49% of rows never materialised.
 
+**No index is added for that query, and the reason is measured.** A
+`(status, created_at)` index changes the plan from `SCAN` to
+`SEARCH … (status=? AND created_at<?)` and is nonetheless **slower**: the WHERE
+clause also filters on `reinforce_count` and `type`, neither of which is in the
+index, so every hit pays a random row lookup to fetch them. Measured on the live
+store (1216 rows, best of 50): 0.773 ms → 0.784 ms; on a synthetic 40200-row
+store with a selective range: 5.805 ms → 9.177 ms. It would also cost ~17.5
+bytes/row (688 KB at 40200 rows). A *covering* index including those two columns
+might win, but it is unmeasured and wider — and a pass costing 0.10 ms once per
+900 s does not justify buying either. **A plan changing from `SCAN` to `SEARCH`
+is not by itself evidence of an improvement**; only a measurement is. (A note in
+`enforce_capacity` records the same finding where the query lives.)
+
 **Owner.** `atom_memory/worker.py` — `enforce_capacity`, `_prune_table`,
 `maintenance`; the read-only explanation is `atom_memory/api.py` —
 `capacity_report`; configuration in `atom_memory/config.py`.

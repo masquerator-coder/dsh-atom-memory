@@ -2501,13 +2501,23 @@ class Worker:
         # changes (the old Python read NULL `type` as 'semantic', which is not
         # durable, so such a row must pass here too).
         #
-        # Note this does not become an index seek: `facts` has no index on
-        # `created_at` (the existing ones lead with `user_id` or `session_id`), so
-        # the planner still scans. What the prefilter buys is rows *out of SQLite
-        # and out of Python objects* — measured at 49% of a 1204-fact store, and
-        # 1.30 ms -> 0.10 ms per sweep. Adding a `(status, created_at)` index would
-        # turn it into a seek, but that is a schema migration this change
-        # deliberately does not perform.
+        # Note on indexing: this does NOT become an index seek. `facts` has no index
+        # on `created_at` (the existing ones lead with `user_id` or `session_id`),
+        # so the planner scans. What the prefilter buys is rows *out of SQLite and
+        # out of Python objects* — measured at 49% of a 1204-fact store, and
+        # 1.30 ms -> 0.10 ms per sweep.
+        #
+        # A `(status, created_at)` index was measured and deliberately NOT added.
+        # It does change the plan (`SEARCH ... (status=? AND created_at<?)`) but
+        # it is *slower*, because neither column the WHERE clause also filters on
+        # (`reinforce_count`, `type`) is in the index, so every hit pays a random
+        # row lookup to fetch them:
+        #     live store, 1216 rows, best of 50: 0.773 ms -> 0.784 ms
+        #     synthetic 40200 rows, selective:   5.805 ms -> 9.177 ms (0.63x)
+        # It would also cost ~17.5 bytes/row (688 KB at 40200 rows) for no gain.
+        # A covering index including `reinforce_count` and `type` might help, but
+        # that is unmeasured and wider, and a 0.10 ms pass every 900 s does not
+        # justify buying it. The plan changing to SEARCH is not evidence of a win.
         rows = self.conn.execute(
             "SELECT f.fact_id, f.user_id, f.predicate, f.type, f.importance, "
             "f.created_at, f.reinforce_count, f.last_used_at "
