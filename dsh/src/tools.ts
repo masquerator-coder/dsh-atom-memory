@@ -735,8 +735,76 @@ export function renderChanges(changes: ChangeRow[], level?: string): string {
   return `${header}${lines.join('\n')}`
 }
 
-/** Render the overview cache's status, including whether a refresh is warranted. */
-export function renderOverviewStatus(status: Record<string, unknown>): string {
+/** Shape of the capacity explanation Python returns (see `AtomMem.capacity_report`). */
+export interface CapacityReport {
+  cap?: number
+  enabled?: boolean
+  active?: number
+  archivable?: number
+  protected?: number
+  oldest_age_days?: number
+  protect_days?: number
+  headroom?: number
+}
+
+/**
+ * Render the stats payload.
+ *
+ * The capacity line exists because "0 archived" has two meanings and only one of
+ * them is healthy: the policy may be switched off (`cap` 0), or every fact may be
+ * protected so the policy cannot reach anything. A bare count cannot tell them
+ * apart, and the difference decides whether the user should act.
+ */
+export function renderStats(v: {
+  facts?: number
+  pending?: number
+  archived?: number
+  capacity?: CapacityReport
+  recent?: Array<{ status?: string; reject_kind?: string; reject_reason?: string }>
+}): string {
+  const lines = [
+    `活跃记忆 ${v.facts ?? 0} 条 · 待处理 ${v.pending ?? 0} 条 · 归档 ${v.archived ?? 0} 条`,
+  ]
+  const cap = v.capacity
+  if (cap !== undefined) {
+    if (cap.enabled !== true) {
+      lines.push(
+        `容量策略未启用（上限 ${cap.cap ?? 0} = 无限）：没有事实会因容量退场，`
+        + '活跃集只会增长。可在设置面板提高上限后生效。',
+      )
+    } else {
+      lines.push(
+        `容量策略已启用：上限 ${cap.cap} · 活跃 ${cap.active ?? 0} · `
+        + `可归档 ${cap.archivable ?? 0}（其余 ${cap.protected ?? 0} 条受保护：`
+        + `创建未满 ${cap.protect_days ?? 0} 天、有复用证据、或属决策/教训/SOP）。`,
+      )
+      if ((cap.archivable ?? 0) === 0 && (cap.active ?? 0) > (cap.cap ?? 0)) {
+        lines.push(
+          `注意：已超上限但当前无可归档事实——最老一条仅 ${cap.oldest_age_days ?? 0} 天，`
+          + `尚未超出 ${cap.protect_days ?? 0} 天保护期。`,
+        )
+      }
+    }
+  }
+  for (const entry of v.recent ?? []) {
+    if (entry.reject_kind) {
+      lines.push(`- 最近一次写入被拒绝（${entry.reject_kind}）：${entry.reject_reason ?? ''}`)
+    }
+  }
+  return lines.join('\n')
+}
+
+/**
+ * Render the overview cache's status, including whether a refresh is warranted.
+ *
+ * `report` is the stored-memory consistency report. It answers a different
+ * question from the status — "is the store consistent" vs "is the overview
+ * current" — but it is free to fetch, so answering both here saves a round trip.
+ */
+export function renderOverviewStatus(
+  status: Record<string, unknown>,
+  report?: { counts?: { duplicates?: number; conflicts?: number } },
+): string {
   const cached = status.cached === true
   const lines: string[] = []
   lines.push(cached ? '总览：已缓存' : '总览：尚无缓存（当前渲染的是确定性回退版本）')
@@ -755,6 +823,18 @@ export function renderOverviewStatus(status: Record<string, unknown>): string {
     up_to_date: '仅细节变化，无需重新生成',
   }
   if (reason) lines.push(`判定：${reasonText[reason] ?? reason}`)
+
+  const counts = report?.counts
+  const found = (counts?.duplicates ?? 0) + (counts?.conflicts ?? 0)
+  if (found > 0) {
+    // The disposal path is named because the store deliberately does not take it:
+    // only the session can see which of two stored claims the user meant.
+    lines.push(
+      `待处置：重复 ${counts?.duplicates ?? 0} 条 · 冲突 ${counts?.conflicts ?? 0} 条。`
+      + '用 memory_recall 查看，再用 memory_replace 或 memory_forget 处置'
+      + '（整理流程不会自动改写）。',
+    )
+  }
   return lines.join('\n')
 }
 
@@ -1111,7 +1191,17 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
         const status = await call<Record<string, unknown>>('overview_status', {
           user_id: uid,
         })
-        return { text: renderOverviewStatus(status) }
+        // Detection answers a different question from the status — "is the store
+        // consistent" vs "is the overview current" — but it is free, so `status`
+        // answers both.
+        let report: { counts?: { duplicates?: number; conflicts?: number } } | undefined
+        try {
+          report = await call('consolidation_report', { user_id: uid })
+        } catch {
+          // A store too old to have the method still renders its status.
+          report = undefined
+        }
+        return { text: renderOverviewStatus(status, report) }
       }
 
       if (action === 'changes') {
@@ -1217,26 +1307,14 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
 
   disposers.push(ctx.tools.register(defineTool({
     name: 'memory_stats',
-    description: '返回当前用户的记忆统计计数，以及最近几次写入的结果（含被拒绝的原因）。',
+    description: '返回当前用户的记忆统计计数、容量策略的可达性，以及最近几次写入的结果（含被拒绝的原因）。',
     parameters: {
       user: { type: 'string', description: '可选：归属用户 id（默认当前用户，跨会话共享）' },
     },
     output: {
       schema: { type: 'object', additionalProperties: true },
       render(_args, value) {
-        const v = value as {
-          facts?: number; pending?: number; archived?: number
-          recent?: Array<{ status?: string; reject_kind?: string; reject_reason?: string }>
-        }
-        const lines = [
-          `活跃记忆 ${v.facts ?? 0} 条 · 待处理 ${v.pending ?? 0} 条 · 归档 ${v.archived ?? 0} 条`,
-        ]
-        for (const entry of v.recent ?? []) {
-          if (entry.reject_kind) {
-            lines.push(`- 最近一次写入被拒绝（${entry.reject_kind}）：${entry.reject_reason ?? ''}`)
-          }
-        }
-        return [{ type: 'text', text: lines.join('\n') }]
+        return [{ type: 'text', text: renderStats(value as Parameters<typeof renderStats>[0]) }]
       },
     },
     async execute(args, exec) {

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
-import { registerMemoryTools } from '../src/tools.ts'
+import { registerMemoryTools, renderStats, renderOverviewStatus } from '../src/tools.ts'
 
 /**
  * Regression test for the user-scope isolation bug.
@@ -408,7 +408,9 @@ describe('memory_overview tool', () => {
     const result = (await tool.execute({ action: 'status' }, execWithSession('s1'))) as any
     expect(result.text).toContain('尚无缓存')
     expect(result.text).toContain('记忆库为空')
-    expect(bridge.call.mock.calls.at(-1)![0]).toBe('overview_status')
+    // `status` also fetches the consistency report, so assert the call was made
+    // rather than relying on it being the last one.
+    expect(bridge.call.mock.calls.map(c => c[0])).toContain('overview_status')
   })
 
   it('changes renders the changelog with readable labels', async () => {
@@ -497,5 +499,96 @@ describe('memory_overview tool', () => {
     bridge.call.mockResolvedValue({ text: '## 以前做过的工作\n- A' })
     await tool.execute({ user: 'someone-else' }, execWithSession('s1'))
     expect(bridge.call.mock.calls.at(-1)![1]!.user_id).toBe('someone-else')
+  })
+})
+
+describe('capacity and detection visibility', () => {
+  it('says the capacity policy is off instead of showing a silent zero', () => {
+    const text = renderStats({
+      facts: 1195, pending: 0, archived: 0,
+      capacity: { cap: 0, enabled: false, active: 1195, archivable: 0, protected: 1195 },
+    })
+    expect(text).toContain('未启用')
+  })
+
+  it('explains that everything is protected when the cap cannot be reached', () => {
+    // The live store's exact state: over cap, nothing movable.
+    const text = renderStats({
+      facts: 1195, pending: 0, archived: 0,
+      capacity: {
+        cap: 1000, enabled: true, active: 1195, archivable: 0, protected: 1195,
+        oldest_age_days: 10, protect_days: 14,
+      },
+    })
+    expect(text).toContain('无可归档')
+    expect(text).toContain('14')
+  })
+
+  it('renders without a capacity block from an older store', () => {
+    expect(renderStats({ facts: 3, pending: 0, archived: 0 })).toContain('活跃记忆 3 条')
+  })
+
+  it('reports detection findings through overview status', () => {
+    const text = renderOverviewStatus(
+      { cached: true, level: 'none', refresh_reason: 'up_to_date' },
+      { counts: { duplicates: 1, conflicts: 0 } },
+    )
+    expect(text).toContain('1')
+    expect(text).toContain('待处置')
+  })
+
+  it('stays silent when detection found nothing', () => {
+    const text = renderOverviewStatus(
+      { cached: true, level: 'none', refresh_reason: 'up_to_date' },
+      { counts: { duplicates: 0, conflicts: 0 } },
+    )
+    expect(text).not.toContain('待处置')
+  })
+
+  it('renders status with no report at all', () => {
+    expect(renderOverviewStatus({ cached: true })).toContain('总览')
+  })
+})
+
+describe('memory_overview status reports findings', () => {
+  function setupOverview() {
+    const bridge = { call: vi.fn() }
+    const registered: ToolDefinition[] = []
+    const tools = {
+      register: (def: ToolDefinition) => {
+        registered.push(def)
+        return () => {}
+      },
+    }
+    registerMemoryTools({
+      ctx: { tools } as any,
+      bridge: bridge as any,
+      fallbackScope: 'global',
+      maxRecalledFacts: 10,
+      summaryTokens: 500,
+    } as any)
+    return { bridge, tool: registered.find(d => d.name === 'memory_overview')! }
+  }
+
+  it('fetches the report and names the disposal path', async () => {
+    const { bridge, tool } = setupOverview()
+    bridge.call.mockImplementation(async (method: string) => {
+      if (method === 'overview_status') return { cached: true, refresh_reason: 'up_to_date' }
+      if (method === 'consolidation_report') return { counts: { duplicates: 2, conflicts: 1 } }
+      return {}
+    })
+    const result = (await tool.execute({ action: 'status' }, execWithSession('s1'))) as any
+    expect(result.text).toContain('待处置')
+    expect(result.text).toContain('memory_replace')
+  })
+
+  it('still renders status when the store predates the report method', async () => {
+    const { bridge, tool } = setupOverview()
+    bridge.call.mockImplementation(async (method: string) => {
+      if (method === 'overview_status') return { cached: true, refresh_reason: 'up_to_date' }
+      throw new Error('unknown method: consolidation_report')
+    })
+    const result = (await tool.execute({ action: 'status' }, execWithSession('s1'))) as any
+    expect(result.text).toContain('总览')
   })
 })
