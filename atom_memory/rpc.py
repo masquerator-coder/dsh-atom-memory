@@ -241,6 +241,10 @@ class RpcServer:
             return await self._overview_status(params)
         if method == "changes":
             return await self._changes(params)
+        if method == "consolidation_report":
+            return await self._consolidation_report(params)
+        if method == "capacity_report":
+            return await self._capacity_report(params)
 
         attr = _METHODS.get(method)
         if attr is None:
@@ -531,6 +535,31 @@ class RpcServer:
             conn, user_id, since_ms=since_ms, limit=int(params.get("limit", 50))
         )
         return {"changes": changes, "level": change_level(conn, user_id, since_ms)}
+
+    async def _consolidation_report(self, params: dict) -> dict:
+        """Return the stored duplicate/conflict report for one owner.
+
+        Read-only: it never supersedes, merges or deletes. Disposal belongs to
+        whoever can still see the user's intent — the session model, through
+        ``memory_replace`` / ``memory_forget``.
+
+        Params: ``user_id``.
+        """
+        from .consolidate import build_report
+
+        return build_report(
+            self._overview_db(), params["user_id"], self.mem.config
+        )
+
+    async def _capacity_report(self, params: dict) -> dict:
+        """Explain what the capacity policy can reach right now.
+
+        The point of the call is that "0 archived" is ambiguous without it: the
+        policy may be disabled, or every fact may be protected. Params: ``user_id``.
+        """
+        if not self._started or self.mem is None or self.mem.db is None:
+            raise _RpcError("not started; call start first")
+        return self.mem.capacity_report(params["user_id"])
 
     async def _persist_candidates(self, params: dict) -> dict:
         """Persist pre-extracted candidates (from the dsh-side LLM extractor).

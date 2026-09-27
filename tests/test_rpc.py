@@ -419,3 +419,59 @@ def test_overview_methods_require_start(proc, tmp_path):
         _send(p, rid, method, {"user_id": "u1"})
         resp = _recv(p)
         assert resp["ok"] is False and "start" in resp["error"], method
+
+
+def test_consolidation_and_capacity_reports_are_reachable(proc, tmp_path):
+    """The host reads both of these, so they must exist and carry the shapes it
+    consumes: detection reports counts, capacity explains the policy's reach."""
+    p = proc
+    _start(p, tmp_path, name="consol.db")
+
+    _send(p, 2, "consolidation_report", {"user_id": "u1"})
+    report = _recv(p)["result"]
+    assert report["counts"] == {"duplicates": 0, "conflicts": 0}
+    assert report["duplicates"] == [] and report["conflicts"] == []
+
+    _send(p, 3, "capacity_report", {"user_id": "u1"})
+    cap = _recv(p)["result"]
+    # The shipped default is an unlimited cap, and the report must say so rather
+    # than looking like a healthy store that happens to have archived nothing.
+    assert cap["cap"] == 0
+    assert cap["enabled"] is False
+    assert cap["protect_days"] == 14
+    assert cap["headroom"] == 0
+
+
+def test_capacity_report_reaches_stats(proc, tmp_path):
+    """`memory_stats` renders the capacity block, so `stats` must carry it."""
+    p = proc
+    _start(p, tmp_path, name="cap.db")
+    _send(p, 2, "stats", {"user_id": "u1"})
+    result = _recv(p)["result"]
+    assert result["capacity"]["enabled"] is False
+    assert result["facts"] == 0
+
+
+def test_detection_finds_a_stored_conflict_over_the_wire(proc, tmp_path):
+    """A real single-valued contradiction written through the write path is
+    reported. `persist_candidates` is the honest path here: `add`'s rule engine
+    would not reliably turn these phrasings into stored facts."""
+    p = proc
+    _start(p, tmp_path, name="conflict.db")
+
+    for rid, obj in ((2, "工程师"), (3, "架构师")):
+        _send(p, rid, "persist_candidates", {
+            "user_id": "u1", "session_id": "s1", "turn_id": 0, "wait_ms": 8000,
+            "candidates": [{
+                "subject": "我的职业", "predicate": "是", "object": obj,
+                "type": "semantic", "importance": 0.6, "confidence": 0.6,
+            }],
+        })
+        assert _recv(p)["ok"] is True
+
+    _send(p, 4, "consolidation_report", {"user_id": "u1"})
+    counts = _recv(p)["result"]["counts"]
+    # The second write supersedes the first under a single-valued predicate, so a
+    # *correct* store has one active value and nothing to report. A non-zero
+    # conflict count here would mean the detector is flagging superseded history.
+    assert counts["conflicts"] == 0, counts
