@@ -749,3 +749,73 @@ def test_learning_facts_does_not_touch_the_profile(tmp_path, monkeypatch):
         await mem.stop()
 
     _run(scenario())
+
+
+# ---- the capacity report -------------------------------------------------------
+
+def test_capacity_report_says_the_cap_is_disabled_rather_than_reporting_zero(tmp_path, monkeypatch):
+    """`enforce_capacity` returns [] for two unrelated reasons: the cap is 0, or
+    everything is protected. `memory_stats` must not conflate them — a user who
+    sees "0 archived" cannot otherwise tell a healthy store from a switched-off
+    policy.
+    """
+    mem = _make(tmp_path, monkeypatch, max_active_facts=0)
+
+    async def scenario():
+        await mem.start()
+        # `_insert_fact` (this file's own helper), not `mem.add`: `add` is
+        # asynchronous — it enqueues a candidate that the worker turns into a fact
+        # after extraction and embedding, so a read immediately after `add`
+        # observes an empty store.
+        _insert_fact(mem, "f1", "用户", "职业", "工程师")
+        report = mem.capacity_report("u1")
+        assert report["cap"] == 0
+        assert report["enabled"] is False
+        assert report["active"] == 1
+        await mem.stop()
+
+    _run(scenario())
+
+
+def test_capacity_report_counts_what_is_actually_reachable(tmp_path, monkeypatch):
+    """With a cap set and every fact young, nothing is archivable — and the report
+    must say so, because that is the live store's real state."""
+    mem = _make(tmp_path, monkeypatch, max_active_facts=10, archive_protect_days=14)
+
+    async def scenario():
+        await mem.start()
+        _insert_fact(mem, "f1", "用户", "职业", "工程师")
+        report = mem.capacity_report("u1")
+        assert report["cap"] == 10
+        assert report["enabled"] is True
+        assert report["active"] == 1
+        assert report["archivable"] == 0, "a fresh fact is protected"
+        assert report["protected"] == 1
+        assert report["protect_days"] == 14
+        await mem.stop()
+
+    _run(scenario())
+
+
+def test_capacity_report_finds_an_old_unused_fact_archivable(tmp_path, monkeypatch):
+    """The other direction: once material is past the protection window and has no
+    reuse evidence, the report must show it as reachable — otherwise the feature
+    would report "nothing movable" forever and look identical to the disabled case.
+    """
+    mem = _make(tmp_path, monkeypatch, max_active_facts=1, archive_protect_days=14)
+
+    async def scenario():
+        await mem.start()
+        from atom_memory.db import now_ms
+
+        old = now_ms() - 30 * 86_400_000
+        _insert_fact(mem, "old", "用户", "爱好", "围棋", created_at=old)
+        _insert_fact(mem, "fresh", "用户", "职业", "工程师")
+        report = mem.capacity_report("u1")
+        assert report["active"] == 2
+        assert report["archivable"] == 1, "the old fact is movable"
+        assert report["protected"] == 1, "the fresh fact is not"
+        assert report["headroom"] == 1
+        await mem.stop()
+
+    _run(scenario())

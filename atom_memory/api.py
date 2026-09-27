@@ -2119,7 +2119,74 @@ class AtomMem:
             "facts": facts["n"],
             "pending": pending["n"],
             "archived": archived["n"],
+            "capacity": self.capacity_report(user_id),
             "recent": self.recent_outcomes(user_id, limit=5),
+        }
+
+    def capacity_report(self, user_id: str) -> dict:
+        """Explain what the capacity policy can and cannot reach right now.
+
+        ``enforce_capacity`` returns an empty list for two unrelated reasons — the
+        cap is disabled, or every fact is protected — and its summary carries the
+        shortfall only when the pass runs. Neither is visible from ``stats``, so a
+        store whose capacity policy is switched off looks exactly like a store
+        that is comfortably under its cap.
+
+        This is a read-only explanation of the same policy
+        :meth:`worker.Worker.enforce_capacity` applies, using the same three
+        exemptions (age, reinforcement evidence, durable type). It computes what
+        *would* be archivable rather than performing it.
+
+        Args:
+            user_id: Whose facts to measure.
+
+        Returns:
+            ``{"cap", "enabled", "active", "archivable", "protected",
+            "oldest_age_days", "protect_days", "headroom"}``. ``headroom`` is how
+            many facts the policy could still remove before it runs out of
+            unprotected material, and is `0` when the cap is disabled.
+        """
+        if self.db is None:
+            raise RuntimeError("AtomMem is not started; call start() first")
+
+        cap = int(self.config.max_active_facts or 0)
+        protect_days = int(self.config.archive_protect_days)
+        durable = {"decision_rule", "lesson", "sop"}
+
+        rows = self.db.execute(
+            "SELECT fact_id, type, created_at, reinforce_count FROM facts "
+            "WHERE user_id = ? AND status = 'active'",
+            (user_id,),
+        ).fetchall()
+        cutoff = now_ms() - protect_days * 86_400_000
+
+        archivable = 0
+        oldest = 0
+        for row in rows:
+            created = int(row["created_at"])
+            if oldest == 0 or created < oldest:
+                oldest = created
+            if created >= cutoff:
+                continue
+            if float(row["reinforce_count"] or 0.0) > 0.0:
+                continue
+            if (row["type"] or "semantic") in durable:
+                continue
+            archivable += 1
+
+        active = len(rows)
+        oldest_age_days = (
+            round((now_ms() - oldest) / 86_400_000.0, 2) if oldest else 0.0
+        )
+        return {
+            "cap": cap,
+            "enabled": cap > 0,
+            "active": active,
+            "archivable": archivable,
+            "protected": active - archivable,
+            "oldest_age_days": oldest_age_days,
+            "protect_days": protect_days,
+            "headroom": min(archivable, max(0, active - cap)) if cap > 0 else 0,
         }
 
     # --- lifecycle surface ----------------------------------------------------
