@@ -434,10 +434,11 @@ def test_consolidation_and_capacity_reports_are_reachable(proc, tmp_path):
 
     _send(p, 3, "capacity_report", {"user_id": "u1"})
     cap = _recv(p)["result"]
-    # The shipped default is an unlimited cap, and the report must say so rather
-    # than looking like a healthy store that happens to have archived nothing.
-    assert cap["cap"] == 0
-    assert cap["enabled"] is False
+    # The shipped default is a guard-rail cap, not unlimited: a store with no
+    # facts is comfortably under it, and the report must describe it as *enabled*
+    # rather than looking like a policy that was switched off.
+    assert cap["cap"] == 5000
+    assert cap["enabled"] is True
     assert cap["protect_days"] == 14
     assert cap["headroom"] == 0
 
@@ -448,7 +449,8 @@ def test_capacity_report_reaches_stats(proc, tmp_path):
     _start(p, tmp_path, name="cap.db")
     _send(p, 2, "stats", {"user_id": "u1"})
     result = _recv(p)["result"]
-    assert result["capacity"]["enabled"] is False
+    assert result["capacity"]["enabled"] is True
+    assert result["capacity"]["cap"] == 5000
     assert result["facts"] == 0
 
 

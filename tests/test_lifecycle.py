@@ -643,7 +643,72 @@ def test_capacity_still_reaches_the_cap_when_nothing_is_protected(tmp_path, monk
     _run(scenario())
 
 
-def test_maintenance_prunes_finished_bookkeeping_past_retention(tmp_path, monkeypatch):
+def test_capacity_prefilter_still_counts_rows_it_cannot_touch(tmp_path, monkeypatch):
+    """The candidate query is prefiltered in SQL; the overflow count is not.
+
+    These must stay separate. `overflow` is measured against *all* active rows so
+    that protected facts correctly show up as a shortfall, while the candidate
+    query deliberately returns only rows that could be archived. If the prefilter
+    were ever used to compute overflow, the pass would believe it was under the
+    cap whenever the exempt rows were what pushed it over — and it would archive
+    nothing while reporting success. This is the same failure the
+    `unreachable` accounting exists to prevent, so it is asserted directly.
+    """
+    mem = _make(tmp_path, monkeypatch, max_active_facts=2, archive_protect_days=30)
+
+    async def scenario():
+        await mem.start()
+        from atom_memory.db import now_ms
+
+        # 3 durable rows, all old and unreinforced: old enough to be candidates
+        # by age, but permanently exempt by type. The SQL prefilter must drop
+        # them, and the overflow count must still see them.
+        for i in range(3):
+            _insert_fact(mem, f"rule{i}", "用户", "决策规则", f"规则{i}",
+                         type="decision_rule", created_at=1)
+        # 1 genuinely archivable row.
+        _insert_fact(mem, "old", "用户", "爱好", "围棋", created_at=1)
+
+        result = await mem.maintenance("u1")
+
+        # Everything reachable went...
+        assert [a["fact_id"] for a in result["archived"]] == ["old"]
+        # ...and the 3 exempt rows are still counted as unreachable slots, not
+        # mistaken for absent.
+        assert mem.stats("u1")["facts"] == 3
+        event = mem.db.execute(
+            "SELECT payload FROM events WHERE type = 'facts_archived' "
+            "ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        # 4 active - cap 2 = 2 slots must be freed; only 1 was reachable.
+        assert json.loads(event["payload"])["unreachable"] == 1
+        await mem.stop()
+
+    _run(scenario())
+
+
+def test_capacity_prefilter_keeps_reinforced_rows_protected(tmp_path, monkeypatch):
+    """A reused row is exempt regardless of age, and the SQL prefilter must agree
+    with the Python policy it replaced."""
+    mem = _make(tmp_path, monkeypatch, max_active_facts=1, archive_protect_days=0)
+
+    async def scenario():
+        await mem.start()
+        _insert_fact(mem, "used", "用户", "爱好", "围棋", created_at=1)
+        mem.db.execute(
+            "UPDATE facts SET reinforce_count = 3.0 WHERE fact_id = 'used'"
+        )
+        mem.db.commit()
+        _insert_fact(mem, "free", "用户", "城市", "天津", created_at=1)
+
+        result = await mem.maintenance("u1")
+
+        # The reinforced row survives; the untouched one is the one archived.
+        assert [a["fact_id"] for a in result["archived"]] == ["free"]
+        assert mem.stats("u1")["facts"] == 1
+        await mem.stop()
+
+    _run(scenario())
     mem = _make(
         tmp_path, monkeypatch,
         candidate_retention_days=1, task_retention_days=1, event_retention_days=1,

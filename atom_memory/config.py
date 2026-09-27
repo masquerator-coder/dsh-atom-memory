@@ -50,11 +50,31 @@ class MemConfig:
             kept. Deliberately much longer than the bookkeeping tables, because
             the audit log is what makes a supersede or a rejection explainable
             after the fact.
-        max_active_facts: Soft cap on a user's active facts. ``0`` (the default)
-            means unlimited. When the cap is exceeded the maintenance pass moves
-            the least valuable *unprotected* facts to the ``archived`` status —
-            never deletes them — so the working set stays bounded while nothing
-            is lost (see :meth:`AtomMem.unarchive`).
+        max_active_facts: Soft cap on a user's active facts. ``0`` means unlimited;
+            ``5000`` (the default) is a guard rail rather than a working bound.
+            When the cap is exceeded the maintenance pass moves the least
+            valuable *unprotected* facts to the ``archived`` status — never
+            deletes them — so the working set stays bounded while nothing is
+            lost (see :meth:`AtomMem.unarchive`).
+
+            Chosen from measurement, not taste. The pass itself is cheap and
+            scales with the *active set*, not with the cap: it fetches only
+            archivable rows (a prefiltered query) plus one ``COUNT(*)`` per
+            owner, so its cost is the same whether the cap is 1000 or 10000. The
+            number that matters is therefore recall quality, since the active set
+            is what recall scans. On a 1204-fact store recall runs in ~16 ms and
+            this pass in ~0.1 ms per 900 s sweep, so neither pressures the cap
+            anywhere near 5000. Two constraints do:
+
+            1. **Durable types are permanently exempt** — ``decision_rule``,
+               ``lesson`` and ``sop`` can never be archived. A cap below their
+               count is unsatisfiable and the pass logs a shortfall on *every*
+               sweep, forever. On this project's own store that floor was 588
+               rows, which is why 5000 leaves deliberate headroom above it.
+            2. **`archiveProtectDays` binds first.** Every fact younger than 14
+               days is exempt, so a young store has nothing archivable at all,
+               whatever the cap. Raising the cap cannot free a row that age has
+               not yet released.
         archive_protect_days: Facts created within this many days are never
             archived, whatever their score: a fresh fact has not had time to be
             used, so archiving it would be a decision made without evidence.
@@ -145,7 +165,7 @@ class MemConfig:
     candidate_retention_days: int = 7
     task_retention_days: int = 30
     event_retention_days: int = 180
-    max_active_facts: int = 0
+    max_active_facts: int = 5000
     archive_protect_days: int = 14
     maintenance_interval_sec: float = 900.0
 
