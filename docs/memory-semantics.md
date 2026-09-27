@@ -222,6 +222,16 @@ reuse-and-decay applied); a fact is *protected* when any of these hold:
    expensive things to re-derive;
 4. it backs a pinned profile row — the user asked for that row to stand.
 
+The cap defaults to `5000` and is a **guard rail, not a working bound**: it is
+high enough that ordinary use does not reach it, and it exists to stop unbounded
+growth rather than to trim continuously. The number is not a latency budget —
+the pass costs the same at any cap (`0`) — but it must stay above the
+durable-types floor, because exemptions 1–3 are absolute. A cap below the number
+of exempt facts is **unsatisfiable**: the pass archives everything it can, then
+reports the shortfall it could not close, on every sweep. Exemption 1 binds
+before the cap does, so a store entirely inside the protection window has nothing
+archivable however the cap is set.
+
 Terminal rows are pruned by age (`candidate_retention_days` 7,
 `task_retention_days` 14, `event_retention_days` 180); reinforcement evidence is
 **not** pruned with them, because it is the replay log that justifies a decay
@@ -235,17 +245,26 @@ the failure mode recoverable. The retention defaults are deliberately asymmetric
 discarding a candidate row costs an audit trail, discarding reinforcement
 evidence costs the ability to explain a ranking.
 
-**A disabled policy and an unreachable one must not look alike.** The cap ships
-as `0` (unlimited), so by default the pass returns immediately and *nothing ever
-leaves the working set*. A store in that state and a store that is comfortably
-under its cap both report `archived: 0`, which is why `stats` carries a
-`capacity` block explaining which of the two it is. The distinction matters
-because only one of them calls for action, and the same reasoning applies to the
-third state: a cap *is* set, the store *is* over it, and yet `archivable` is `0`
-because every fact is protected. Measured on this project's own live store: 1195
-active facts, all protected, `archivable == 0` — so lowering the cap below 1195
-would free nothing, and the protection window (facts 10 days old against a 14-day
-floor) was the binding constraint rather than the cap.
+**An unreachable policy must not look like a working one.** "Archived 0" has
+three distinct meanings: the store is under its cap (healthy), the cap is `0` and
+the policy is switched off, or the cap *is* set, the store *is* over it, and
+`archivable` is `0` because every fact is exempt. A bare count cannot tell them
+apart, which is why `stats` carries a `capacity` block naming which one holds.
+Only the third calls for action, and what it calls for is *not* lowering the cap.
+Measured on this project's own live store: 1195 active facts, all inside the
+14-day window, `archivable == 0` — the protection window was the binding
+constraint, and no cap value would have freed a single row.
+
+**The pass reads only what it can act on.** `enforce_capacity` computes the
+per-owner overflow from one cheap `COUNT(*)`, and fetches candidate rows through a
+query prefiltered to the three exemptions (`created_at < cutoff`,
+`reinforce_count <= 0`, non-durable type). The two must stay separate: overflow is
+measured against *all* active rows so that exempt facts correctly appear as an
+unreachable shortfall, while candidates are only those archivable. Deriving
+overflow from the filtered list would make the pass believe it was under its cap
+whenever the exempt rows were what pushed it over — archiving nothing and
+reporting success. Measured effect of the prefilter on a 1204-fact store: 1.30 ms
+→ 0.10 ms per sweep, with 49% of rows never materialised.
 
 **Owner.** `atom_memory/worker.py` — `enforce_capacity`, `_prune_table`,
 `maintenance`; the read-only explanation is `atom_memory/api.py` —
@@ -255,7 +274,9 @@ floor) was the binding constraint rather than the cap.
 `test_capacity_protects_fresh_reinforced_durable_and_pinned_facts`,
 `test_maintenance_prunes_terminal_rows`,
 `test_capacity_report_says_the_cap_is_disabled_rather_than_reporting_zero`,
-`test_capacity_report_counts_what_is_actually_reachable`.
+`test_capacity_report_counts_what_is_actually_reachable`,
+`test_capacity_prefilter_still_counts_rows_it_cannot_touch`,
+`test_capacity_prefilter_keeps_reinforced_rows_protected`.
 
 ---
 

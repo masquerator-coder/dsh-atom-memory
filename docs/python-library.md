@@ -254,10 +254,10 @@ class MemConfig:
     summary_token_limit: int = 1500
     user_md_token_limit: int = 800
     candidate_retention_days: int = 7
-    task_retention_days: int = 14
+    task_retention_days: int = 30
     event_retention_days: int = 180
-    max_active_facts: int = 0
-    archive_protect_days: int = 30
+    max_active_facts: int = 5000
+    archive_protect_days: int = 14
     maintenance_interval_sec: float = 900.0
     max_retries: int = 3
     worker_poll_interval_sec: float = 0.5
