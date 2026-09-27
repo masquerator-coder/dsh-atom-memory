@@ -214,7 +214,7 @@ least valuable **unprotected** facts to `archived` until the store fits. The
 value order is the memory's own priority order (effective importance with
 reuse-and-decay applied); a fact is *protected* when any of these hold:
 
-1. it is newer than `archive_protect_days` (default 30) — anything recently
+1. it is newer than `archive_protect_days` (default 14) — anything recently
    stated is part of the current context;
 2. it has been reused (`reinforce_count > 0` / a `fact_reinforcements` row) —
    reuse is the strongest available signal of value;
@@ -235,12 +235,76 @@ the failure mode recoverable. The retention defaults are deliberately asymmetric
 discarding a candidate row costs an audit trail, discarding reinforcement
 evidence costs the ability to explain a ranking.
 
+**A disabled policy and an unreachable one must not look alike.** The cap ships
+as `0` (unlimited), so by default the pass returns immediately and *nothing ever
+leaves the working set*. A store in that state and a store that is comfortably
+under its cap both report `archived: 0`, which is why `stats` carries a
+`capacity` block explaining which of the two it is. The distinction matters
+because only one of them calls for action, and the same reasoning applies to the
+third state: a cap *is* set, the store *is* over it, and yet `archivable` is `0`
+because every fact is protected. Measured on this project's own live store: 1195
+active facts, all protected, `archivable == 0` — so lowering the cap below 1195
+would free nothing, and the protection window (facts 10 days old against a 14-day
+floor) was the binding constraint rather than the cap.
+
 **Owner.** `atom_memory/worker.py` — `enforce_capacity`, `_prune_table`,
-`maintenance`; configuration in `atom_memory/config.py`.
+`maintenance`; the read-only explanation is `atom_memory/api.py` —
+`capacity_report`; configuration in `atom_memory/config.py`.
 
 **Tests.** `tests/test_lifecycle.py::test_capacity_archives_the_least_valuable_fact`,
 `test_capacity_protects_fresh_reinforced_durable_and_pinned_facts`,
-`test_maintenance_prunes_terminal_rows`.
+`test_maintenance_prunes_terminal_rows`,
+`test_capacity_report_says_the_cap_is_disabled_rather_than_reporting_zero`,
+`test_capacity_report_counts_what_is_actually_reachable`.
+
+---
+
+## 4a. Stored duplicates and conflicts are reported, never repaired
+
+**Rule.** The write path resolves identity *as writes arrive*: a restatement folds
+into the row it matches, and a contradiction under a single-valued predicate
+supersedes the stored value (rules 1 and 2). Two facts that became duplicates
+*after* the fact are found by a read instead — `consolidation_report`, surfaced
+through `memory_overview action=status`. It reports:
+
+1. **duplicates** — active facts sharing a `content_fingerprint`. The fingerprint
+   is the store's own identity for a claim, so two active rows carrying one are
+   the same memory stored twice;
+2. **conflicts** — a key the validator calls **single-valued** holding more than
+   one distinct object, with the newest assertion identified.
+
+The pass does **not** supersede, merge or delete. Disposal stays with the session
+model, through `memory_replace` / `memory_forget`.
+
+**A multi-valued predicate is never a conflict.** Whether a predicate may hold
+many objects is decided by `is_multi_valued` alone, and the detector consults it
+rather than assuming one object per key — passing `memory_type`, because the type
+is the *primary* multi-valued marker (a to-do, an episodic event, a knowledge item
+is multi-valued whatever its predicate says). Derived independently, a
+`(subject, predicate)` + distinct-object rule returned **44 conflict groups**
+against a real 1195-fact store, and **all 44 were multi-valued memory**
+(preferences, to-dos, lessons) — the project's own authority classifies every one
+of them as multi-valued, i.e. not a conflict at all.
+
+**Why.** A report that is entirely false positives is worse than no report,
+because acting on it deletes legitimate memory — and the natural way to "fix" an
+apparent contradiction is to retire one side of it. The reason disposal is left
+to the caller is the same reason: the store can see that two objects disagree,
+but only the session can see which one the user meant. Detection also reads only
+data already in the table, deliberately: finding *reworded* duplicates would mean
+re-embedding every stored fact, which is not a cost a background pass may impose
+on a store of any real size. The report is therefore a lower bound on
+redundancy, and on a store whose memory is accumulated multi-valued material it
+will legitimately report nothing.
+
+**Owner.** `atom_memory/consolidate.py` — `detect_duplicates`,
+`detect_conflicts`, `build_report`; the multi-valued authority is
+`atom_memory/validator.py` — `is_multi_valued`; exposure in
+`atom_memory/rpc.py` — `_consolidation_report`.
+
+**Tests.** `tests/test_consolidate.py::test_a_multi_valued_predicate_is_never_reported_as_a_conflict`,
+`test_a_predicate_that_is_multi_valued_only_by_type_is_not_a_conflict`,
+`test_a_genuine_single_valued_conflict_is_still_reported`.
 
 ---
 
