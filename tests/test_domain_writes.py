@@ -451,6 +451,187 @@ def test_promoting_is_idempotent_and_says_whether_it_created(tmp_path, monkeypat
     asyncio.run(scenario())
 
 
+def _seed_fact_in_scope(mem, fact_id, scope_id, user="u"):
+    """Insert an active fact and put it in one scope."""
+    ts = now_ms()
+    mem.db.execute(
+        "INSERT INTO facts(fact_id, user_id, session_id, subject, predicate, object, "
+        "observed_at, created_at) VALUES (?, ?, 's', 's', 'p', 'o', ?, ?)",
+        (fact_id, user, ts, ts),
+    )
+    mem.db.execute(
+        "INSERT INTO fact_scope(fact_id, scope_id, priority) VALUES (?, ?, 0)",
+        (fact_id, scope_id),
+    )
+    mem.db.commit()
+    return fact_id
+
+
+def test_the_scope_map_relabels_existing_facts(tmp_path, monkeypatch):
+    """The mapping has to reach facts stored before it existed.
+
+    Registering a topic never tagged anything, so a store that gained a mapping
+    after the fact kept every row in `general` — the topics existed with zero
+    facts while the fallback held the corpus.
+    """
+    mem = _mem(
+        tmp_path,
+        monkeypatch,
+        scope_domain_map=(
+            ("/global/project:c:/ws/papers", "research"),
+            ("/global/project:c:/ws/course", "teaching"),
+            ("/global/project:c:/ws/course/lab", "teaching/lab"),
+        ),
+    )
+
+    async def scenario():
+        await mem.start()
+        try:
+            store = mem._scope_store()
+            course = store.create("project", "c:/ws/course")
+            lab = store.create("project", "c:/ws/course/lab")
+            papers = store.create("project", "c:/ws/papers")
+            _seed_fact_in_scope(mem, "f1", course)
+            _seed_fact_in_scope(mem, "f2", papers)
+            _seed_fact_in_scope(mem, "f3", lab)
+
+            domains = mem._domain_store()
+            general = domains.create("u", "general")
+            from atom_memory.domain import DomainAssignment, DomainLabel
+
+            domains.attach("f1", DomainAssignment(labels=(
+                DomainLabel(domain_id=general, name="general", confidence=0.5,
+                            is_primary=True, source="session_default"),
+            )))
+            # A label the user set by hand must survive the backfill.
+            domains.create("u", "programming")
+            domains.set_fact_domains("f3", ["programming"], user_id="u")
+
+            # A dry run must not write anything.
+            plan = mem.domain_relabel_from_scopes("u", dry_run=True)
+            assert plan["dry_run"] is True
+            assert plan["candidates"] == 3
+            assert plan["applied"] == 0
+            assert domains.labels_of("f1")[0].name == "general"
+
+            result = mem.domain_relabel_from_scopes("u", dry_run=False)
+            assert result["applied"] == 3
+            assert result["added"] == {"research": 1, "teaching": 1, "teaching/lab": 1}
+
+            # Most specific prefix wins: the lab is `teaching/lab`, not `teaching`.
+            assert [l.name for l in domains.labels_of("f2")] == ["research"]
+            # f3's user label keeps its standing (primary) and the rule's topic is
+            # added alongside it: the mapping identifies the fact's *area*, while
+            # the user's label remains what they said it was about.
+            f3_names = sorted(l.name for l in domains.labels_of("f3"))
+            assert f3_names == ["programming", "teaching/lab"]
+
+            # The fallback is replaced, not accumulated, and the new row is
+            # stamped as rule output rather than as a user decision — otherwise
+            # nothing could ever outrank it again.
+            f1 = domains.labels_of("f1")
+            assert [l.name for l in f1] == ["teaching"]
+            assert f1[0].source == "scoped_map"
+            assert f1[0].is_primary is True
+
+            # A user label is neither removed nor demoted by a rule.
+            f3 = domains.labels_of("f3")
+            assert f3[0].name == "programming"
+            assert f3[0].source == "user_explicit"
+            assert f3[0].is_primary is True
+            added_rule = next(l for l in f3 if l.name == "teaching/lab")
+            assert added_rule.source == "scoped_map"
+            assert added_rule.is_primary is False
+
+            # Re-running is a no-op rather than a growing label set.
+            again = mem.domain_relabel_from_scopes("u", dry_run=False)
+            assert again["candidates"] == 0
+            assert again["applied"] == 0
+        finally:
+            await mem.stop()
+
+    asyncio.run(scenario())
+
+
+def test_the_scope_map_leaves_what_it_cannot_place_alone(tmp_path, monkeypatch):
+    """No rule matching is not evidence the current label is wrong."""
+    mem = _mem(
+        tmp_path,
+        monkeypatch,
+        scope_domain_map=(("/global/project:c:/ws/papers", "research"),),
+    )
+
+    async def scenario():
+        await mem.start()
+        try:
+            store = mem._scope_store()
+            other = store.create("project", "c:/ws/unmapped")
+            _seed_fact_in_scope(mem, "f1", other)
+
+            domains = mem._domain_store()
+            general = domains.create("u", "general")
+            from atom_memory.domain import DomainAssignment, DomainLabel
+
+            domains.attach("f1", DomainAssignment(labels=(
+                DomainLabel(domain_id=general, name="general", confidence=0.5,
+                            is_primary=True, source="session_default"),
+            )))
+
+            result = mem.domain_relabel_from_scopes("u", dry_run=False)
+            assert result["candidates"] == 0
+            # Deleting the label would turn a fact nobody could classify into a
+            # fact no filter can find.
+            assert [l.name for l in domains.labels_of("f1")] == ["general"]
+        finally:
+            await mem.stop()
+
+    asyncio.run(scenario())
+
+
+def test_the_scope_map_corrects_a_stale_rule_label(tmp_path, monkeypatch):
+    """Changing the mapping has to move facts that already followed it.
+
+    Without this, re-mapping a project would leave the previous rule's topic in
+    place, and a fact would accumulate one label per mapping it ever matched —
+    the union growth the merge rule exists to prevent.
+    """
+    mem = _mem(
+        tmp_path,
+        monkeypatch,
+        scope_domain_map=(("/global/project:c:/ws/course", "teaching"),),
+    )
+
+    async def scenario():
+        await mem.start()
+        try:
+            store = mem._scope_store()
+            course = store.create("project", "c:/ws/course")
+            _seed_fact_in_scope(mem, "f1", course)
+
+            domains = mem._domain_store()
+            stale = domains.create("u", "old-topic")
+            from atom_memory.domain import DomainAssignment, DomainLabel
+
+            domains.attach("f1", DomainAssignment(labels=(
+                DomainLabel(domain_id=stale, name="old-topic", confidence=1.0,
+                            is_primary=True, source="scoped_map"),
+            )))
+
+            result = mem.domain_relabel_from_scopes("u", dry_run=False)
+            assert result["applied"] == 1
+
+            labels = domains.labels_of("f1")
+            assert [l.name for l in labels] == ["teaching"]
+            # Exactly one row: the stale rule label was replaced, not kept
+            # alongside the new one.
+            assert len(labels) == 1
+            assert labels[0].source == "scoped_map"
+        finally:
+            await mem.stop()
+
+    asyncio.run(scenario())
+
+
 class _StubMem:
     """Records the calls the RPC layer makes, and answers like the real one."""
 
@@ -487,6 +668,7 @@ def test_every_domain_rpc_method_is_reachable_and_forwards_its_params():
             ("fact_domain_set", {"user_id": "u", "fact_id": "f",
                                  "domains": ["teaching"]}),
             ("fact_domain_get", {"user_id": "u", "fact_id": "f"}),
+            ("domain_relabel_from_scopes", {"user_id": "u", "dry_run": True}),
         ]
         return [await server._dispatch(method, params) for method, params in requests]
 
@@ -495,11 +677,12 @@ def test_every_domain_rpc_method_is_reachable_and_forwards_its_params():
         "domain_list", "domain_resolve", "domain_create", "domain_rename",
         "domain_merge", "domain_archive", "domain_bridge_add", "domain_unresolved",
         "domain_signal_promote", "domain_signal_reject", "fact_domain_set",
-        "fact_domain_get",
+        "fact_domain_get", "domain_relabel_from_scopes",
     ]
     forwarded = dict(server.mem.calls)
     assert forwarded["domain_resolve"]["scope_context"] == PROJECT
     assert forwarded["fact_domain_set"]["domains"] == ["teaching"]
+    assert forwarded["domain_relabel_from_scopes"]["dry_run"] is True
 
 
 def test_the_first_write_seeds_the_vocabulary_from_the_scope_tree(

@@ -1582,3 +1582,166 @@ class DomainStore:
                     ),
                 )
         return self.labels_of(fact_id)
+
+    def relabel_from_scopes(
+        self,
+        user_id: str,
+        *,
+        scope_paths: Optional[Dict[int, str]] = None,
+        dry_run: bool = True,
+        limit: int = 0,
+    ) -> dict:
+        """Re-derive labels for existing facts from the scope each sits in.
+
+        This exists because the scope → topic mapping was configurable from the
+        start but had no caller: every write that landed before a mapping existed
+        was filed under ``general`` and stayed there, so the vocabulary had topics
+        with zero facts while ``general`` held the corpus. Registration of a topic
+        never implied any fact was tagged with it.
+
+        Two rules keep this from being a blunt overwrite:
+
+        * **A stronger label is never removed.** Only ``general`` (the fallback)
+          and a previous ``scoped_map`` label are candidates for replacement;
+          anything a user or an extractor stated outranks a rule, which is the
+          same ordering :func:`source_rank` already encodes.
+        * **A fact the mapping cannot resolve is left alone**, ``general``
+          included. "No rule matches" is not evidence that the topic is wrong,
+          and deleting the label would turn a fact nobody could classify into a
+          fact no filter can ever find.
+
+        ``main`` is not touched: nothing here is a user decision, so
+        ``is_primary`` is left as stored.
+
+        Args:
+            user_id: Owner of the facts and the vocabulary.
+            scope_paths: ``{scope_id: path}``. Supplied by the caller (the API
+                layer reads it from the scope store) so this module stays free of
+                a cross-store import.
+            dry_run: When true (the default) report the plan and write nothing.
+            limit: Cap the number of facts examined; ``0`` means no cap.
+
+        Returns:
+            A summary: counts, the topics that would be or were added, and a
+            sample of the changes for inspection.
+        """
+        paths = dict(scope_paths or {})
+        # The topic each scope resolves to, computed once per scope rather than
+        # once per fact: a scope holds hundreds of facts and the mapping is pure.
+        scope_domain: Dict[int, str] = {}
+        for scope_id, path in paths.items():
+            found = self._map_scope_path(user_id, path)
+            if found:
+                name = self.name_of(found)
+                if name:
+                    scope_domain[int(scope_id)] = name
+
+        rows = self.conn.execute(
+            "SELECT fs.fact_id, fs.scope_id FROM fact_scope fs "
+            "JOIN facts f ON f.fact_id = fs.fact_id AND f.status = 'active' "
+            "WHERE f.user_id = ? ORDER BY fs.priority, fs.fact_id",
+            (str(user_id or ""),),
+        ).fetchall()
+        seen: set = set()
+        planned: List[Tuple[str, str]] = []
+        for row in rows:
+            fact_id = str(row["fact_id"])
+            if fact_id in seen:
+                continue
+            seen.add(fact_id)
+            if limit and len(seen) > int(limit):
+                break
+            target = scope_domain.get(int(row["scope_id"]))
+            if not target:
+                continue
+            labels = self.labels_of(fact_id)
+            if target in {label.name for label in labels}:
+                continue
+            planned.append((fact_id, target))
+
+        applied = 0
+        if not dry_run:
+            target_id_cache: Dict[str, Optional[int]] = {}
+
+            def _id_of(name: str) -> Optional[int]:
+                if name not in target_id_cache:
+                    target_id_cache[name] = self.find(user_id, name)
+                return target_id_cache[name]
+
+            for fact_id, target in planned:
+                labels = self.labels_of(fact_id)
+                general_id_now = self.find(user_id, "general")
+                keep = [
+                    label for label in labels
+                    if label.domain_id != general_id_now
+                    and not (
+                        label.source == SOURCE_SCOPED_MAP and label.name != target
+                    )
+                ]
+
+                # Remove the labels this rule supersedes. `attach` merges by
+                # max-confidence and never by union, so a stale `general` row
+                # would otherwise survive underneath the new one.
+                superseded = [
+                    label.domain_id for label in labels
+                    if label.domain_id not in {k.domain_id for k in keep}
+                ]
+                target_id = _id_of(target)
+                if not target_id:
+                    continue
+                with self.conn:
+                    for domain_id in superseded:
+                        if domain_id == target_id:
+                            continue
+                        self.conn.execute(
+                            "DELETE FROM fact_domain WHERE fact_id = ? AND domain_id = ?",
+                            (fact_id, domain_id),
+                        )
+
+                cap = max(1, int(getattr(self.config, "domain_max_per_fact", 5) or 5))
+                assignment = DomainAssignment(
+                    labels=(
+                        # The mapped topic leads and is primary: the rule states
+                        # the fact's standing, and `attach` keeps the first label.
+                        DomainLabel(
+                            domain_id=target_id,
+                            name=target,
+                            confidence=1.0,
+                            is_primary=True,
+                            source=SOURCE_SCOPED_MAP,
+                        ),
+                        *(
+                            DomainLabel(
+                                domain_id=label.domain_id,
+                                name=label.name,
+                                confidence=label.confidence,
+                                is_primary=False,
+                                source=label.source,
+                            )
+                            for label in keep[: max(0, cap - 1)]
+                        ),
+                    ),
+                    detail="scope backfill",
+                )
+                try:
+                    self.attach(fact_id, assignment)
+                    applied += 1
+                except ValueError:
+                    # An unstorable target. Skip rather than abort: one bad name
+                    # must not strand the rest of the backfill.
+                    continue
+
+        added: Dict[str, int] = {}
+        for _, target in planned:
+            added[target] = added.get(target, 0) + 1
+        return {
+            "dry_run": bool(dry_run),
+            "mapped_scopes": len(scope_domain),
+            "candidates": len(planned),
+            "applied": applied,
+            "added": dict(sorted(added.items(), key=lambda kv: -kv[1])),
+            "sample": [
+                {"fact_id": fact_id, "domain": target}
+                for fact_id, target in planned[:20]
+            ],
+        }

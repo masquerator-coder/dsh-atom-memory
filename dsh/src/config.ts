@@ -250,6 +250,19 @@ export interface DeployTimeConfig {
    */
   multiValuedPredicates?: string[]
   /**
+   * Deployment-level scope → topic rules, most specific prefix winning.
+   *
+   * A deploy-time field rather than a live one, for the same reason the scope
+   * identity fields are: it describes the deployment's own layout ("this
+   * checkout is the papers project"), not a preference to toggle mid-session.
+   * Changing it needs a bridge restart, which is also when the mapping is read.
+   *
+   * Empty (the default) changes nothing: an unconfigured deployment's start
+   * params stay byte-identical to what they were before this field existed, and
+   * labelling falls through to `general` exactly as before.
+   */
+  scopeDomainMap?: Array<[string, string]>
+  /**
    * Whether scope-aware memory is on: collect this session's context signals
    * (git root and origin remote, declared package name, working directory) and
    * send them as the `scope_context` payload of every scope-aware RPC call.
@@ -389,6 +402,42 @@ export const Config = z.object({
   maxFactTokens: z.number().default(600),
   dedupMaxDistance: z.number().default(0.10),
   multiValuedPredicates: z.array(z.string()).default([]),
+  /**
+   * Deployment-level rule table: "everything under this project is about X".
+   *
+   * The scope tree records *where* work happened (which project, which series)
+   * and the topic vocabulary records *what it was about*. Neither implies the
+   * other, so the link has to be stated — and this is the statement. Without it
+   * every write falls through to `general`, which is what happened here: 1476
+   * facts sat in `general` while the projects they belonged to were obviously
+   * about teaching, research or deployment work.
+   *
+   * Matching is by **prefix, most specific wins**, so a child project overrides
+   * its parent ("papers under aiworkspace is research, even though aiworkspace
+   * is the teaching workspace"). That also makes the order in this list
+   * irrelevant: `_map_scope_path` compares prefix lengths rather than taking the
+   * first hit, so a shorter prefix listed earlier cannot shadow a longer one.
+   *
+   * Do **not** map `/global`: it is a prefix of every scope, so it would match
+   * everything and become a synonym for `general`.
+   *
+   * Each rule is a two-element `[prefix, domain]` array rather than an object.
+   * That is the wire shape the Python side unpacks, and an object would make the
+   * schema's inferred type unnameable for the declaration emitter — it would
+   * typecheck and still fail the bundle with `TS2742`.
+   *
+   * Prefixes are matched byte-for-byte against the paths the scope store holds,
+   * which come in three dialects — `c:/users/...` (lowercase drive, no leading
+   * slash), `/mnt/c/users/...`, and bare remotes like `github.com/owner/repo` —
+   * each preceded by `/global/project:`. A rule in the wrong dialect looks
+   * plausible and silently never fires; `memory_domains` action
+   * `relabel_from_scopes` reports how many rules resolved, which is how to check.
+   *
+   * A mapped topic that does not exist yet is registered on first use. The
+   * library treats the mapping as the user's own statement of intent, which is
+   * stronger evidence than anything an extractor could propose.
+   */
+  scopeDomainMap: z.array(z.array(z.string())).default([]),
   scopeEnabled: z.boolean().default(true),
   // Empty means "no tag": an empty signal value is dropped by the payload
   // builder rather than sent, which is what keeps an unconfigured deployment's

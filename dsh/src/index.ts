@@ -154,6 +154,24 @@ export function buildStartParams(config: ConfigShape): Record<string, unknown> {
   if (config.multiValuedPredicates !== undefined && config.multiValuedPredicates.length > 0) {
     params.multi_valued_predicates = config.multiValuedPredicates
   }
+  // Scope → topic rules, as `[prefix, domain]` pairs — the exact shape the
+  // Python side unpacks (`_map_scope_path` reads `entry[0]` / `entry[1]`).
+  //
+  // Written as a two-element array rather than an object because a nested
+  // `z.object` inside `Config` makes the schema's inferred type unnameable for
+  // the declaration emitter, which fails the bundle with `TS2742` — the field
+  // would typecheck and still not build. A pair is also the wire shape, so
+  // there is nothing to convert.
+  //
+  // A row missing either half is dropped rather than sent: an empty prefix is a
+  // prefix of every scope path and would map the whole store onto one topic.
+  const scopeDomainMap = (config.scopeDomainMap ?? [])
+    .map(entry => [String(entry?.[0] ?? ''), String(entry?.[1] ?? '')] as const)
+    .filter(([prefix, domain]) => prefix.length > 0 && domain.length > 0)
+    .map(([prefix, domain]) => [prefix, domain])
+  if (scopeDomainMap.length > 0) {
+    params.scope_domain_map = scopeDomainMap
+  }
   return params
 }
 

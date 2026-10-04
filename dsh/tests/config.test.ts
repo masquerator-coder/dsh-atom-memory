@@ -102,4 +102,34 @@ describe('start params', () => {
         .recency_reference_window_days,
     ).toBe(10)
   })
+
+  it('leaves scope_domain_map out when the deployment declares none', () => {
+    expect(Config({}).scopeDomainMap).toEqual([])
+    expect('scope_domain_map' in buildStartParams(Config({}))).toBe(false)
+  })
+
+  it('forwards the scope map as pairs, which is what Python unpacks', () => {
+    const params = buildStartParams(Config({
+      scopeDomainMap: [['/global/project:c:/ws/papers', 'research']],
+    }))
+
+    // `_map_scope_path` reads `entry[0]` / `entry[1]`, so the wire shape has to
+    // be a 2-element list per rule — an object would raise on the Python side
+    // instead of applying.
+    expect(params.scope_domain_map).toEqual([['/global/project:c:/ws/papers', 'research']])
+  })
+
+  it('drops a half-filled rule rather than sending one that matches everything', () => {
+    // An empty prefix is a prefix of every path: sending it would map the whole
+    // store onto one topic.
+    const params = buildStartParams(Config({
+      scopeDomainMap: [
+        ['', 'teaching'],
+        ['/global/project:x', ''],
+        ['/global/project:y', 'research'],
+      ],
+    }))
+
+    expect(params.scope_domain_map).toEqual([['/global/project:y', 'research']])
+  })
 })

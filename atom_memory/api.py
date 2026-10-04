@@ -1375,6 +1375,39 @@ class AtomMem:
         payload["already_registered"] = existing_id is not None
         return payload
 
+    def domain_relabel_from_scopes(
+        self, user_id: str, dry_run: bool = True, limit: int = 0
+    ) -> dict:
+        """Re-derive topics for existing facts from the scopes they sit in.
+
+        The scope → topic mapping was always configurable, but nothing ever
+        applied it to facts already stored: they were filed under `general` when
+        written and stayed there, which left the vocabulary full of topics with
+        zero facts while `general` held the corpus.
+
+        Defaults to ``dry_run=True`` on purpose. This rewrites labels, and a
+        preview is the only way to see the plan before committing to it.
+
+        Args:
+            user_id: Owner of the facts and the vocabulary.
+            dry_run: Report the plan without writing (the default).
+            limit: Cap the facts examined; ``0`` means no cap.
+
+        Returns:
+            The plan/summary from `DomainStore.relabel_from_scopes`.
+        """
+        scope_store = self._scope_store()
+        paths = {
+            int(row.id): str(row.path or "")
+            for row in scope_store.list_scopes()
+        }
+        return self._domain_store().relabel_from_scopes(
+            user_id,
+            scope_paths=paths,
+            dry_run=bool(dry_run),
+            limit=int(limit or 0),
+        )
+
     def fact_domain_set(self, user_id: str, fact_id: str, domains: list) -> dict:
         """Replace a fact's topics with exactly the given names.
 

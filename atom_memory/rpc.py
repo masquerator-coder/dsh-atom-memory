@@ -130,6 +130,7 @@ _METHODS: Dict[str, str] = {
     "domain_signal_reject": "domain_signal_reject",
     "fact_domain_set": "fact_domain_set",
     "fact_domain_get": "fact_domain_get",
+    "domain_relabel_from_scopes": "domain_relabel_from_scopes",
 }
 
 

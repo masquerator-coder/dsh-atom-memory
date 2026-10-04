@@ -564,6 +564,90 @@ describe('memory_domains queue actions', () => {
     expect(described).toContain('signal_promote')
     expect(String(tool.description)).toContain('signal_promote')
   })
+
+  it('relabel_from_scopes is advertised and defaults to a dry run', async () => {
+    const { bridge, tool } = setupDomains()
+    bridge.call.mockResolvedValue({ dry_run: true, candidates: 0, added: {} })
+
+    const described = String((tool.parameters as any).properties.action.description)
+    expect(described).toContain('relabel_from_scopes')
+
+    // An omitted argument must not rewrite labels: the caller has to opt in.
+    await tool.execute({ action: 'relabel_from_scopes' }, execWithSession('s1'))
+    let [, params] = bridge.call.mock.calls.at(-1) as [string, Record<string, unknown>]
+    expect(params.dry_run).toBe(true)
+
+    await tool.execute(
+      { action: 'relabel_from_scopes', dryRun: false },
+      execWithSession('s1'),
+    )
+    ;[, params] = bridge.call.mock.calls.at(-1) as [string, Record<string, unknown>]
+    expect(params.dry_run).toBe(false)
+  })
+
+  it('relabel_from_scopes forwards a sane limit', async () => {
+    const { bridge, tool } = setupDomains()
+    bridge.call.mockResolvedValue({ dry_run: true, candidates: 0, added: {} })
+
+    const cases: Array<[Record<string, unknown>, number]> = [
+      // Omitted, explicitly 0, and negative all mean "no cap"; a positive value
+      // is truncated to an integer.
+      [{}, 0],
+      [{ limit: 0 }, 0],
+      [{ limit: -5 }, 0],
+      [{ limit: 10 }, 10],
+    ]
+    for (const [extra, expected] of cases) {
+      await tool.execute(
+        { action: 'relabel_from_scopes', ...extra },
+        execWithSession('s1'),
+      )
+      const [, params] = bridge.call.mock.calls.at(-1) as [string, Record<string, unknown>]
+      expect(params.limit).toBe(expected)
+    }
+  })
+
+  it('relabel_from_scopes renders the plan it is previewing', async () => {
+    const { bridge, tool } = setupDomains()
+    bridge.call.mockResolvedValue({
+      dry_run: true, mapped_scopes: 3, candidates: 12, applied: 0,
+      added: { teaching: 8, research: 4 },
+    })
+
+    const result = (await tool.execute(
+      { action: 'relabel_from_scopes' },
+      execWithSession('s1'),
+    )) as any
+    const text = (tool.output!.render!(
+      { action: 'relabel_from_scopes' },
+      result,
+    ) as Array<{ text: string }>)[0]!.text
+
+    expect(text).toContain('预演')
+    expect(text).toContain('12')
+    expect(text).toContain('teaching：8 条')
+    expect(text).toContain('dryRun=false')
+  })
+
+  it('relabel_from_scopes names the missing mapping as the cause of an empty plan', async () => {
+    const { bridge, tool } = setupDomains()
+    bridge.call.mockResolvedValue({
+      dry_run: true, mapped_scopes: 0, candidates: 0, applied: 0, added: {},
+    })
+
+    const result = (await tool.execute(
+      { action: 'relabel_from_scopes' },
+      execWithSession('s1'),
+    )) as any
+    const text = (tool.output!.render!(
+      { action: 'relabel_from_scopes' },
+      result,
+    ) as Array<{ text: string }>)[0]!.text
+
+    // "Nothing to do" has two very different causes; naming the wrong one sends
+    // the user looking for a bug in the wrong place.
+    expect(text).toContain('scopeDomainMap')
+  })
 })
 
 describe('capacity and detection visibility', () => {

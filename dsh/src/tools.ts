@@ -673,6 +673,28 @@ export function renderDomainResult(action: string, value: unknown): string {
       return `已注册主题 [${v.domain_id ?? '?'}] ${label}`
         + `${v.display_name && v.display_name !== v.name ? `（${v.display_name}）` : ''}。`
     }
+    case 'relabel_from_scopes': {
+      const v = value as {
+        dry_run?: boolean
+        mapped_scopes?: number
+        candidates?: number
+        applied?: number
+        added?: Record<string, number>
+      }
+      const added = Object.entries(v.added ?? {})
+      if (v.candidates === 0) {
+        return v.mapped_scopes === 0
+          ? '没有任何「作用域 → 主题」映射生效，因此没有可重算的事实（先配置 scopeDomainMap）。'
+          : '映射已生效，但没有事实需要重算（都已经是映射指向的主题了）。'
+      }
+      const head = v.dry_run
+        ? `预演：${v.candidates} 条事实会改打主题（未写库）。`
+        : `已重算 ${v.applied ?? 0} 条事实的主题。`
+      const lines = added.slice(0, 12).map(([name, count]) => `- ${name}：${count} 条`)
+      const more = added.length > 12 ? [`（另有 ${added.length - 12} 个主题）`] : []
+      const tail = v.dry_run ? ['', '确认无误后，用 dryRun=false 真正执行。'] : []
+      return [head, ...lines, ...more, ...tail].join('\n')
+    }
     case 'fact_set':
     case 'fact_get': {
       const v = value as {
@@ -1464,6 +1486,8 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
       + 'rename / merge / archive 维护词表；bridge_add 记录跨主题关联（只影响排序权重，不改变过滤）；'
       + 'unresolved 列出待注册队列；signal_promote 注册队列里的某个建议（批准）；'
       + 'signal_reject 忽略某个待注册建议；'
+      + 'relabel_from_scopes 按「作用域 → 主题」映射重算已有事实的主题（默认只报告计划，'
+      + 'dryRun=false 才写库）；'
       + 'fact_set / fact_get 读取或改写某条事实的主题（改写是权威的：未列出的主题会被移除）。',
     parameters: {
       action: {
@@ -1471,7 +1495,7 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
         required: true,
         description:
           '要执行的操作：list / resolve / create / rename / merge / archive / bridge_add / '
-          + 'unresolved / signal_promote / signal_reject / fact_set / fact_get',
+          + 'unresolved / signal_promote / signal_reject / relabel_from_scopes / fact_set / fact_get',
       },
       name: { type: 'string', description: 'create / rename / signal_promote / signal_reject 必填：主题规范名（小写 ASCII，斜杠分隔，如 teaching/ds）' },
       displayName: { type: 'string', description: 'create 可选：给人看的中文显示名' },
@@ -1487,6 +1511,8 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
       parentId: { type: 'integer', description: 'create 可选：父主题 id（省略则自动挂到最近的已注册祖先，或 general）' },
       factId: { type: 'string', description: 'fact_set / fact_get 必填：事实 id' },
       status: { type: 'string', description: 'list 可选：主题状态（默认 active，也可用 merged / archived）' },
+      dryRun: { type: 'boolean', description: 'relabel_from_scopes 可选：默认 true（只报告计划、不写库）；传 false 才真正改写标签' },
+      limit: { type: 'integer', description: 'relabel_from_scopes 可选：最多处理多少条事实（0 = 不限）' },
       user: { type: 'string', description: '可选：归属用户 id（默认当前用户，跨会话共享）' },
     },
     output: {
@@ -1564,6 +1590,18 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
           if (!args.name) throw new Error('memory_domains signal_reject requires name')
           return await call<any>('domain_signal_reject', { user_id: uid, name: args.name })
         }
+        case 'relabel_from_scopes': {
+          // A dry run unless explicitly disabled. The action rewrites labels, so
+          // the safe reading of an omitted argument is "show me the plan" — the
+          // caller has to opt into writing.
+          const dryRun = args.dryRun !== false
+          const limit = Number(args.limit ?? 0)
+          return await call<any>('domain_relabel_from_scopes', {
+            user_id: uid,
+            dry_run: dryRun,
+            limit: Number.isFinite(limit) && limit > 0 ? Math.trunc(limit) : 0,
+          })
+        }
         case 'fact_set': {
           if (!args.factId) throw new Error('memory_domains fact_set requires factId')
           if (!args.labels || args.labels.length === 0) {
@@ -1581,7 +1619,8 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
           throw new Error(
             `memory_domains: unknown action ${String(args.action)}`
             + '（可用：list / resolve / create / rename / merge / archive / bridge_add / '
-            + 'unresolved / signal_promote / signal_reject / fact_set / fact_get）',
+            + 'unresolved / signal_promote / signal_reject / relabel_from_scopes / '
+            + 'fact_set / fact_get）',
           )
       }
     },

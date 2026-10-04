@@ -24,6 +24,27 @@
 # `overviewIdleSeconds` is the quiet window after a write before a refresh is
 # attempted, and `overviewRefreshMinutes` is the floor between two refreshes
 # (0 removes the floor).
+#
+# `autoDomainPromote` (default true) lets the plugin approve queued topic
+# proposals during idle time. Only proposals seen at least
+# `domainPromoteThreshold` times are considered, the model only decides which of
+# those are real topics, and at most `domainPromoteMaxPerRun` are registered per
+# run. With it off the queue is kept and proposals can still be approved by hand
+# (`memory_domains` action `signal_promote`).
+#
+# `scopeDomainMap` is the scope → topic rule table: "everything under this
+# project is about X". Labels come from here, not from the scope tree — the scope
+# records *where* work happened and the vocabulary records *what it was about*,
+# and nothing links the two on its own. Without a rule a write falls through to
+# `general`. Matching is by prefix with the most specific rule winning, so a
+# child project overrides its parent. Do NOT map `/global`: it is a prefix of
+# every scope and would swallow the whole store.
+#
+# Note the stored scope paths are Windows/mounted forms with a lowercase drive
+# and no leading slash on the drive (`c:/users/...`), and each is prefixed by
+# `/global/project:`. A rule whose prefix does not match byte-for-byte silently
+# never fires — `memory_domains` action `relabel_from_scopes` reports how many
+# rules resolved, which is the way to check. `dryRun` defaults to true there.
 - insert:
     - id: atom-memory
       name: dsh-atom-memory
@@ -39,5 +60,27 @@
         overviewEnabled: true
         overviewIdleSeconds: 90
         overviewRefreshMinutes: 15
+        autoDomainPromote: true
+        scopeDomainMap:
+          # Each rule is [scope path prefix, topic]. See the note above.
+          # --- teaching: the AI course tree, the mistake book, slide decks ---
+          - ["/global/project:c:/users/fuqia/documents/aiworkspace/ai智慧课程", "teaching"]
+          - ["/global/project:c:/users/fuqia/documents/aiworkspace/错题本", "teaching"]
+          - ["/global/project:c:/users/fuqia/documents/aiworkspace/ppt", "teaching"]
+          # --- research: paper work (CNKI access, literature tooling) ---
+          - ["/global/project:c:/users/fuqia/documents/aiworkspace/papers", "research"]
+          # --- legal: the mail router ---
+          - ["/global/project:/mnt/c/users/fuqia/documents/aiworkspace/legal-mail-router", "legal"]
+          # --- ml-infra: the DGX cluster, in all three places it is tracked ---
+          - ["/global/project:c:/users/fuqia/.dsh/im-workspace", "ml-infra"]
+          - ["/global/project:github.com/masquerator-coder/dsv41-deploy-public", "ml-infra"]
+          - ["/global/project:atomgit.com/foqiang/dgx-monitor", "ml-infra"]
+          # --- dsh: plugin development ---
+          - ["/global/project:d:/coding/dsh-plugin/dsh-atom-memory", "dsh"]
+          - ["/global/project:d:/coding/dsh-plugin/dsh-im-gateway", "dsh"]
+          - ["/global/project:github.com/masquerator-coder/dsh-browser-skill", "dsh"]
+          - ["/global/project:github.com/masquerator-coder/mistakebook", "dsh"]
+          # --- skill-authoring: writing the skills themselves ---
+          - ["/global/project:c:/users/fuqia/documents/aiworkspace/skills分类汇总", "skill-authoring"]
 
 

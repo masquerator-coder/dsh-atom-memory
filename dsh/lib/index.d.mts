@@ -117,6 +117,42 @@ declare const Config: z<Schemastery.ObjectS<NoInfer<{
   maxFactTokens: z<number, number, "defined">;
   dedupMaxDistance: z<number, number, "defined">;
   multiValuedPredicates: z<string[], string[], "defined">;
+  /**
+   * Deployment-level rule table: "everything under this project is about X".
+   *
+   * The scope tree records *where* work happened (which project, which series)
+   * and the topic vocabulary records *what it was about*. Neither implies the
+   * other, so the link has to be stated — and this is the statement. Without it
+   * every write falls through to `general`, which is what happened here: 1476
+   * facts sat in `general` while the projects they belonged to were obviously
+   * about teaching, research or deployment work.
+   *
+   * Matching is by **prefix, most specific wins**, so a child project overrides
+   * its parent ("papers under aiworkspace is research, even though aiworkspace
+   * is the teaching workspace"). That also makes the order in this list
+   * irrelevant: `_map_scope_path` compares prefix lengths rather than taking the
+   * first hit, so a shorter prefix listed earlier cannot shadow a longer one.
+   *
+   * Do **not** map `/global`: it is a prefix of every scope, so it would match
+   * everything and become a synonym for `general`.
+   *
+   * Each rule is a two-element `[prefix, domain]` array rather than an object.
+   * That is the wire shape the Python side unpacks, and an object would make the
+   * schema's inferred type unnameable for the declaration emitter — it would
+   * typecheck and still fail the bundle with `TS2742`.
+   *
+   * Prefixes are matched byte-for-byte against the paths the scope store holds,
+   * which come in three dialects — `c:/users/...` (lowercase drive, no leading
+   * slash), `/mnt/c/users/...`, and bare remotes like `github.com/owner/repo` —
+   * each preceded by `/global/project:`. A rule in the wrong dialect looks
+   * plausible and silently never fires; `memory_domains` action
+   * `relabel_from_scopes` reports how many rules resolved, which is how to check.
+   *
+   * A mapped topic that does not exist yet is registered on first use. The
+   * library treats the mapping as the user's own statement of intent, which is
+   * stronger evidence than anything an extractor could propose.
+   */
+  scopeDomainMap: z<string[][], string[][], "defined">;
   scopeEnabled: z<boolean, boolean, "defined">;
   scopeOrg: z<string, string, "defined">;
   scopeClient: z<string, string, "defined">;
@@ -222,6 +258,42 @@ declare const Config: z<Schemastery.ObjectS<NoInfer<{
   maxFactTokens: z<number, number, "defined">;
   dedupMaxDistance: z<number, number, "defined">;
   multiValuedPredicates: z<string[], string[], "defined">;
+  /**
+   * Deployment-level rule table: "everything under this project is about X".
+   *
+   * The scope tree records *where* work happened (which project, which series)
+   * and the topic vocabulary records *what it was about*. Neither implies the
+   * other, so the link has to be stated — and this is the statement. Without it
+   * every write falls through to `general`, which is what happened here: 1476
+   * facts sat in `general` while the projects they belonged to were obviously
+   * about teaching, research or deployment work.
+   *
+   * Matching is by **prefix, most specific wins**, so a child project overrides
+   * its parent ("papers under aiworkspace is research, even though aiworkspace
+   * is the teaching workspace"). That also makes the order in this list
+   * irrelevant: `_map_scope_path` compares prefix lengths rather than taking the
+   * first hit, so a shorter prefix listed earlier cannot shadow a longer one.
+   *
+   * Do **not** map `/global`: it is a prefix of every scope, so it would match
+   * everything and become a synonym for `general`.
+   *
+   * Each rule is a two-element `[prefix, domain]` array rather than an object.
+   * That is the wire shape the Python side unpacks, and an object would make the
+   * schema's inferred type unnameable for the declaration emitter — it would
+   * typecheck and still fail the bundle with `TS2742`.
+   *
+   * Prefixes are matched byte-for-byte against the paths the scope store holds,
+   * which come in three dialects — `c:/users/...` (lowercase drive, no leading
+   * slash), `/mnt/c/users/...`, and bare remotes like `github.com/owner/repo` —
+   * each preceded by `/global/project:`. A rule in the wrong dialect looks
+   * plausible and silently never fires; `memory_domains` action
+   * `relabel_from_scopes` reports how many rules resolved, which is how to check.
+   *
+   * A mapped topic that does not exist yet is registered on first use. The
+   * library treats the mapping as the user's own statement of intent, which is
+   * stronger evidence than anything an extractor could propose.
+   */
+  scopeDomainMap: z<string[][], string[][], "defined">;
   scopeEnabled: z<boolean, boolean, "defined">;
   scopeOrg: z<string, string, "defined">;
   scopeClient: z<string, string, "defined">;
