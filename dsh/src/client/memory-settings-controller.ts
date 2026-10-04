@@ -60,6 +60,13 @@ export interface MemoryData {
     object: string
     type?: string
     content?: string
+    /**
+     * The topics this fact carries, primary first (the store's own order).
+     *
+     * Present since `list_facts` learned to report labels; older store versions
+     * omit it, which the panel reads as "unlabelled" rather than as an error.
+     */
+    domain_names?: string[]
   }>
   profile: Array<{ section: string; key: string; value: string; source?: string }>
   /**
@@ -149,11 +156,16 @@ export interface MemorySettingsFace {
   /**
    * Fetch one page of active facts into `data.facts` (server-side paging).
    *
+   * `domain` restricts the page to one topic (and its descendants) — see
+   * {@link FACTS_DOMAIN_UNLABELLED} for the "no topic" selection and
+   * {@link FACTS_DOMAIN_ALL} for no filter. Both the page and its total come
+   * back filtered, so the pager describes what the filter actually returns.
+   *
    * Rejects on a failed call so the caller can report it; the store's own
    * `lastError` is set either way. The page that was on screen stays in the
    * snapshot when the call fails, so a failed page turn does not blank the table.
    */
-  fetchFactsPage: (offset: number, limit: number) => Promise<void>
+  fetchFactsPage: (offset: number, limit: number, domain?: string) => Promise<void>
   /**
    * Re-read the user's registered topic vocabulary.
    *
@@ -236,7 +248,12 @@ interface WireResult<T> {
 
 /** Minimal structural shape of the `atom-memory` Remote namespace. */
 interface RemoteAtomMemory {
-  listFacts(args: { user: string; offset?: number; limit?: number }): Promise<WireResult<{ facts: MemoryData['facts']; total: number }>>
+  listFacts(args: {
+    user: string
+    offset?: number
+    limit?: number
+    domain?: string
+  }): Promise<WireResult<{ facts: MemoryData['facts']; total: number }>>
   editFact(args: {
     user: string
     fact_id: string
@@ -284,6 +301,25 @@ export const FACTS_PAGE_SIZES = [20, 50, 100, 200] as const
 
 /** Page size the panel opens with. */
 export const FACTS_PAGE_SIZE_DEFAULT = 50
+
+/**
+ * The dropdown value meaning "no topic filter".
+ *
+ * Kept distinct from the unlabelled sentinel below: "" is "show everything" and
+ * must never be sent as a `domain` argument, or every selection would turn into
+ * a filter that matches nothing.
+ */
+export const FACTS_DOMAIN_ALL = ''
+
+/**
+ * The dropdown value meaning "only facts carrying no topic".
+ *
+ * Mirrors `AtomMem.UNLABELLED_DOMAIN` on the Python side. Unlabelled rows are a
+ * real, inspectable state (a fact written before the topic dimension landed, or
+ * one whose proposal was rejected), and they are exactly what a user repairing
+ * their vocabulary needs to find — so it is an option, not an absence.
+ */
+export const FACTS_DOMAIN_UNLABELLED = '__unlabelled__'
 
 /**
  * Read a row count off a `list_facts` envelope.
@@ -350,7 +386,7 @@ export class MemorySettingsController {
       setExtractionModelOverride: (override) =>
         this.scope.set('extractionModel', override),
       refreshData: () => this.refreshData(),
-      fetchFactsPage: (offset, limit) => this.fetchFactsPage(offset, limit),
+      fetchFactsPage: (offset, limit, domain) => this.fetchFactsPage(offset, limit, domain),
       fetchDomains: () => this.fetchDomains(),
       saveFact: (fact) => this.saveFact(fact),
       deleteFact: (factId) => this.deleteFact(factId),
@@ -466,10 +502,19 @@ export class MemorySettingsController {
    *
    * @param offset - Zero-based index of the first row to fetch.
    * @param limit - Rows per page (the store clamps this to 200).
+   * @param domain - Topic to restrict to; `undefined` or {@link FACTS_DOMAIN_ALL}
+   *   means no filter.
    */
-  private async fetchFactsPage(offset: number, limit: number): Promise<void> {
+  private async fetchFactsPage(offset: number, limit: number, domain?: string): Promise<void> {
     try {
-      const page = unwrap(await this.r().listFacts({ user: USER, offset, limit }))
+      const page = unwrap(await this.r().listFacts({
+        user: USER,
+        offset,
+        limit,
+        // `""` is the dropdown's "all" value, not a topic: sending it would ask
+        // the store for a topic named "", which matches nothing.
+        ...(domain === undefined || domain === FACTS_DOMAIN_ALL ? {} : { domain }),
+      }))
       this.store.set({
         ...this.store.getSnapshot(),
         data: {

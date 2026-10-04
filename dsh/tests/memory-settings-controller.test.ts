@@ -14,6 +14,8 @@ import {
   MemorySettingsController,
   FACTS_PAGE_SIZE_DEFAULT,
   FACTS_PAGE_SIZES,
+  FACTS_DOMAIN_ALL,
+  FACTS_DOMAIN_UNLABELLED,
   type MemorySettingsSection,
 } from '../src/client/memory-settings-controller.ts'
 import {
@@ -247,6 +249,89 @@ describe('MemorySettingsController', () => {
     // control that silently does not do what it says.
     expect(FACTS_PAGE_SIZES.every(size => size >= 1 && size <= 200)).toBe(true)
     expect(FACTS_PAGE_SIZES).toContain(FACTS_PAGE_SIZE_DEFAULT)
+  })
+
+  // -- the domain filter ------------------------------------------------------
+
+  it('omits the domain argument entirely when no topic is selected', async () => {
+    // `""` is the dropdown's "all" value, not a topic: sending it would ask the
+    // store for a topic named "", which matches nothing.
+    const { scope } = fakeScope(snapshot({}))
+    const { remote, listFacts } = fakeRemote()
+    const face = new MemorySettingsController(
+      scope as unknown as ConfigForm<MemorySettingsSection>, remote,
+    ).inject()
+    await face.fetchFactsPage(0, 50, FACTS_DOMAIN_ALL)
+    expect(listFacts).toHaveBeenLastCalledWith({ user: 'global', offset: 0, limit: 50 })
+    // An omitted third argument behaves the same way.
+    await face.fetchFactsPage(0, 50)
+    expect(listFacts).toHaveBeenLastCalledWith({ user: 'global', offset: 0, limit: 50 })
+  })
+
+  it('passes the selected topic through to the store', async () => {
+    const { scope } = fakeScope(snapshot({}))
+    const { remote, listFacts } = fakeRemote()
+    const face = new MemorySettingsController(
+      scope as unknown as ConfigForm<MemorySettingsSection>, remote,
+    ).inject()
+    await face.fetchFactsPage(200, 100, 'teaching/ds')
+    expect(listFacts).toHaveBeenLastCalledWith({
+      user: 'global', offset: 200, limit: 100, domain: 'teaching/ds',
+    })
+  })
+
+  it('carries the unlabelled sentinel through as a real filter', async () => {
+    // Distinct from FACTS_DOMAIN_ALL: this one asks the store the opposite
+    // question and must reach it, or the option would silently show everything.
+    const { scope } = fakeScope(snapshot({}))
+    const { remote, listFacts } = fakeRemote()
+    const face = new MemorySettingsController(
+      scope as unknown as ConfigForm<MemorySettingsSection>, remote,
+    ).inject()
+    await face.fetchFactsPage(0, 50, FACTS_DOMAIN_UNLABELLED)
+    expect(listFacts).toHaveBeenLastCalledWith({
+      user: 'global', offset: 0, limit: 50, domain: FACTS_DOMAIN_UNLABELLED,
+    })
+    expect(FACTS_DOMAIN_UNLABELLED).not.toBe(FACTS_DOMAIN_ALL)
+  })
+
+  it('takes the total from the filtered envelope, not the unfiltered store', async () => {
+    const { scope } = fakeScope(snapshot({}))
+    const { remote, listFacts } = fakeRemote()
+    listFacts.mockResolvedValue({
+      ok: true,
+      value: {
+        facts: [{ fact_id: 'f1', subject: 's', predicate: 'p', object: 'o' }],
+        total: 3,
+        domain: 'teaching',
+      },
+    } as never)
+    const face = new MemorySettingsController(
+      scope as unknown as ConfigForm<MemorySettingsSection>, remote,
+    ).inject()
+    await face.fetchFactsPage(0, 50, 'teaching')
+    // The pager must describe the filtered result: reading a stored total here
+    // would claim pages that the filter does not have.
+    const snap = face.hooks.memorySettings.getSnapshot()
+    expect(snap.data.factsTotal).toBe(3)
+  })
+
+  it('keeps the rows on screen and the reason when a filtered fetch fails', async () => {
+    const { scope } = fakeScope(snapshot({}))
+    const { remote, listFacts } = fakeRemote()
+    listFacts.mockResolvedValueOnce({
+      ok: true,
+      value: { facts: [{ fact_id: 'f1', subject: 's', predicate: 'p', object: 'o' }], total: 9 },
+    } as never)
+    const face = new MemorySettingsController(
+      scope as unknown as ConfigForm<MemorySettingsSection>, remote,
+    ).inject()
+    await face.refreshData()
+    listFacts.mockResolvedValueOnce({ ok: false, error: { message: '领域筛选失败' } } as never)
+    await expect(face.fetchFactsPage(0, 50, 'teaching')).rejects.toThrow('领域筛选失败')
+    const snap = face.hooks.memorySettings.getSnapshot()
+    expect(snap.data.facts.map(f => f.fact_id)).toEqual(['f1'])
+    expect(snap.lastError).toBe('领域筛选失败')
   })
 
   it('reads the registered domain vocabulary alongside the facts', async () => {

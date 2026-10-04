@@ -1041,7 +1041,16 @@ Rules:
 	* Deliberately does not call {@link assertReady}: this is the call the panel
 	* makes *because* something is wrong, so it has to answer while the bridge is
 	* down instead of throwing the same generic error.
-	*/async health(){const startupError=this.startupError();const payload=await this.bridge.healthDetail();return{bridgeAlive:this.bridge.alive,startupError:startupError??null,startup:payload??null};}/** Paginate the user's active facts. */async listFacts(args){this.assertReady();return this.bridge.call("list_facts",{user_id:args.user,offset:args.offset??0,limit:args.limit??50,include_retracted:args.includeRetracted??false});}/** Directly edit one active fact's SPO / type / content. */async editFact(args){this.assertReady();if(!args.fact_id)throw new Error("editFact requires fact_id");return this.bridge.call("edit_fact",{user_id:args.user,fact_id:args.fact_id,subject:args.subject,predicate:args.predicate,object:args.object,content:args.content,type:args.type});}/** Soft-retract (forget) one active fact. */async deleteFact(args){this.assertReady();if(!args.fact_id)throw new Error("deleteFact requires fact_id");return this.bridge.call("forget",{user_id:args.user,fact_id:args.fact_id});}/**
+	*/async health(){const startupError=this.startupError();const payload=await this.bridge.healthDetail();return{bridgeAlive:this.bridge.alive,startupError:startupError??null,startup:payload??null};}/**
+	* Paginate the user's active facts, optionally restricted to one topic.
+	*
+	* `domain` is a canonical topic name or path (`teaching` / `teaching/ds`) and
+	* selects that topic **and its descendants**, matching the hierarchy the
+	* vocabulary is built on. The sentinel `__unlabelled__` selects facts carrying
+	* no topic at all (see `AtomMem.UNLABELLED_DOMAIN`). `undefined` does not
+	* filter. An unknown name selects nothing — deliberately, since falling back to
+	* "no filter" would show every fact while the panel still read as a topic.
+	*/async listFacts(args){this.assertReady();return this.bridge.call("list_facts",{user_id:args.user,offset:args.offset??0,limit:args.limit??50,include_retracted:args.includeRetracted??false,...(args.domain===void 0?{}:{domain:args.domain})});}/** Directly edit one active fact's SPO / type / content. */async editFact(args){this.assertReady();if(!args.fact_id)throw new Error("editFact requires fact_id");return this.bridge.call("edit_fact",{user_id:args.user,fact_id:args.fact_id,subject:args.subject,predicate:args.predicate,object:args.object,content:args.content,type:args.type});}/** Soft-retract (forget) one active fact. */async deleteFact(args){this.assertReady();if(!args.fact_id)throw new Error("deleteFact requires fact_id");return this.bridge.call("forget",{user_id:args.user,fact_id:args.fact_id});}/**
 	* Render the user's `summary` exactly as the host injects it.
 	*
 	* The panel's "view memory" modal must show the *same text the model sees*,

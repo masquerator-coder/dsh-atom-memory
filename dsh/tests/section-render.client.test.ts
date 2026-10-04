@@ -207,8 +207,17 @@ function buildPagedFactsController(
     predicate: '是',
     object: `宾语${i + 1}`,
     content: '',
+    // Split the facts across the topics so a filter genuinely narrows the set:
+    // even-numbered facts carry the first topic, odd-numbered the second. Facts
+    // past the first two get both, so a filter is never the whole table.
+    domain_names: domains.length === 0
+      ? []
+      : [
+          ...(i % 2 === 0 ? [domains[0]!] : []),
+          ...(i % 2 === 1 && domains[1] !== undefined ? [domains[1]!] : []),
+        ],
   }))
-  const calls: Array<{ offset: number; limit: number }> = []
+  const calls: Array<{ offset: number; limit: number; domain?: string }> = []
   let section: Record<string, unknown> = {
     enabled: true, captureEnabled: true, llmExtractionEnabled: true,
     contextInjectionEnabled: true, extractionModel: undefined,
@@ -229,11 +238,17 @@ function buildPagedFactsController(
     unset: async () => {}, mutate: async () => {},
   }
   const remote = {
-    listFacts: async (args: { offset?: number; limit?: number }) => {
+    listFacts: async (args: { offset?: number; limit?: number; domain?: string }) => {
       const offset = args.offset ?? 0
       const limit = args.limit ?? 50
-      calls.push({ offset, limit })
-      return { ok: true, value: { facts: all.slice(offset, offset + limit), total } }
+      calls.push({ offset, limit, ...(args.domain === undefined ? {} : { domain: args.domain }) })
+      // Honour the topic filter the way the store does, so a selection is
+      // observable in the ROWS and not just in the recorded argument. Facts with
+      // no matching label are simply absent from the filtered result.
+      const rows = args.domain === undefined
+        ? all
+        : all.filter(f => f.domain_names.includes(args.domain!))
+      return { ok: true, value: { facts: rows.slice(offset, offset + limit), total: rows.length } }
     },
     editFact: async () => ({ ok: true, value: {} }),
     deleteFact: async () => ({ ok: true, value: {} }),
@@ -246,7 +261,11 @@ function buildPagedFactsController(
             domain_id: i + 1,
             name,
             display_name: name,
-            path: `/${name}`,
+            // Paths carry NO leading slash — that is the store's own format
+            // (`teaching/ds`), verified against `DomainStore.list_domains`. A
+            // fixture that added one would exercise a shape the store never
+            // produces.
+            path: name,
             status: 'active',
             // The first `seeded` entries stand in for the store's self-registered
             // names (git remotes, general/user).
@@ -275,6 +294,20 @@ function factRows(): string[][] {
   return Array.from(table.querySelectorAll('tbody tr')).map(tr =>
     Array.from(tr.querySelectorAll('input, textarea')).map(el => (el as HTMLInputElement).value),
   )
+}
+
+/**
+ * The facts editor's row-range read-out ("第 X-Y 条 / 共 Z 条").
+ *
+ * Identified by its own text shape rather than a class, so a change to the
+ * pager's markup does not silently make this return nothing (which would let a
+ * broken count assertion pass against `undefined`).
+ */
+function rowsCountText(): string {
+  const node = Array.from(document.querySelectorAll('.atom-memory-hint'))
+    .find(el => /^第 \d+-\d+ 条 \/ 共 \d+ 条$/u.test(el.textContent ?? ''))
+  expect(node, 'the pager row-range read-out is not rendered').toBeTruthy()
+  return node!.textContent!
 }
 
 /**
@@ -587,6 +620,200 @@ describe('MemorySettingsSection client render', () => {
     expect(screen.getByText('第 1-3 条 / 共 3 条')).toBeTruthy()
     // No page turn was requested just by opening the modal.
     expect(calls).toHaveLength(1)
+  })
+
+  // -- the domain filter ------------------------------------------------------
+
+  it('offers the registered domains plus "all" and "no domain"', async () => {
+    const { controller, calls } = buildPagedFactsController(5, ['teaching', 'programming'])
+    const { props } = bind(controller)
+    await act(async () => {
+      render(createElement(MemorySettingsSection, props))
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.click(screen.getByText('编辑记忆'))
+    })
+    await act(async () => {})
+
+    const select = screen.getByLabelText('按领域筛选') as HTMLSelectElement
+    // Sorted by displayed name, after the two fixed choices.
+    expect(Array.from(select.options).map(o => o.textContent)).toEqual([
+      '全部领域',
+      '未标注领域',
+      'programming',
+      'teaching',
+    ])
+    // The canonical name is the value (that is what `list_facts` resolves), not
+    // the rendered label.
+    expect(Array.from(select.options).map(o => o.value)).toEqual([
+      '', '__unlabelled__', 'programming', 'teaching',
+    ])
+    // Opening the modal does not filter anything.
+    expect(calls.at(-1)).toEqual({ offset: 0, limit: 50 })
+  })
+
+  it('offers the system-seeded domains too, since a fact can be filtered by them', async () => {
+    // The badge's count deliberately excludes these (they are not topics the
+    // user chose), but that is a claim about ownership — a filter is about what
+    // a fact carries, and an auto-registered topic is a valid filter.
+    const { controller } = buildPagedFactsController(5, ['github.com/o/r', 'teaching'], false, 1)
+    const { props } = bind(controller)
+    await act(async () => {
+      render(createElement(MemorySettingsSection, props))
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.click(screen.getByText('编辑记忆'))
+    })
+    await act(async () => {})
+    const select = screen.getByLabelText('按领域筛选') as HTMLSelectElement
+    expect(Array.from(select.options).map(o => o.value)).toContain('github.com/o/r')
+  })
+
+  it('filters the table to the selected domain and reports the matching count', async () => {
+    const { controller, calls } = buildPagedFactsController(5, ['teaching', 'programming'])
+    const { props } = bind(controller)
+    await act(async () => {
+      render(createElement(MemorySettingsSection, props))
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.click(screen.getByText('编辑记忆'))
+    })
+    await act(async () => {})
+    expect(factRows()).toHaveLength(5)
+
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText('按领域筛选'), { target: { value: 'teaching' } })
+    })
+    await act(async () => {})
+
+    // The filter reached the store...
+    expect(calls.at(-1)).toEqual({ offset: 0, limit: 50, domain: 'teaching' })
+    // ...and changed the ROWS, not just the request: 5 facts, even indices only.
+    expect(factRows()).toHaveLength(3)
+    expect(rowsCountText()).toBe('第 1-3 条 / 共 3 条')
+  })
+
+  it('restarts from the first page when the domain changes', async () => {
+    // Row 100 of "all topics" is not row 100 of a filtered set: keeping the page
+    // number would land the user on an arbitrary slice, or past the end.
+    const { controller, calls } = buildPagedFactsController(120, ['teaching', 'programming'])
+    const { props } = bind(controller)
+    await act(async () => {
+      render(createElement(MemorySettingsSection, props))
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.click(screen.getByText('编辑记忆'))
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.click(screen.getByText('下一页'))
+    })
+    await act(async () => {})
+    expect(calls.at(-1)).toEqual({ offset: 50, limit: 50 })
+    // 120 facts at 50/page = 3 pages, and we are on the second.
+    expect(screen.getByText('第 2/3 页')).toBeTruthy()
+
+    // `teaching` is carried by the even-indexed facts: 60 of the 120, so the
+    // filtered result is 2 pages and the page must reset to 1.
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText('按领域筛选'), { target: { value: 'teaching' } })
+    })
+    await act(async () => {})
+    expect(calls.at(-1)).toEqual({ offset: 0, limit: 50, domain: 'teaching' })
+    expect(screen.getByText('第 1/2 页')).toBeTruthy()
+    expect(rowsCountText()).toBe('第 1-50 条 / 共 60 条')
+  })
+
+  it('keeps the filter applied across a page turn', async () => {
+    const { controller, calls } = buildPagedFactsController(120, ['teaching', 'programming'])
+    const { props } = bind(controller)
+    await act(async () => {
+      render(createElement(MemorySettingsSection, props))
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.click(screen.getByText('编辑记忆'))
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText('按领域筛选'), { target: { value: 'teaching' } })
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.click(screen.getByText('下一页'))
+    })
+    await act(async () => {})
+    // A page turn must not silently drop back to the unfiltered list.
+    expect(calls.at(-1)).toEqual({ offset: 50, limit: 50, domain: 'teaching' })
+  })
+
+  it('keeps the filter applied across a page-size change', async () => {
+    const { controller, calls } = buildPagedFactsController(120, ['teaching', 'programming'])
+    const { props } = bind(controller)
+    await act(async () => {
+      render(createElement(MemorySettingsSection, props))
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.click(screen.getByText('编辑记忆'))
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText('按领域筛选'), { target: { value: 'teaching' } })
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText('每页显示'), { target: { value: '20' } })
+    })
+    await act(async () => {})
+    expect(calls.at(-1)).toEqual({ offset: 0, limit: 20, domain: 'teaching' })
+  })
+
+  it('sends the unlabelled sentinel as a real filter, not as "no filter"', async () => {
+    // The two dropdown values must not collapse into each other: "" means every
+    // fact, and the sentinel means exactly the ones with no topic.
+    const { controller, calls } = buildPagedFactsController(5, ['teaching'])
+    const { props } = bind(controller)
+    await act(async () => {
+      render(createElement(MemorySettingsSection, props))
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.click(screen.getByText('编辑记忆'))
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText('按领域筛选'), { target: { value: '__unlabelled__' } })
+    })
+    await act(async () => {})
+    expect(calls.at(-1)).toEqual({ offset: 0, limit: 50, domain: '__unlabelled__' })
+  })
+
+  it('explains the sub-domain semantics and the matching count once filtered', async () => {
+    const { controller } = buildPagedFactsController(5, ['teaching'])
+    const { props } = bind(controller)
+    await act(async () => {
+      render(createElement(MemorySettingsSection, props))
+    })
+    await act(async () => {})
+    await act(async () => {
+      fireEvent.click(screen.getByText('编辑记忆'))
+    })
+    await act(async () => {})
+    // No filter yet: the hint would read as a claim about a filter that is off.
+    expect(screen.queryByText(/包含其子领域/)).toBeNull()
+
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText('按领域筛选'), { target: { value: 'teaching' } })
+    })
+    await act(async () => {})
+    expect(screen.getByText(/包含其子领域/)).toBeTruthy()
+    // The count is the filtered total (3 of the 5 facts), not the store's.
+    expect(screen.getByText(/3 条符合/)).toBeTruthy()
   })
 
   it('saves only the rows on the page being edited, never a stale page draft', async () => {

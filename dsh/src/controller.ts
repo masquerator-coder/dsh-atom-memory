@@ -152,16 +152,34 @@ export class AtomMemoryController extends TypertRemoteService {
     }
   }
 
-  /** Paginate the user's active facts. */
+  /**
+   * Paginate the user's active facts, optionally restricted to one topic.
+   *
+   * `domain` is a canonical topic name or path (`teaching` / `teaching/ds`) and
+   * selects that topic **and its descendants**, matching the hierarchy the
+   * vocabulary is built on. The sentinel `__unlabelled__` selects facts carrying
+   * no topic at all (see `AtomMem.UNLABELLED_DOMAIN`). `undefined` does not
+   * filter. An unknown name selects nothing — deliberately, since falling back to
+   * "no filter" would show every fact while the panel still read as a topic.
+   */
   @Remote
-  async listFacts(args: { user: string; offset?: number; limit?: number; includeRetracted?: boolean }):
-  Promise<Record<string, unknown>> {
+  async listFacts(args: {
+    user: string
+    offset?: number
+    limit?: number
+    includeRetracted?: boolean
+    domain?: string
+  }): Promise<Record<string, unknown>> {
     this.assertReady()
     return this.bridge.call('list_facts', {
       user_id: args.user,
       offset: args.offset ?? 0,
       limit: args.limit ?? 50,
       include_retracted: args.includeRetracted ?? false,
+      // Only sent when the panel actually picked a topic: passing `null` would
+      // be a filter argument the Python side has to special-case, and omitting
+      // the key is what "no filter" already means there.
+      ...(args.domain === undefined ? {} : { domain: args.domain }),
     }) as Promise<Record<string, unknown>>
   }
 

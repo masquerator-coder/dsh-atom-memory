@@ -79,6 +79,138 @@ def test_list_facts_paginates(tmp_path, monkeypatch):
     _run(scenario())
 
 
+def test_list_facts_reports_each_fact_topic_labels(tmp_path, monkeypatch):
+    """A listed fact carries its topic labels, not just its SPO triple.
+
+    The settings panel's domain dropdown is built on this: without the labels on
+    the row there is nothing for it to filter by, and the panel would have to
+    fetch every fact before it could answer "which of these are about teaching".
+    """
+    mem = _make(tmp_path, monkeypatch)
+
+    async def scenario():
+        await mem.start()
+        _insert_fact(mem, "f1", "用户", "职业", "工程师", created_at=1)
+        _insert_fact(mem, "f2", "用户", "偏好", "黑咖啡", created_at=2)
+
+        # f1 is labelled, f2 is deliberately left unlabelled.
+        mem.fact_domain_set("u1", "f1", ["teaching", "programming"])
+
+        facts = {f["fact_id"]: f for f in mem.list_facts("u1")["facts"]}
+        # `domains` is ordered primary first, matching `fact_domains`' own order.
+        assert facts["f1"]["domain_names"] == ["teaching", "programming"]
+        assert [d["name"] for d in facts["f1"]["domains"]] == ["teaching", "programming"]
+        assert facts["f1"]["domains"][0]["domain_id"] > 0
+        # An unlabelled fact reports an empty list — present, not missing, so the
+        # caller can tell "no topic" from "not looked up".
+        assert facts["f2"]["domain_names"] == []
+        assert facts["f2"]["domains"] == []
+        await mem.stop()
+
+    _run(scenario())
+
+
+def test_list_facts_filters_by_domain_including_descendants(tmp_path, monkeypatch):
+    """Selecting a parent topic also selects its children.
+
+    The vocabulary is a hierarchy, so a fact filed under `teaching/ds` is about
+    teaching; a filter that missed it would show an empty page for a topic the
+    user can see has content.
+    """
+    mem = _make(tmp_path, monkeypatch)
+
+    async def scenario():
+        await mem.start()
+        _insert_fact(mem, "f_ds", "用户", "教", "数据结构", created_at=1)
+        _insert_fact(mem, "f_math", "用户", "教", "微积分", created_at=2)
+        _insert_fact(mem, "f_other", "用户", "偏好", "黑咖啡", created_at=3)
+        mem.fact_domain_set("u1", "f_ds", ["teaching/ds"])
+        mem.fact_domain_set("u1", "f_math", ["teaching/math"])
+
+        # The parent matches both children.
+        page = mem.list_facts("u1", domain="teaching")
+        assert page["total"] == 2
+        assert {f["fact_id"] for f in page["facts"]} == {"f_ds", "f_math"}
+        # The filter is echoed, so a late response cannot be rendered as the
+        # result of a different selection.
+        assert page["domain"] == "teaching"
+
+        # A leaf matches only itself.
+        leaf = mem.list_facts("u1", domain="teaching/ds")
+        assert {f["fact_id"] for f in leaf["facts"]} == {"f_ds"}
+
+        # The path form the panel renders is accepted too.
+        assert mem.list_facts("u1", domain="/teaching/ds")["total"] == 1
+
+        # No filter still returns everything.
+        assert mem.list_facts("u1")["total"] == 3
+
+        # A sibling whose name merely shares a prefix is NOT swallowed by the
+        # subtree match (`/teaching` must not match `/teaching2`).
+        mem.fact_domain_set("u1", "f_other", ["teaching2"])
+        assert mem.list_facts("u1", domain="teaching")["total"] == 2
+        assert mem.list_facts("u1", domain="teaching2")["total"] == 1
+        await mem.stop()
+
+    _run(scenario())
+
+
+def test_list_facts_domain_filter_reaches_unlabelled_and_unknown(tmp_path, monkeypatch):
+    """Both edge selections are answerable, and neither silently stops filtering."""
+    from atom_memory.api import AtomMem as _AtomMem
+
+    mem = _make(tmp_path, monkeypatch)
+
+    async def scenario():
+        await mem.start()
+        _insert_fact(mem, "f_labelled", "用户", "教", "数据结构", created_at=1)
+        _insert_fact(mem, "f_bare", "用户", "偏好", "黑咖啡", created_at=2)
+        mem.fact_domain_set("u1", "f_labelled", ["teaching"])
+
+        # "unlabelled" is a real, inspectable state: these are the rows a user
+        # fixing their vocabulary needs to find.
+        bare = mem.list_facts("u1", domain=_AtomMem.UNLABELLED_DOMAIN)
+        assert {f["fact_id"] for f in bare["facts"]} == {"f_bare"}
+
+        # An unknown name selects NOTHING. Falling back to "no filter" would show
+        # every fact while the dropdown still read as one specific topic.
+        unknown = mem.list_facts("u1", domain="never-registered")
+        assert unknown["total"] == 0
+        assert unknown["facts"] == []
+        await mem.stop()
+
+    _run(scenario())
+
+
+def test_list_facts_domain_filter_keeps_the_count_in_step_with_the_page(tmp_path, monkeypatch):
+    """`total` counts the FILTERED set, so the pager cannot claim pages that do not exist.
+
+    A filter that narrowed the rows but not the count would render "page 1/5" over
+    a one-page result — the exact shape of bug that makes a pager look broken.
+    """
+    mem = _make(tmp_path, monkeypatch)
+
+    async def scenario():
+        await mem.start()
+        for i in range(5):
+            _insert_fact(mem, f"f_keep{i}", "用户", "教", f"条目{i}", created_at=i)
+            mem.fact_domain_set("u1", f"f_keep{i}", ["teaching"])
+        for i in range(20):
+            _insert_fact(mem, f"f_drop{i}", "用户", "偏好", f"其他{i}", created_at=100 + i)
+
+        assert mem.list_facts("u1")["total"] == 25
+        filtered = mem.list_facts("u1", domain="teaching", limit=2, offset=0)
+        assert filtered["total"] == 5
+        assert len(filtered["facts"]) == 2
+        # The second page of the filtered set is still within it.
+        second = mem.list_facts("u1", domain="teaching", limit=2, offset=2)
+        assert len(second["facts"]) == 2
+        assert second["total"] == 5
+        await mem.stop()
+
+    _run(scenario())
+
+
 def test_edit_fact_updates_spo_and_vectors(tmp_path, monkeypatch):
     mem = _make(tmp_path, monkeypatch)
 

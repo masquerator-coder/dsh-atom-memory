@@ -1116,6 +1116,70 @@ class AtomMem:
 
     # -- topic surface -------------------------------------------------------------
 
+    def _add_domain_filter(
+        self,
+        user_id: str,
+        domain: Optional[str],
+        where: list,
+        params: list,
+    ) -> None:
+        """Add the topic filter to a `facts` query, in place.
+
+        Kept separate from :meth:`list_facts` so the page query and its `COUNT`
+        cannot drift apart: both callers hand in their own `where`/`params` and
+        this adds the same fragment to each, so the count is over exactly the
+        rows the page is drawn from.
+
+        The subtree match goes through the **materialised `path`** rather than
+        :meth:`~atom_memory.domain.DomainStore.children`: the path is already the
+        hierarchy's stored form and a prefix test is one round trip, whereas
+        walking children would need one query per level. Paths are stored without
+        a leading slash (``teaching/ds``), and the descendant test appends the
+        separator, so ``teaching`` matches ``teaching`` and ``teaching/ds`` but
+        not ``teaching2`` — no false sibling match is possible.
+
+        Args:
+            user_id: Owner of the vocabulary.
+            domain: The requested topic, or ``None`` for no filter.
+            where: Predicate fragments, appended to in place.
+            params: Bind parameters, appended to in place.
+        """
+        if domain is None:
+            return
+        if domain == AtomMem.UNLABELLED_DOMAIN:
+            where.append("fact_id NOT IN (SELECT fact_id FROM fact_domain)")
+            return
+        # Accept the canonical name and the path form, with or without the
+        # leading slash a UI may add when rendering a hierarchy (`teaching/ds` /
+        # `/teaching/ds`). The stored `path` itself carries no leading slash.
+        # `list_domains` is the store's own reader and resolves merges for us, so
+        # no extra lookup helper is needed (and no second cache to go stale).
+        wanted = domain[1:] if domain.startswith("/") else domain
+        row = next(
+            (
+                r
+                for r in self._domain_store().list_domains(user_id)
+                if r.path == wanted or r.canonical_name == wanted
+            ),
+            None,
+        )
+        if row is None:
+            # An unknown name selects nothing, deliberately: falling back to "no
+            # filter" would show the user every fact while the dropdown still
+            # read as a specific topic.
+            where.append("1 = 0")
+            return
+        prefix = row.path or row.canonical_name
+        where.append(
+            "fact_id IN ("
+            "SELECT fd.fact_id FROM fact_domain fd "
+            "JOIN domain d ON d.id = fd.domain_id "
+            "WHERE d.user_id = ? AND (d.path = ? OR d.path LIKE ? ESCAPE '\\')"
+            ")"
+        )
+        escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        params.extend([str(user_id or ""), prefix, f"{escaped}/%"])
+
     def _domain_store(self) -> DomainStore:
         """Return a topic store over the live connection.
 
@@ -1505,12 +1569,24 @@ class AtomMem:
 
     # --- UI-facing edit / backup / restore surface ---------------------------
 
+    #: Sentinel for ``list_facts(domain=...)`` meaning "rows carrying no topic".
+    #:
+    #: A plain string rather than ``None`` because ``None`` already means "do not
+    #: filter at all", and the panel needs to be able to ask the opposite
+    #: question — an unlabelled row is a real, inspectable state (a fact written
+    #: before the topic dimension landed, or one whose proposal was rejected), and
+    #: it is exactly the set a user fixing their vocabulary wants to find. The
+    #: value is deliberately not a legal domain name: canonical names are
+    #: lowercase path-like segments, and ``__unlabelled__`` can never be one.
+    UNLABELLED_DOMAIN = "__unlabelled__"
+
     def list_facts(
         self,
         user_id: str,
         include_retracted: bool = False,
         limit: int = 50,
         offset: int = 0,
+        domain: Optional[str] = None,
     ) -> dict:
         """Paginate a user's facts in descending recency for the settings UI.
 
@@ -1519,33 +1595,52 @@ class AtomMem:
             include_retracted: Whether to include soft-deleted rows.
             limit: Maximum rows returned.
             offset: Row offset for paging.
+            domain: Restrict to facts carrying this topic. ``None`` (the default)
+                does not filter. A canonical name or path (``teaching`` /
+                ``teaching/ds``) selects that topic **and everything below it**,
+                matching the hierarchy the vocabulary itself is built on.
+                :attr:`UNLABELLED_DOMAIN` selects facts carrying no label at all.
+                An unknown name selects nothing rather than silently listing
+                everything — a filter that quietly stops filtering is worse than
+                an empty page.
 
         Returns:
-            ``{"facts", "total", "offset", "limit"}`` where each fact carries
-            ``fact_id`` / ``subject`` / ``predicate`` / ``object`` / ``type`` /
-            ``content`` / ``confidence`` / ``importance`` /
+            ``{"facts", "total", "offset", "limit", "domain"}`` where each fact
+            carries ``fact_id`` / ``subject`` / ``predicate`` / ``object`` /
+            ``type`` / ``content`` / ``confidence`` / ``importance`` /
             ``effective_importance`` / ``reinforce_count`` / ``last_used_at`` /
-            ``status`` / ``created_at``.
+            ``status`` / ``created_at``, plus ``domains`` (the fact's topic
+            labels, primary first) and ``domain_names`` (their canonical names,
+            resolved through merges). ``total`` counts the **filtered** set, so
+            the panel's pager describes what the filter actually returns.
         """
         if self.db is None:
             raise RuntimeError("AtomMem is not started; call start() first")
         limit = max(1, min(int(limit), 200))
         offset = max(0, int(offset))
-        status_clause = "AND status = 'active'" if not include_retracted else ""
+        where = ["user_id = ?"]
+        params = [user_id]
+        if not include_retracted:
+            where.append("status = 'active'")
+        self._add_domain_filter(user_id, domain, where, params)
+        where_sql = " AND ".join(where)
         # Decay every fact's reinforcement snapshot to one shared instant, so the
         # page is internally consistent and matches what retrieval would rank.
         at = now_ms()
+        # The count runs through the SAME `where`/`params` as the page, so a
+        # filter that narrowed the rows but not the count cannot make the pager
+        # claim pages that do not exist.
         total = self.db.execute(
-            f"SELECT COUNT(*) AS n FROM facts WHERE user_id = ? {status_clause}",
-            (user_id,),
+            f"SELECT COUNT(*) AS n FROM facts WHERE {where_sql}",
+            tuple(params),
         ).fetchone()["n"]
         rows = self.db.execute(
             f"SELECT fact_id, subject, predicate, object, type, content, "
             f"confidence, importance, status, created_at, reinforce_count, "
             f"last_used_at FROM facts "
-            f"WHERE user_id = ? {status_clause} "
+            f"WHERE {where_sql} "
             f"ORDER BY created_at DESC LIMIT ? OFFSET ?",
-            (user_id, limit, offset),
+            (*params, limit, offset),
         ).fetchall()
         store = self._scope_store()
         scope_map = store.fact_scopes([r["fact_id"] for r in rows])
@@ -1555,6 +1650,21 @@ class AtomMem:
             for values in scope_map.values()
             for sid in values
         }
+        # The topic labels of this page, keyed by fact. One batched read for the
+        # whole page rather than one per row (`DomainStore.fact_domains` chunks
+        # its `IN (...)`), and read from the domain store rather than the scope
+        # store because these are the orthogonal "about what" axis. A fact with
+        # no label is present with an empty tuple, so "unlabelled" is
+        # distinguishable from "not looked up".
+        domain_store = self._domain_store()
+        domain_map = domain_store.fact_domains([r["fact_id"] for r in rows])
+        domain_names: dict = {}
+        for ids in domain_map.values():
+            for did in ids:
+                if did not in domain_names:
+                    # Read through a merge, so a fact labelled with a topic that
+                    # was later folded into another reports the name in force.
+                    domain_names[did] = domain_store.name_of(did)
         facts = [
             {
                 "fact_id": r["fact_id"],
@@ -1597,10 +1707,30 @@ class AtomMem:
                     {"key": key, "value": value}
                     for key, value in cond_map.get(r["fact_id"], ())
                 ],
+                "domains": [
+                    {
+                        "domain_id": did,
+                        "name": domain_names.get(did, ""),
+                    }
+                    for did in domain_map.get(r["fact_id"], ())
+                ],
+                "domain_names": [
+                    domain_names.get(did, "")
+                    for did in domain_map.get(r["fact_id"], ())
+                ],
             }
             for r in rows
         ]
-        return {"facts": facts, "total": total, "offset": offset, "limit": limit}
+        return {
+            "facts": facts,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            # Echoed so the panel can tell which filter produced this page: a
+            # response that arrives after the user changed the dropdown must not
+            # be rendered as the new selection's result.
+            "domain": domain,
+        }
 
     async def edit_fact(
         self,

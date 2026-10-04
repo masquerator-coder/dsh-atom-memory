@@ -108,6 +108,15 @@ window.__ModuleLoader__.load({
 			200
 		];
 		/**
+		* The dropdown value meaning "only facts carrying no topic".
+		*
+		* Mirrors `AtomMem.UNLABELLED_DOMAIN` on the Python side. Unlabelled rows are a
+		* real, inspectable state (a fact written before the topic dimension landed, or
+		* one whose proposal was rejected), and they are exactly what a user repairing
+		* their vocabulary needs to find — so it is an option, not an absence.
+		*/
+		const FACTS_DOMAIN_UNLABELLED = "__unlabelled__";
+		/**
 		* Read a row count off a `list_facts` envelope.
 		*
 		* Falls back to the page length when `total` is missing or unparsable, so a
@@ -175,7 +184,7 @@ window.__ModuleLoader__.load({
 					}),
 					setExtractionModelOverride: (override) => this.scope.set("extractionModel", override),
 					refreshData: () => this.refreshData(),
-					fetchFactsPage: (offset, limit) => this.fetchFactsPage(offset, limit),
+					fetchFactsPage: (offset, limit, domain) => this.fetchFactsPage(offset, limit, domain),
 					fetchDomains: () => this.fetchDomains(),
 					saveFact: (fact) => this.saveFact(fact),
 					deleteFact: (factId) => this.deleteFact(factId),
@@ -286,13 +295,16 @@ window.__ModuleLoader__.load({
 			*
 			* @param offset - Zero-based index of the first row to fetch.
 			* @param limit - Rows per page (the store clamps this to 200).
+			* @param domain - Topic to restrict to; `undefined` or {@link FACTS_DOMAIN_ALL}
+			*   means no filter.
 			*/
-			async fetchFactsPage(offset, limit) {
+			async fetchFactsPage(offset, limit, domain) {
 				try {
 					const page = unwrap(await this.r().listFacts({
 						user: USER,
 						offset,
-						limit
+						limit,
+						...domain === void 0 || domain === "" ? {} : { domain }
 					}));
 					this.store.set({
 						...this.store.getSnapshot(),
@@ -596,6 +608,10 @@ window.__ModuleLoader__.load({
 				factsPageNext: "下一页",
 				factsPageIndicator: "第 {page}/{pages} 页",
 				factsPageLoadError: "第 {page} 页加载失败：{message}",
+				factsDomainLabel: "按领域筛选",
+				factsDomainAll: "全部领域",
+				factsDomainUnlabelled: "未标注领域",
+				factsDomainHint: "选中的领域包含其子领域（如 teaching 会一并显示 teaching/ds）；共 {total} 条符合。",
 				memorySummaryBadge: "{domains} 个领域 · 共 {total} 条",
 				memorySummaryBadgeNoDomains: "共 {total} 条",
 				memoryDomainsTitle: "你建立的领域（{count} 个）",
@@ -717,6 +733,10 @@ window.__ModuleLoader__.load({
 				factsPageNext: "Next",
 				factsPageIndicator: "Page {page}/{pages}",
 				factsPageLoadError: "Failed to load page {page}: {message}",
+				factsDomainLabel: "Filter by domain",
+				factsDomainAll: "All domains",
+				factsDomainUnlabelled: "No domain",
+				factsDomainHint: "A selected domain includes its sub-domains (e.g. teaching also shows teaching/ds); {total} matching.",
 				memorySummaryBadge: "{domains} domains · {total} total",
 				memorySummaryBadgeNoDomains: "{total} total",
 				memoryDomainsTitle: "Domains you created ({count})",
@@ -986,6 +1006,22 @@ window.__ModuleLoader__.load({
 		/** Strip the client-only render identity before handing drafts to `onSave`. */
 		function withoutUid(rows) {
 			return rows.map(({ uid: _uid, ...rest }) => rest);
+		}
+		/**
+		* The text shown for one topic in the filter dropdown.
+		*
+		* `display_name` is the human name and wins where it says something more than
+		* the canonical one; `path` is the materialised hierarchy label, which is what
+		* makes a nested topic readable (`teaching/ds` rather than a bare `ds`); `name`
+		* is the canonical fallback. A display name that merely repeats the path would
+		* only add width, so it is not preferred over it. The **value** stays `name`
+		* (the canonical form) because that is what `list_facts` resolves.
+		*/
+		function domainLabel(d) {
+			const path = d.path || d.name;
+			const display = d.display_name;
+			if (display && display !== d.name && display !== path) return `${display} (${path})`;
+			return path;
 		}
 		/**
 		* A text field that owns its draft while the user types and commits it on blur
@@ -1478,7 +1514,8 @@ window.__ModuleLoader__.load({
 						t,
 						initial: facts,
 						total: factsTotal,
-						onFetchPage: (offset, limit) => props.fetchFactsPage(offset, limit),
+						domains,
+						onFetchPage: (offset, limit, domain) => props.fetchFactsPage(offset, limit, domain),
 						onSave: (rows) => props.saveAllFacts(rows),
 						onClose: () => setModal(void 0)
 					}) : null,
@@ -1565,7 +1602,7 @@ window.__ModuleLoader__.load({
 		* since navigated away from and no longer sees.
 		*/
 		function FactsEditorModal(props) {
-			const { t, initial, total, onFetchPage, onSave, onClose } = props;
+			const { t, initial, total, domains, onFetchPage, onSave, onClose } = props;
 			/** Build the editable drafts for one fetched page. */
 			const draftsFor = (page) => page.map((f) => ({
 				uid: nextDraftUid(),
@@ -1586,6 +1623,22 @@ window.__ModuleLoader__.load({
 			const [paging, setPaging] = (0, react.useState)(false);
 			const [pageError, setPageError] = (0, react.useState)();
 			/**
+			* The topic the table is filtered to; `FACTS_DOMAIN_ALL` is "no filter".
+			*
+			* Held here rather than read from the store so the dropdown responds to the
+			* click immediately, while the rows it requests arrive asynchronously.
+			*/
+			const [domain, setDomain] = (0, react.useState)("");
+			/**
+			* The rows currently displayed came from this topic filter.
+			*
+			* Distinct from `domain`: an in-flight fetch means the dropdown already reads
+			* as the new topic while the table still shows the old topic's rows. Only
+			* `loadPage`'s success path moves this forward, so the two can never disagree
+			* about what is on screen.
+			*/
+			const [loadedDomain, setLoadedDomain] = (0, react.useState)("");
+			/**
 			* The page the table is actually showing, derived from what the store handed
 			* us rather than assumed from `page`.
 			*
@@ -1597,12 +1650,21 @@ window.__ModuleLoader__.load({
 			const pageCount = Math.max(1, Math.ceil(total / pageSize));
 			const from = total === 0 ? 0 : Math.min(page * pageSize + 1, total);
 			const to = total === 0 ? 0 : Math.min((page + 1) * pageSize, total);
-			/** Fetch `nextPage` and re-seed the drafts from what came back. */
-			const loadPage = (nextPage, size) => {
+			/**
+			* Fetch `nextPage` under `nextDomain` and re-seed the drafts from what came back.
+			*
+			* The filter is a parameter rather than read from `domain` state, because a
+			* dropdown change and the resulting fetch happen in the same tick: reading the
+			* state here would still see the previous value. `loadedDomain` is committed
+			* only on success, alongside the page number, so the rows on screen are always
+			* the ones that topic produced.
+			*/
+			const loadPage = (nextPage, size, nextDomain = domain) => {
 				setPaging(true);
 				setPageError(void 0);
-				onFetchPage(nextPage * size, size).then(() => {
+				onFetchPage(nextPage * size, size, nextDomain).then(() => {
 					setPage(nextPage);
+					setLoadedDomain(nextDomain);
 				}).catch((err) => {
 					setPageError(err?.message ?? String(err));
 				}).finally(() => {
@@ -1617,11 +1679,22 @@ window.__ModuleLoader__.load({
 				setPageSize(size);
 				loadPage(0, size);
 			};
+			/**
+			* Switch the topic filter and go back to the first page.
+			*
+			* The offset has to reset: row 100 of "all topics" is not row 100 of
+			* "teaching", so keeping the page number would land the user on an arbitrary
+			* slice of the new result — or past its end entirely.
+			*/
+			const changeDomain = (nextDomain) => {
+				setDomain(nextDomain);
+				loadPage(0, pageSize, nextDomain);
+			};
 			(0, react.useEffect)(() => {
 				setRows(draftsFor(initial));
 			}, [initial]);
 			(0, react.useEffect)(() => {
-				if (page > pageCount - 1) loadPage(pageCount - 1, pageSize);
+				if (page > pageCount - 1) loadPage(pageCount - 1, pageSize, loadedDomain);
 			}, [pageCount, page]);
 			const setRow = (index, patch) => setRows((prev) => prev.map((r, i) => i === index ? {
 				...r,
@@ -1678,6 +1751,32 @@ window.__ModuleLoader__.load({
 								className: css.pagerGroup,
 								children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 									className: css.hint,
+									children: t("factsDomainLabel")
+								}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("select", {
+									value: domain,
+									disabled: paging || saving,
+									"aria-label": t("factsDomainLabel"),
+									onChange: (e) => changeDomain(e.currentTarget.value),
+									children: [
+										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("option", {
+											value: "",
+											children: t("factsDomainAll")
+										}),
+										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("option", {
+											value: FACTS_DOMAIN_UNLABELLED,
+											children: t("factsDomainUnlabelled")
+										}),
+										[...domains].sort((a, b) => domainLabel(a).localeCompare(domainLabel(b))).map((d) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)("option", {
+											value: d.name,
+											children: domainLabel(d)
+										}, d.domain_id))
+									]
+								})]
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
+								className: css.pagerGroup,
+								children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+									className: css.hint,
 									children: t("factsPageSizeLabel")
 								}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("select", {
 									value: pageSize,
@@ -1724,6 +1823,10 @@ window.__ModuleLoader__.load({
 							page: String(page + 1),
 							message: pageError
 						})
+					}) : null,
+					loadedDomain !== "" ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+						className: css.hint,
+						children: t("factsDomainHint", { total: String(total) })
 					}) : null,
 					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("table", {
 						className: css.editor,

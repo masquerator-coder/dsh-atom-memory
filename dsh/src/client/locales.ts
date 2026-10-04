@@ -115,6 +115,11 @@ const zh = {
   factsPageNext: '下一页',
   factsPageIndicator: '第 {page}/{pages} 页',
   factsPageLoadError: '第 {page} 页加载失败：{message}',
+  // 5b-2) the domain filter above the facts table.
+  factsDomainLabel: '按领域筛选',
+  factsDomainAll: '全部领域',
+  factsDomainUnlabelled: '未标注领域',
+  factsDomainHint: '选中的领域包含其子领域（如 teaching 会一并显示 teaching/ds）；共 {total} 条符合。',
   // 5c) the memory summary badge beside 编辑记忆: "N 个领域 · 共 X 条".
   // `domains` is the registered topic vocabulary, NOT the number of topics that
   // currently hold facts — `list_facts` carries no per-fact domain labels, so a
@@ -250,6 +255,10 @@ const en: Record<keyof typeof zh, string> = {
   factsPageNext: 'Next',
   factsPageIndicator: 'Page {page}/{pages}',
   factsPageLoadError: 'Failed to load page {page}: {message}',
+  factsDomainLabel: 'Filter by domain',
+  factsDomainAll: 'All domains',
+  factsDomainUnlabelled: 'No domain',
+  factsDomainHint: 'A selected domain includes its sub-domains (e.g. teaching also shows teaching/ds); {total} matching.',
   memorySummaryBadge: '{domains} domains · {total} total',
   memorySummaryBadgeNoDomains: '{total} total',
   memoryDomainsTitle: 'Domains you created ({count})',

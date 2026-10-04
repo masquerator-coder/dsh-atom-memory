@@ -78,7 +78,7 @@ import type {
   FactEditRow, MemorySettingsFace, MemorySettingsState, ProfileEditRow,
   ProfileSuggestion, ProfileSuggestionResult,
 } from './memory-settings-controller.ts'
-import { FACTS_PAGE_SIZE_DEFAULT, FACTS_PAGE_SIZES } from './memory-settings-controller.ts'
+import { FACTS_PAGE_SIZE_DEFAULT, FACTS_PAGE_SIZES, FACTS_DOMAIN_ALL, FACTS_DOMAIN_UNLABELLED } from './memory-settings-controller.ts'
 
 /** Locale key of each gear shown in the panel, smallest gear first. */
 const PRESET_LABEL_KEYS: Record<(typeof INJECTED_SUMMARY_TOKEN_PRESETS)[number], MemorySettingsLocaleKey> = {
@@ -181,6 +181,27 @@ interface ProfileDraft extends ProfileEditRow {
 /** Strip the client-only render identity before handing drafts to `onSave`. */
 function withoutUid<T extends { uid: number }>(rows: T[]): Omit<T, 'uid'>[] {
   return rows.map(({ uid: _uid, ...rest }) => rest)
+}
+
+/**
+ * The text shown for one topic in the filter dropdown.
+ *
+ * `display_name` is the human name and wins where it says something more than
+ * the canonical one; `path` is the materialised hierarchy label, which is what
+ * makes a nested topic readable (`teaching/ds` rather than a bare `ds`); `name`
+ * is the canonical fallback. A display name that merely repeats the path would
+ * only add width, so it is not preferred over it. The **value** stays `name`
+ * (the canonical form) because that is what `list_facts` resolves.
+ */
+function domainLabel(d: {
+  name: string
+  display_name?: string
+  path?: string
+}): string {
+  const path = d.path || d.name
+  const display = d.display_name
+  if (display && display !== d.name && display !== path) return `${display} (${path})`
+  return path
 }
 
 /**
@@ -688,7 +709,8 @@ export function MemorySettingsSection(props: MemorySettingsSectionProps) {
           t={t}
           initial={facts}
           total={factsTotal}
-          onFetchPage={(offset, limit) => props.fetchFactsPage(offset, limit)}
+          domains={domains}
+          onFetchPage={(offset, limit, domain) => props.fetchFactsPage(offset, limit, domain)}
           onSave={(rows) => props.saveAllFacts(rows)}
           onClose={() => setModal(undefined)}
         />
@@ -787,12 +809,22 @@ function FactsEditorModal(props: {
   initial: MemorySettingsState['data']['facts']
   /** Total active facts in the store (not `initial.length`, which is one page). */
   total: number
+  /**
+   * The registered topic vocabulary, for the filter dropdown.
+   *
+   * Every registered topic is offered — including the `system_seeded` ones the
+   * badge excludes from its count. That exclusion is about what a *count* claims
+   * the user owns; here the question is what a fact can be filtered by, and a
+   * git-remote or `general` label is a perfectly good filter even though the
+   * user never chose it.
+   */
+  domains: NonNullable<MemorySettingsState['data']['domains']>
   /** Load one page from the store; rejects if the call fails. */
-  onFetchPage: (offset: number, limit: number) => Promise<void>
+  onFetchPage: (offset: number, limit: number, domain?: string) => Promise<void>
   onSave: (rows: FactEditRow[]) => void
   onClose: () => void
 }) {
-  const { t, initial, total, onFetchPage, onSave, onClose } = props
+  const { t, initial, total, domains, onFetchPage, onSave, onClose } = props
 
   /** Build the editable drafts for one fetched page. */
   const draftsFor = (page: MemorySettingsState['data']['facts']): FactsDraft[] =>
@@ -814,6 +846,24 @@ function FactsEditorModal(props: {
   const [pageError, setPageError] = useState<string>()
 
   /**
+   * The topic the table is filtered to; `FACTS_DOMAIN_ALL` is "no filter".
+   *
+   * Held here rather than read from the store so the dropdown responds to the
+   * click immediately, while the rows it requests arrive asynchronously.
+   */
+  const [domain, setDomain] = useState<string>(FACTS_DOMAIN_ALL)
+
+  /**
+   * The rows currently displayed came from this topic filter.
+   *
+   * Distinct from `domain`: an in-flight fetch means the dropdown already reads
+   * as the new topic while the table still shows the old topic's rows. Only
+   * `loadPage`'s success path moves this forward, so the two can never disagree
+   * about what is on screen.
+   */
+  const [loadedDomain, setLoadedDomain] = useState<string>(FACTS_DOMAIN_ALL)
+
+  /**
    * The page the table is actually showing, derived from what the store handed
    * us rather than assumed from `page`.
    *
@@ -826,20 +876,30 @@ function FactsEditorModal(props: {
   const from = total === 0 ? 0 : Math.min(page * pageSize + 1, total)
   const to = total === 0 ? 0 : Math.min((page + 1) * pageSize, total)
 
-  /** Fetch `nextPage` and re-seed the drafts from what came back. */
-  const loadPage = (nextPage: number, size: number) => {
+  /**
+   * Fetch `nextPage` under `nextDomain` and re-seed the drafts from what came back.
+   *
+   * The filter is a parameter rather than read from `domain` state, because a
+   * dropdown change and the resulting fetch happen in the same tick: reading the
+   * state here would still see the previous value. `loadedDomain` is committed
+   * only on success, alongside the page number, so the rows on screen are always
+   * the ones that topic produced.
+   */
+  const loadPage = (nextPage: number, size: number, nextDomain: string = domain) => {
     setPaging(true)
     setPageError(undefined)
-    void onFetchPage(nextPage * size, size)
+    void onFetchPage(nextPage * size, size, nextDomain)
       .then(() => {
         // The store has published the new page; committing the page number here
         // (rather than before the await) keeps `page` and the rows on screen
         // from disagreeing while the fetch is in flight.
         setPage(nextPage)
+        setLoadedDomain(nextDomain)
       })
       .catch((err: unknown) => {
         // The failed page never lands, so keep showing the page that is there
-        // and say why instead of blanking the table.
+        // and say why instead of blanking the table. `loadedDomain` deliberately
+        // stays put too: it still describes the rows on screen.
         setPageError((err as Error)?.message ?? String(err))
       })
       .finally(() => { setPaging(false) })
@@ -857,6 +917,18 @@ function FactsEditorModal(props: {
     loadPage(0, size)
   }
 
+  /**
+   * Switch the topic filter and go back to the first page.
+   *
+   * The offset has to reset: row 100 of "all topics" is not row 100 of
+   * "teaching", so keeping the page number would land the user on an arbitrary
+   * slice of the new result — or past its end entirely.
+   */
+  const changeDomain = (nextDomain: string) => {
+    setDomain(nextDomain)
+    loadPage(0, pageSize, nextDomain)
+  }
+
   // Adopt rows the store published for the page we are on.
   //
   // `initial` is a fresh array on every store publish (including the refresh our
@@ -869,9 +941,10 @@ function FactsEditorModal(props: {
   }, [initial])
 
   // A save can delete rows on the last page and shrink `total` past the page we
-  // are standing on; walk back until the page exists again.
+  // are standing on; walk back until the page exists again. `loadedDomain` (not
+  // `domain`) drives the refetch: the rows being counted are that topic's.
   useEffect(() => {
-    if (page > pageCount - 1) loadPage(pageCount - 1, pageSize)
+    if (page > pageCount - 1) loadPage(pageCount - 1, pageSize, loadedDomain)
   }, [pageCount, page])
 
   const setRow = (index: number, patch: Partial<FactsDraft>) =>
@@ -913,6 +986,26 @@ function FactsEditorModal(props: {
           {t('factsPageRange', { from: String(from), to: String(to), total: String(total) })}
         </span>
         <span className={css.pagerSpacer} />
+        {/* The topic filter. Sorted by displayed name so the list is scannable
+            rather than following the store's path order, which is only
+            meaningful when the hierarchy is already known. */}
+        <label className={css.pagerGroup}>
+          <span className={css.hint}>{t('factsDomainLabel')}</span>
+          <select
+            value={domain}
+            disabled={paging || saving}
+            aria-label={t('factsDomainLabel')}
+            onChange={(e) => changeDomain(e.currentTarget.value)}
+          >
+            <option value={FACTS_DOMAIN_ALL}>{t('factsDomainAll')}</option>
+            <option value={FACTS_DOMAIN_UNLABELLED}>{t('factsDomainUnlabelled')}</option>
+            {[...domains]
+              .sort((a, b) => domainLabel(a).localeCompare(domainLabel(b)))
+              .map(d => (
+                <option key={d.domain_id} value={d.name}>{domainLabel(d)}</option>
+              ))}
+          </select>
+        </label>
         <label className={css.pagerGroup}>
           <span className={css.hint}>{t('factsPageSizeLabel')}</span>
           <select
@@ -954,6 +1047,12 @@ function FactsEditorModal(props: {
               {t('factsPageLoadError', { page: String(page + 1), message: pageError })}
             </div>
           )
+        : null}
+
+      {/* Only shown when a filter is actually on: the count below reads as "how
+          many match" and would be misleading next to an unfiltered list. */}
+      {loadedDomain !== FACTS_DOMAIN_ALL
+        ? <div className={css.hint}>{t('factsDomainHint', { total: String(total) })}</div>
         : null}
 
       <table className={css.editor}>
