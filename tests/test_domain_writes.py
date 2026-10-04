@@ -408,6 +408,49 @@ def test_domain_bridges_and_the_registration_queue(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_promoting_is_idempotent_and_says_whether_it_created(tmp_path, monkeypatch):
+    """Re-approving must clear the queue without inventing a second row.
+
+    The queue is the only place that knows a proposal, so an approval that
+    fails on a retry would strand it. ``already_registered`` is what lets a
+    caller — including the automatic promoter — report which of the two
+    happened instead of claiming a creation that never occurred.
+    """
+    mem = _mem(tmp_path, monkeypatch)
+
+    async def scenario():
+        await mem.start()
+        try:
+            mem._domain_store().record_signal("u", "teaching")
+
+            first = mem.domain_signal_promote("u", "teaching")
+            assert first["already_registered"] is False
+            assert mem.domain_unresolved("u") == []
+
+            # A second approval of the same name: same row, flagged as pre-existing.
+            mem._domain_store().record_signal("u", "teaching")
+            again = mem.domain_signal_promote("u", "teaching")
+            assert again["domain_id"] == first["domain_id"]
+            assert again["already_registered"] is True
+            assert mem.domain_unresolved("u") == []
+
+            # The vocabulary holds exactly one row for it.
+            names = [d["name"] for d in mem.domain_list("u")]
+            assert names.count("teaching") == 1
+
+            # A name that cannot be stored stays a hard error rather than a
+            # silent no-op: local paths are the common source of these (they
+            # contain a colon), and quietly accepting one would lose the fact
+            # that the queue row was never resolved.
+            mem._domain_store().record_signal("u", "hobby")
+            with pytest.raises(ValueError):
+                mem.domain_signal_promote("u", "c:/users/x")
+        finally:
+            await mem.stop()
+
+    asyncio.run(scenario())
+
+
 class _StubMem:
     """Records the calls the RPC layer makes, and answers like the real one."""
 

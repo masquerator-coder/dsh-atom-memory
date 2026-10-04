@@ -55,6 +55,15 @@ export interface LiveRuntime {
    * to the deterministic overview — so it is a cost knob, not a feature kill.
    */
   overviewEnabled: boolean
+  /**
+   * Whether the out-of-band topic-queue promoter runs.
+   *
+   * The second switch that spends model calls without being asked, so it is
+   * separate from {@link overviewEnabled} — a user may well want one and not the
+   * other. Turning it off leaves the queue intact: proposals accumulate and can
+   * be approved by hand, which is what happened before this existed.
+   */
+  autoDomainPromote: boolean
   /** Manual LLM extraction model override; empty provider+model = follow dsh default. */
   extractionModel?: ExtractionModelOverride
 }
@@ -72,6 +81,7 @@ export function createRuntime(seed: LiveRuntimeSeed): LiveRuntime {
     contextInjectionEnabled: seed.contextInjectionEnabled ?? true,
     injectedSummaryTokens: clampInjectedSummaryTokens(seed.injectedSummaryTokens),
     overviewEnabled: seed.overviewEnabled ?? true,
+    autoDomainPromote: seed.autoDomainPromote ?? true,
     extractionModel: seed.extractionModel,
   }
 }

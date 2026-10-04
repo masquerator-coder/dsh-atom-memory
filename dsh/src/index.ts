@@ -49,6 +49,7 @@ import { registerMemoryContext } from './context.ts'
 import { registerCapture } from './capture.ts'
 import { buildLlmCompleter, buildLlmExtractor, type ExtractFn } from './llm-extractor.ts'
 import { createOverviewRefresher, OVERVIEW_COMPLETION_TOKENS } from './overview.ts'
+import { createDomainPromoter, DOMAIN_PROMOTION_TOKENS } from './domain-promotion.ts'
 import { checkPythonSide, type PreflightResult } from './preflight.ts'
 import {
   scopeContextForCwd,
@@ -174,6 +175,7 @@ function seedRuntime(config: ConfigShape): LiveRuntime {
     llmExtractionEnabled: config.llmExtractionEnabled.get() !== false,
     contextInjectionEnabled: config.contextInjectionEnabled.get() !== false,
     overviewEnabled: config.overviewEnabled.get() !== false,
+    autoDomainPromote: config.autoDomainPromote.get() !== false,
     injectedSummaryTokens: config.injectedSummaryTokens.get(),
     extractionModel: config.extractionModel.get(),
   })
@@ -199,6 +201,7 @@ function liveNow(config: ConfigShape): LiveRuntime {
     llmExtractionEnabled: config.llmExtractionEnabled.get() !== false,
     contextInjectionEnabled: config.contextInjectionEnabled.get() !== false,
     overviewEnabled: config.overviewEnabled.get() !== false,
+    autoDomainPromote: config.autoDomainPromote.get() !== false,
     injectedSummaryTokens: config.injectedSummaryTokens.get(),
     extractionModel: config.extractionModel.get(),
   })
@@ -398,6 +401,14 @@ export function apply(ctx: Context, config: ConfigShape): void {
     modelOverride: () => runtime.get().extractionModel,
     label: 'overview synthesis',
   })
+  // Approving the topic queue is the same "decide something about memory" job
+  // over a different input, so it shares the extraction model rather than making
+  // the user configure a third one.
+  const synthesizeDomainPromotion = buildLlmCompleter(ctx, {
+    maxTokens: DOMAIN_PROMOTION_TOKENS,
+    modelOverride: () => runtime.get().extractionModel,
+    label: 'topic promotion',
+  })
   const overview = createOverviewRefresher({
     bridge,
     completer: () => synthesizeOverview,
@@ -410,6 +421,27 @@ export function apply(ctx: Context, config: ConfigShape): void {
     log: (message) => ctx.logger(message),
   })
   ctx.effect(() => () => overview.dispose())
+
+  // Topic-queue promotion runs out of band for the same reason the overview
+  // does: it is triggered by a write and executes after a quiet window, never
+  // while a prompt is being frozen. It shares the extraction model, and — unlike
+  // extraction — is not gated on `llmExtractionEnabled`, because that switch is
+  // about automatic capture while this one resolves proposals capture already
+  // queued. Leaving the two tied would strand the queue exactly when a user
+  // turns capture off.
+  const domainPromoter = createDomainPromoter({
+    bridge,
+    completer: () => synthesizeDomainPromotion,
+    userScope: FALLBACK_SCOPE,
+    enabled: () => runtime.get().autoDomainPromote !== false,
+    isReady: () => state.value,
+    idleMs: (config.domainPromoteIdleSeconds ?? 60) * 1000,
+    minIntervalMs: (config.domainPromoteIntervalMinutes ?? 30) * 60_000,
+    threshold: config.domainPromoteThreshold ?? 3,
+    maxPerRun: config.domainPromoteMaxPerRun ?? 10,
+    log: (message) => ctx.logger(message),
+  })
+  ctx.effect(() => () => domainPromoter.dispose())
 
   // The panel's data operations (features 3-5) are served to the browser over
   // the Remote gateway; registration is reversible with the controller. The
@@ -524,7 +556,12 @@ export function apply(ctx: Context, config: ConfigShape): void {
       // Every write pushes the overview's refresh deadline out, so a working
       // session costs at most one synthesis per idle window instead of one per
       // message. Not awaited and not erroring: see `CaptureDeps.afterPersist`.
-      afterPersist: () => overview.noteActivity(),
+      // The same write is also what queues topic proposals, so it notes activity
+      // for the promoter too — also detached, also never awaited.
+      afterPersist: () => {
+        overview.noteActivity()
+        domainPromoter.noteActivity()
+      },
     },
     {
       // A getter: the panel's switch stops capture immediately rather than at

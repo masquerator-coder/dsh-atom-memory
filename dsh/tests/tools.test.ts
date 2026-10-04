@@ -502,6 +502,70 @@ describe('memory_overview tool', () => {
   })
 })
 
+describe('memory_domains queue actions', () => {
+  function setupDomains() {
+    const { bridge, registered } = setup()
+    return { bridge, tool: registered.find(d => d.name === 'memory_domains')! }
+  }
+
+  it('signal_promote forwards the name and renders the registration', async () => {
+    const { bridge, tool } = setupDomains()
+    bridge.call.mockResolvedValue({
+      domain_id: 7, name: 'teaching', path: 'teaching', already_registered: false,
+    })
+
+    const result = (await tool.execute(
+      { action: 'signal_promote', name: 'teaching' },
+      execWithSession('s1'),
+    )) as any
+
+    const [method, params] = bridge.call.mock.calls.at(-1) as [string, Record<string, unknown>]
+    expect(method).toBe('domain_signal_promote')
+    expect(params.name).toBe('teaching')
+    expect(params.user_id).toBe('global')
+
+    const text = (tool.output!.render!({ action: 'signal_promote' }, result) as Array<{ text: string }>)[0]!.text
+    expect(text).toContain('已注册主题')
+    expect(text).toContain('teaching')
+  })
+
+  it('signal_promote reports a pre-existing topic as already registered', async () => {
+    const { bridge, tool } = setupDomains()
+    bridge.call.mockResolvedValue({
+      domain_id: 7, name: 'teaching', path: 'teaching', already_registered: true,
+    })
+
+    const result = (await tool.execute(
+      { action: 'signal_promote', name: 'teaching' },
+      execWithSession('s1'),
+    )) as any
+    const text = (tool.output!.render!({ action: 'signal_promote' }, result) as Array<{ text: string }>)[0]!.text
+
+    // Not an error: the queue row was still cleared, so it must not read as a
+    // failure the caller should react to.
+    expect(text).toContain('已存在')
+  })
+
+  it('signal_promote requires a name', async () => {
+    const { bridge, tool } = setupDomains()
+
+    await expect(tool.execute({ action: 'signal_promote' }, execWithSession('s1')))
+      .rejects.toThrow(/requires name/)
+    expect(bridge.call).not.toHaveBeenCalled()
+  })
+
+  it('advertises signal_promote in the action list, so it is reachable at all', async () => {
+    const { tool } = setupDomains()
+    const described = String((tool.parameters as any).properties.action.description)
+
+    // The original defect was an action that existed in Python and the RPC name
+    // table but appeared in no action list — unreachable, so the queue never
+    // drained. This pins the advertisement, not just the implementation.
+    expect(described).toContain('signal_promote')
+    expect(String(tool.description)).toContain('signal_promote')
+  })
+})
+
 describe('capacity and detection visibility', () => {
   it('says the capacity policy is off instead of showing a silent zero', () => {
     const text = renderStats({

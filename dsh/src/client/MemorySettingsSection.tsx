@@ -465,6 +465,25 @@ export function MemorySettingsSection(props: MemorySettingsSectionProps) {
         </div>
       </fieldset>
 
+      {/* 2c) auto-approving the pending topic queue */}
+      <fieldset className={css.block} disabled={!state.available}>
+        <legend>{t('promoteHeader')}</legend>
+        <label className={css.switchRow}>
+          <span className={css.switch}>
+            <input
+              type="checkbox"
+              className={css.switchInput}
+              checked={state.section.autoDomainPromote}
+              onChange={(e) => { void props.setAutoDomainPromote(e.currentTarget.checked) }}
+            />
+            <span className={css.switchTrack} aria-hidden="true">
+              <span className={css.switchThumb} />
+            </span>
+          </span>
+          <span>{t('promoteDesc')}</span>
+        </label>
+      </fieldset>
+
       {/* 3) extraction model */}
       <fieldset className={css.block} disabled={!state.available}>
         <legend>{t('modelHeader')}</legend>

@@ -656,6 +656,23 @@ export function renderDomainResult(action: string, value: unknown): string {
       )
       return ['待注册的主题建议（达到一定次数后由用户决定是否注册）：', ...lines].join('\n')
     }
+    case 'signal_promote': {
+      const v = value as {
+        name?: string
+        path?: string
+        display_name?: string
+        domain_id?: number
+        already_registered?: boolean
+      }
+      const label = v.path ?? v.name ?? '?'
+      // Re-promoting an existing topic is a no-op, not a failure: the queue row
+      // is still cleared, so it is reported as done rather than as an error.
+      if (v.already_registered) {
+        return `主题 "${label}" 已存在（[${v.domain_id ?? '?'}]），待注册建议已清掉。`
+      }
+      return `已注册主题 [${v.domain_id ?? '?'}] ${label}`
+        + `${v.display_name && v.display_name !== v.name ? `（${v.display_name}）` : ''}。`
+    }
     case 'fact_set':
     case 'fact_get': {
       const v = value as {
@@ -1445,7 +1462,8 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
       + '词表是注册制：抽取建议了未注册的主题时，会归入最近的已注册祖先并记入待注册队列，不会自动新建。'
       + 'action=list 列出词表；resolve 说明当前会话解析到哪些主题、某个主题名会归到哪里；create 注册新主题；'
       + 'rename / merge / archive 维护词表；bridge_add 记录跨主题关联（只影响排序权重，不改变过滤）；'
-      + 'unresolved 列出待注册队列；signal_reject 忽略某个待注册建议；'
+      + 'unresolved 列出待注册队列；signal_promote 注册队列里的某个建议（批准）；'
+      + 'signal_reject 忽略某个待注册建议；'
       + 'fact_set / fact_get 读取或改写某条事实的主题（改写是权威的：未列出的主题会被移除）。',
     parameters: {
       action: {
@@ -1453,9 +1471,9 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
         required: true,
         description:
           '要执行的操作：list / resolve / create / rename / merge / archive / bridge_add / '
-          + 'unresolved / signal_reject / fact_set / fact_get',
+          + 'unresolved / signal_promote / signal_reject / fact_set / fact_get',
       },
-      name: { type: 'string', description: 'create / rename / signal_reject 必填：主题规范名（小写 ASCII，斜杠分隔，如 teaching/ds）' },
+      name: { type: 'string', description: 'create / rename / signal_promote / signal_reject 必填：主题规范名（小写 ASCII，斜杠分隔，如 teaching/ds）' },
       displayName: { type: 'string', description: 'create 可选：给人看的中文显示名' },
       labels: {
         type: 'array',
@@ -1534,6 +1552,14 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
         }
         case 'unresolved':
           return { signals: (await call<any>('domain_unresolved', { user_id: uid })) ?? [] }
+        case 'signal_promote': {
+          if (!args.name) throw new Error('memory_domains signal_promote requires name')
+          return await call<any>('domain_signal_promote', {
+            user_id: uid,
+            name: args.name,
+            display_name: args.displayName ?? '',
+          })
+        }
         case 'signal_reject': {
           if (!args.name) throw new Error('memory_domains signal_reject requires name')
           return await call<any>('domain_signal_reject', { user_id: uid, name: args.name })
@@ -1555,7 +1581,7 @@ export function registerMemoryTools(deps: ToolDeps): (() => void)[] {
           throw new Error(
             `memory_domains: unknown action ${String(args.action)}`
             + '（可用：list / resolve / create / rename / merge / archive / bridge_add / '
-            + 'unresolved / signal_reject / fact_set / fact_get）',
+            + 'unresolved / signal_promote / signal_reject / fact_set / fact_get）',
           )
       }
     },

@@ -39,6 +39,15 @@ export interface MemorySettingsSection {
    * injection intact (the snapshot falls back to the deterministic overview).
    */
   overviewEnabled: boolean
+  /**
+   * Whether the out-of-band topic-queue promoter runs.
+   *
+   * The second switch here that spends model calls without being asked. Kept
+   * separate from {@link overviewEnabled} because the two do unrelated jobs, and
+   * separate from `llmExtractionEnabled` because that one governs capture: the
+   * queue is what capture already produced, so tying them would strand it.
+   */
+  autoDomainPromote: boolean
   extractionModel?: {
     provider?: string
     model?: string
@@ -140,6 +149,8 @@ export interface MemorySettingsFace {
   setInjectedSummaryTokens: (tokens: number) => Promise<boolean>
   /** Turn the out-of-band work-overview synthesis on or off. */
   setOverviewEnabled: (enabled: boolean) => Promise<boolean>
+  /** Turn the out-of-band topic-queue promotion on or off. */
+  setAutoDomainPromote: (enabled: boolean) => Promise<boolean>
   /**
    * Ask the store to regenerate the work overview now.
    *
@@ -349,6 +360,7 @@ export class MemorySettingsController {
       contextInjectionEnabled: true,
       injectedSummaryTokens: DEFAULT_INJECTED_SUMMARY_TOKENS,
       overviewEnabled: true,
+      autoDomainPromote: true,
       extractionModel: undefined,
     },
     data: { facts: [], factsTotal: 0, profile: [], domains: [] },
@@ -370,6 +382,7 @@ export class MemorySettingsController {
       setInjectedSummaryTokens: (tokens) =>
         this.scope.set('injectedSummaryTokens', clampInjectedSummaryTokens(tokens)),
       setOverviewEnabled: (enabled) => this.scope.set('overviewEnabled', enabled),
+      setAutoDomainPromote: (enabled) => this.scope.set('autoDomainPromote', enabled),
       refreshOverview: async () => {
         const outcome = unwrap(await this.r().refreshOverview({ user: USER }))
         // Regeneration changes what the summary modal renders, so drop the
@@ -719,6 +732,7 @@ function defaulted(value: MemorySettingsSection): MemorySettingsSection {
     contextInjectionEnabled: value.contextInjectionEnabled ?? true,
     injectedSummaryTokens: clampInjectedSummaryTokens(value.injectedSummaryTokens),
     overviewEnabled: value.overviewEnabled ?? true,
+    autoDomainPromote: value.autoDomainPromote ?? true,
     extractionModel: value.extractionModel,
   }
 }

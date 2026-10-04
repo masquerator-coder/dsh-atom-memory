@@ -48,6 +48,35 @@ declare const Config: z<Schemastery.ObjectS<NoInfer<{
   summaryTokens: z<number, number, "defined">;
   overviewIdleSeconds: z<number, number, "defined">;
   overviewRefreshMinutes: z<number, number, "defined">;
+  /**
+   * How many times a proposed topic must be seen before the automatic promoter
+   * may register it.
+   *
+   * The threshold is the whole reason the queue is useful rather than noise: a
+   * one-off mention ("life/travel" from a single trip) should not become
+   * permanent vocabulary, while a topic that recurs across many writes is what
+   * the user actually works on. Measured on this store the recurring ones sit in
+   * the tens of sightings, so the default is low enough to catch them and high
+   * enough to drop the singletons.
+   */
+  domainPromoteThreshold: z<number, number, "defined">;
+  /**
+   * Cap on topics registered by one automatic promotion run.
+   *
+   * The queue has no upper bound, so without a cap a first run on an old store
+   * would register hundreds of names at once — an unreviewable vocabulary and
+   * one very large model call. Runs repeat, so the queue still drains.
+   */
+  domainPromoteMaxPerRun: z<number, number, "defined">;
+  domainPromoteIdleSeconds: z<number, number, "defined">;
+  /**
+   * Minimum gap between two promotion runs, in minutes. `0` disables the gap.
+   *
+   * Same reasoning as the overview's interval: the threshold and the queue
+   * already stop a *no-op* run, this stops a *repeated* one, so a long session
+   * costs a bounded number of model calls however much it writes.
+   */
+  domainPromoteIntervalMinutes: z<number, number, "defined">;
   rpcTimeoutMs: z<number, number, "defined">;
   writeAckTimeoutMs: z<number, number, "defined">;
   maxVectorDistance: z<number, number, "defined">;
@@ -112,6 +141,7 @@ declare const Config: z<Schemastery.ObjectS<NoInfer<{
   injectedSummaryTokens: z<number, number, "volatile-defined">;
   contextInjectionEnabled: z<boolean, boolean, "volatile-defined">;
   overviewEnabled: z<boolean, boolean, "volatile-defined">;
+  autoDomainPromote: z<boolean, boolean, "volatile-defined">;
 }>>, Schemastery.ObjectT<NoInfer<{
   dbPath: z<string, string, "defined">;
   pythonBin: z<string, string, "defined">;
@@ -123,6 +153,35 @@ declare const Config: z<Schemastery.ObjectS<NoInfer<{
   summaryTokens: z<number, number, "defined">;
   overviewIdleSeconds: z<number, number, "defined">;
   overviewRefreshMinutes: z<number, number, "defined">;
+  /**
+   * How many times a proposed topic must be seen before the automatic promoter
+   * may register it.
+   *
+   * The threshold is the whole reason the queue is useful rather than noise: a
+   * one-off mention ("life/travel" from a single trip) should not become
+   * permanent vocabulary, while a topic that recurs across many writes is what
+   * the user actually works on. Measured on this store the recurring ones sit in
+   * the tens of sightings, so the default is low enough to catch them and high
+   * enough to drop the singletons.
+   */
+  domainPromoteThreshold: z<number, number, "defined">;
+  /**
+   * Cap on topics registered by one automatic promotion run.
+   *
+   * The queue has no upper bound, so without a cap a first run on an old store
+   * would register hundreds of names at once — an unreviewable vocabulary and
+   * one very large model call. Runs repeat, so the queue still drains.
+   */
+  domainPromoteMaxPerRun: z<number, number, "defined">;
+  domainPromoteIdleSeconds: z<number, number, "defined">;
+  /**
+   * Minimum gap between two promotion runs, in minutes. `0` disables the gap.
+   *
+   * Same reasoning as the overview's interval: the threshold and the queue
+   * already stop a *no-op* run, this stops a *repeated* one, so a long session
+   * costs a bounded number of model calls however much it writes.
+   */
+  domainPromoteIntervalMinutes: z<number, number, "defined">;
   rpcTimeoutMs: z<number, number, "defined">;
   writeAckTimeoutMs: z<number, number, "defined">;
   maxVectorDistance: z<number, number, "defined">;
@@ -187,6 +246,7 @@ declare const Config: z<Schemastery.ObjectS<NoInfer<{
   injectedSummaryTokens: z<number, number, "volatile-defined">;
   contextInjectionEnabled: z<boolean, boolean, "volatile-defined">;
   overviewEnabled: z<boolean, boolean, "volatile-defined">;
+  autoDomainPromote: z<boolean, boolean, "volatile-defined">;
 }>>, "plain">;
 /**
  * The schema's inferred output — what `apply` actually receives.

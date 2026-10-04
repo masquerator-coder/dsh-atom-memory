@@ -145,6 +145,7 @@ window.__ModuleLoader__.load({
 					contextInjectionEnabled: true,
 					injectedSummaryTokens: 800,
 					overviewEnabled: true,
+					autoDomainPromote: true,
 					extractionModel: void 0
 				},
 				data: {
@@ -167,6 +168,7 @@ window.__ModuleLoader__.load({
 					hooks: { memorySettings: this.store },
 					setInjectedSummaryTokens: (tokens) => this.scope.set("injectedSummaryTokens", clampInjectedSummaryTokens(tokens)),
 					setOverviewEnabled: (enabled) => this.scope.set("overviewEnabled", enabled),
+					setAutoDomainPromote: (enabled) => this.scope.set("autoDomainPromote", enabled),
 					refreshOverview: async () => {
 						const outcome = unwrap(await this.r().refreshOverview({ user: USER }));
 						this.store.set({
@@ -498,6 +500,7 @@ window.__ModuleLoader__.load({
 				contextInjectionEnabled: value.contextInjectionEnabled ?? true,
 				injectedSummaryTokens: clampInjectedSummaryTokens(value.injectedSummaryTokens),
 				overviewEnabled: value.overviewEnabled ?? true,
+				autoDomainPromote: value.autoDomainPromote ?? true,
 				extractionModel: value.extractionModel
 			};
 		}
@@ -528,6 +531,8 @@ window.__ModuleLoader__.load({
 				overviewOutcomeNothing: "记忆库暂无可叙述的内容。",
 				overviewOutcomeEmpty: "模型没有产出内容，缓存保持不变。",
 				overviewOutcomeSkipped: "总览后台生成未启用。",
+				promoteHeader: "待注册主题自动批准",
+				promoteDesc: "在空闲时用模型审批「待注册的主题建议」：出现次数够多的名字才会被注册进词表，模型只负责判断哪些是真主题。在此之前，队列里没有任何入口能批准，只会一直堆积。关掉后队列保留，仍可用 memory_domains 的 signal_promote 手工批准。",
 				overviewOutcomeError: "生成失败（详见日志），缓存保持不变。",
 				overviewOutcomeNoChange: "仅细节变化，无需重新生成。",
 				overviewOutcomeNoChangeReason: "无需重新生成（{reason}）。",
@@ -656,6 +661,8 @@ window.__ModuleLoader__.load({
 				overviewOutcomeError: "Generation failed (see the logs); the cache is unchanged.",
 				overviewOutcomeNoChange: "Only detail-level changes — no regeneration needed.",
 				overviewOutcomeNoChangeReason: "No regeneration needed ({reason}).",
+				promoteHeader: "Auto-approve queued topics",
+				promoteDesc: "Use the model during idle time to review the pending topic proposals: only names seen often enough qualify, and the model only judges which of those are real topics. Before this existed nothing could approve a proposal, so the queue only ever grew. With it off the queue is kept, and proposals can still be approved by hand through memory_domains signal_promote.",
 				modelHeader: "LLM extraction model",
 				modelFollowDefault: "Follow the dsh default model",
 				modelManual: "Specify a model manually",
@@ -1225,6 +1232,28 @@ window.__ModuleLoader__.load({
 								}) : null]
 							})
 						]
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("fieldset", {
+						className: css.block,
+						disabled: !state.available,
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("legend", { children: t("promoteHeader") }), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
+							className: css.switchRow,
+							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+								className: css.switch,
+								children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+									type: "checkbox",
+									className: css.switchInput,
+									checked: state.section.autoDomainPromote,
+									onChange: (e) => {
+										props.setAutoDomainPromote(e.currentTarget.checked);
+									}
+								}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+									className: css.switchTrack,
+									"aria-hidden": "true",
+									children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { className: css.switchThumb })
+								})]
+							}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: t("promoteDesc") })]
+						})]
 					}),
 					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("fieldset", {
 						className: css.block,

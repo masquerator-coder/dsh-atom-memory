@@ -33,6 +33,7 @@ function snapshot(over: Partial<ConfigFormSnapshot<MemorySettingsSection>>): Con
       contextInjectionEnabled: true,
       injectedSummaryTokens: DEFAULT_INJECTED_SUMMARY_TOKENS,
       overviewEnabled: true,
+      autoDomainPromote: true,
       extractionModel: undefined,
       ...(over.value as Partial<MemorySettingsSection> | undefined),
     },

@@ -53,6 +53,15 @@ export interface LiveConfig {
   contextInjectionEnabled: Volatile<boolean | undefined>
   /** Whether the out-of-band work-overview synthesis runs. */
   overviewEnabled: Volatile<boolean | undefined>
+  /**
+   * Whether the out-of-band topic-queue promoter runs.
+   *
+   * Separate from `llmExtractionEnabled` on purpose: that switch governs
+   * automatic *capture*, and turning capture off must not also strand the
+   * registration queue — the queue is what a write produces, so a user who
+   * stops capturing still needs the proposals already queued to be resolved.
+   */
+  autoDomainPromote: Volatile<boolean | undefined>
 }
 
 /** Shape of the extraction-model override as stored in the settings document. */
@@ -311,6 +320,35 @@ export const Config = z.object({
   summaryTokens: z.number().default(1500),
   overviewIdleSeconds: z.number().default(90),
   overviewRefreshMinutes: z.number().default(15),
+  /**
+   * How many times a proposed topic must be seen before the automatic promoter
+   * may register it.
+   *
+   * The threshold is the whole reason the queue is useful rather than noise: a
+   * one-off mention ("life/travel" from a single trip) should not become
+   * permanent vocabulary, while a topic that recurs across many writes is what
+   * the user actually works on. Measured on this store the recurring ones sit in
+   * the tens of sightings, so the default is low enough to catch them and high
+   * enough to drop the singletons.
+   */
+  domainPromoteThreshold: z.number().step(1).min(1).default(3),
+  /**
+   * Cap on topics registered by one automatic promotion run.
+   *
+   * The queue has no upper bound, so without a cap a first run on an old store
+   * would register hundreds of names at once — an unreviewable vocabulary and
+   * one very large model call. Runs repeat, so the queue still drains.
+   */
+  domainPromoteMaxPerRun: z.number().step(1).min(1).default(10),
+  domainPromoteIdleSeconds: z.number().default(60),
+  /**
+   * Minimum gap between two promotion runs, in minutes. `0` disables the gap.
+   *
+   * Same reasoning as the overview's interval: the threshold and the queue
+   * already stop a *no-op* run, this stops a *repeated* one, so a long session
+   * costs a bounded number of model calls however much it writes.
+   */
+  domainPromoteIntervalMinutes: z.number().default(30),
   rpcTimeoutMs: z.number().default(30_000),
   writeAckTimeoutMs: z.number().default(2500),
   maxVectorDistance: z.number().default(0.70),
@@ -374,6 +412,7 @@ export const Config = z.object({
   injectedSummaryTokens: z.number().default(DEFAULT_INJECTED_SUMMARY_TOKENS).volatile(),
   contextInjectionEnabled: z.boolean().default(true).volatile(),
   overviewEnabled: z.boolean().default(true).volatile(),
+  autoDomainPromote: z.boolean().default(true).volatile(),
 })
 
 /**

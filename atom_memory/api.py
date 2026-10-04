@@ -1341,16 +1341,26 @@ class AtomMem:
     ) -> dict:
         """Register a queued proposal, which is how a new topic enters the vocabulary.
 
+        Idempotent: re-registering a name that is already in the vocabulary
+        succeeds and still clears the queue row, because "approve this" that
+        fails on a second attempt would leave the queue as the only place that
+        knows the name. ``already_registered`` in the result distinguishes the two
+        cases, so an automated caller can report honestly instead of claiming a
+        creation that did not happen.
+
         Args:
             user_id: Owner of the vocabulary.
             name: The canonical name from the queue.
             display_name: Free-form label for humans.
 
         Returns:
-            The created row as a dict.
+            The created (or pre-existing) row as a dict, plus ``already_registered``.
         """
         store = self._domain_store()
         canonical = normalize_canonical(name)
+        # Checked before create(), because create() is idempotent and would
+        # otherwise make "did I just add this?" unanswerable from its result.
+        existing_id = store.find(user_id, canonical)
         domain_id = store.create(user_id, canonical, display_name=display_name)
         if not domain_id:
             raise ValueError(f"invalid domain name: {name!r}")
@@ -1361,7 +1371,9 @@ class AtomMem:
                 (domain_id, user_id, canonical),
             )
         row = store.get(domain_id)
-        return row.to_dict() if row is not None else {"domain_id": domain_id}
+        payload = row.to_dict() if row is not None else {"domain_id": domain_id}
+        payload["already_registered"] = existing_id is not None
+        return payload
 
     def fact_domain_set(self, user_id: str, fact_id: str, domains: list) -> dict:
         """Replace a fact's topics with exactly the given names.
