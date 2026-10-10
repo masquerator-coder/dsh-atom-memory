@@ -1,6 +1,6 @@
 {
   "name": "dsh-atom-memory",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "dsh-side integration for the dsh-atom-memory Python library: subprocess+stdio bridge, memory tools, LLM-first extraction, durable capture hooks, and a browser settings section (memory on/off, extraction model, profile + memory editing, backup/restore).",
   "type": "module",
   "main": "lib/index.mjs",
