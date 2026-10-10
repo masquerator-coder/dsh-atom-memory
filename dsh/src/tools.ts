@@ -715,10 +715,17 @@ export function renderDomainResult(action: string, value: unknown): string {
   }
 }
 
-/** One row of the memory changelog, as `changes` reports it. */
+/**
+ * One row of the memory changelog, as `changes` reports it.
+ *
+ * The timestamp field is `at`, not `created_at`: `recent_changes` in
+ * `atom_memory/overview.py` builds each row as `{"type", "at", "detail"}` —
+ * the column is `created_at` in SQL, but the row key it emits is `at`. Reading
+ * `created_at` here matched nothing, so every timestamp rendered as `?`.
+ */
 export interface ChangeRow {
   type?: string
-  created_at?: number
+  at?: number
   detail?: Record<string, unknown>
 }
 
@@ -768,7 +775,7 @@ export function renderChanges(changes: ChangeRow[], level?: string): string {
       || (typeof detail.fact_id === 'string' && detail.fact_id)
       || ''
     const extra = typeof detail.type === 'string' ? `（${detail.type}）` : ''
-    return `- ${formatChangeTime(row.created_at)} ${label}${extra}${subject ? `：${subject}` : ''}`
+    return `- ${formatChangeTime(row.at)} ${label}${extra}${subject ? `：${subject}` : ''}`
   })
   const header = level === undefined ? '' : `变动级别：${level}\n`
   return `${header}${lines.join('\n')}`

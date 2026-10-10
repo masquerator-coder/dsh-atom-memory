@@ -304,7 +304,7 @@ let _initProto;function _applyDecs(e,t,n,r,o,i){var a,c,u,s,f,l,p,d=Symbol.metad
 * @param changes - Rows from Python, already newest-first.
 * @param level - The change level the same call computed, when present.
 * @returns A markdown-ish block; never empty (an empty store says so).
-*/function renderChanges(changes,level){if(changes.length===0)return"（近期没有记忆变动）";const lines=changes.map(row=>{const label=CHANGE_LABELS[row.type??""]??row.type??"?";const detail=row.detail??{};const subject=typeof detail.predicate==="string"&&detail.predicate||typeof detail.object==="string"&&detail.object||typeof detail.name==="string"&&detail.name||typeof detail.fact_id==="string"&&detail.fact_id||"";const extra=typeof detail.type==="string"?`（${detail.type}）`:"";return`- ${formatChangeTime(row.created_at)} ${label}${extra}${subject?`：${subject}`:""}`;});return`${level===void 0?"":`变动级别：${level}\n`}${lines.join("\n")}`;}/**
+*/function renderChanges(changes,level){if(changes.length===0)return"（近期没有记忆变动）";const lines=changes.map(row=>{const label=CHANGE_LABELS[row.type??""]??row.type??"?";const detail=row.detail??{};const subject=typeof detail.predicate==="string"&&detail.predicate||typeof detail.object==="string"&&detail.object||typeof detail.name==="string"&&detail.name||typeof detail.fact_id==="string"&&detail.fact_id||"";const extra=typeof detail.type==="string"?`（${detail.type}）`:"";return`- ${formatChangeTime(row.at)} ${label}${extra}${subject?`：${subject}`:""}`;});return`${level===void 0?"":`变动级别：${level}\n`}${lines.join("\n")}`;}/**
 * Render the stats payload.
 *
 * The capacity line exists because "0 archived" has two meanings and only one of

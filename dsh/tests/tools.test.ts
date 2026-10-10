@@ -415,10 +415,14 @@ describe('memory_overview tool', () => {
 
   it('changes renders the changelog with readable labels', async () => {
     const { bridge, tool } = setupOverview()
+    // The row key is `at` — that is what `recent_changes` in
+    // `atom_memory/overview.py` actually emits (`{"type", "at", "detail"}`).
+    // Using `created_at` here is what let the timestamps render as `?` in
+    // production while this test stayed green, so the field name is load-bearing.
     bridge.call.mockResolvedValue({
       changes: [
-        { type: 'fact_written', created_at: Date.UTC(2026, 1, 5, 3, 4), detail: { predicate: '决定', type: 'decision_rule' } },
-        { type: 'fact_superseded', created_at: 0, detail: {} },
+        { type: 'fact_written', at: Date.UTC(2026, 1, 5, 3, 4), detail: { predicate: '决定', type: 'decision_rule' } },
+        { type: 'fact_superseded', at: 0, detail: {} },
       ],
       level: 'structural',
     })
@@ -427,7 +431,10 @@ describe('memory_overview tool', () => {
     expect(result.text).toContain('写入')
     expect(result.text).toContain('决定')
     expect(result.text).toContain('替换')
-    expect(result.text).toContain('?')  // the zero timestamp
+    // A real timestamp renders as `MM-DD HH:mm`, not `?`.
+    expect(result.text).toMatch(/\d{2}-\d{2} \d{2}:\d{2} 写入/)
+    // …while a zero timestamp still says `?` rather than inventing a date.
+    expect(result.text).toContain('- ? 替换')
   })
 
   it('changes says so when nothing happened', async () => {
