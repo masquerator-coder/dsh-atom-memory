@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { registerMemoryContext } from '../src/context.ts'
 
-interface FakeSection { name: string; text: string }
+interface FakeSection { name: string; text: string; interpolate?: boolean }
 
 function makeCtx() {
   const sections: Array<{ name: string; order: number; text: unknown }> = []
@@ -100,6 +100,27 @@ describe('registerMemoryContext', () => {
     expect(first.sections.map((s: FakeSection) => s.name)).toEqual([
       'atom-memory-awareness', 'atom-memory-snapshot',
     ])
+  })
+
+  it('injects the snapshot as literal text, never as a prompt-variable template', async () => {
+    // Memory is data. A stored fact can legitimately contain a `{{…}}` token (a
+    // template, a path, a config snippet), and DSH interpolates `{{name}}`
+    // section text by default: an unregistered name makes prompt assembly throw,
+    // which takes the whole session down before any model request.
+    const bridge = { call: vi.fn(async () => '# Memory\n- 模板写法: 记忆里记了 {{cwd}} 和 {{path}}') }
+    const { ctx, handlers } = makeCtx()
+    registerMemoryContext({
+      ctx, bridge: bridge as any,
+      userScope: 'global', resolveMaxTokens: () => 1500, snapshotEnabled: () => true,
+    })
+    const handler = assembleHandler(handlers)
+    const result = await handler(assembly(), agentCtx('s1'), next(assembly()))
+    const snapshot = result.sections.find((s: FakeSection) => s.name === 'atom-memory-snapshot')!
+
+    expect(snapshot.interpolate).toBe(false)
+    // Verbatim: the tokens survive so the model sees what was actually stored.
+    expect(snapshot.text).toContain('{{cwd}}')
+    expect(snapshot.text).toContain('{{path}}')
   })
 
   it('reads independently for a different session', async () => {

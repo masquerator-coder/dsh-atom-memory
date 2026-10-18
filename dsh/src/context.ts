@@ -215,7 +215,13 @@ export function registerMemoryContext(deps: MemoryContextDeps): FrozenSnapshotHa
   /** Insert the snapshot right after the awareness section (else append). */
   const injectSection = (assembly: PromptAssembly, text: string): void => {
     if (assembly.sections.some(s => s.name === SNAPSHOT_SECTION)) return
-    const section = { name: SNAPSHOT_SECTION, text }
+    // `interpolate: false` is not cosmetic. Sections interpolate `{{name}}`
+    // prompt variables by default, and an unregistered name makes `renderPrompt`
+    // throw — so any memory text that happens to contain a `{{…}}` token (a
+    // stored path, a template, a config snippet) would fail assembly and the
+    // session could not start. This section carries *data*, which must reach the
+    // model verbatim, never as a template.
+    const section = { name: SNAPSHOT_SECTION, text, interpolate: false }
     const anchor = assembly.sections.findIndex(s => s.name === AWARENESS_SECTION)
     if (anchor >= 0) assembly.sections.splice(anchor + 1, 0, section)
     else assembly.sections.push(section)

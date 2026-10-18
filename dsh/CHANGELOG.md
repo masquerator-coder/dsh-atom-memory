@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### Fixed (记忆快照含 `{{…}}` 时导致会话无法开始)
+
+`@deepseek-ai/dsh-system-prompt` 0.2.x 起对 section 文本做**严格的 `{{name}}`
+变量插值**：遇到未注册的变量名，`renderPrompt` 直接抛错，装配在发出任何模型请求
+之前就失败，整个会话起不来。注入的 `atom-memory-snapshot` 走的是默认插值路径，
+而记忆内容天然可能出现 `{{cwd}}` 这类字面量（模板写法、配置片段、路径），于是
+新会话报：
+
+```
+unknown prompt variable "{{cwd}}" in section "atom-memory-snapshot"; registered variables: provider, model
+```
+
+这是**数据进模板**的问题，不是某条脏数据的问题——任何形如 `{{name}}` 的记忆都会
+触发。修法是用宿主已有的机制把该 section 标为字面量：注入时带上
+`interpolate: false`（与 `dsh-working-directory` 注入自身 context 的做法一致），
+记忆文本逐字到达模型，既不被替换也不会让装配抛错。
+
+`dsh/src/context.ts`（`injectSection`）、`dsh/tests/context.test.ts`（新增回归用例：
+记忆含 `{{cwd}}`/`{{path}}` 时 section 必须 `interpolate: false` 且文本原样）
+
 ### Changed (设置页「编辑记忆」摘要：按钮与徽章拉开间距，徽章补充领域数)
 
 - 按钮与右侧计数徽章之间加了间距（`.atom-memory-toggle` 内 `margin-left:12px`），
